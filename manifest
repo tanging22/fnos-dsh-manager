@@ -1,8 +1,8 @@
 appname=fnos-dsh-manager
-version=1.0.32
+version=1.0.33
 display_name=DSH 管理器
 desc=DeepSeek Harness 的 fnOS 管理面板：查看运行状态与实时日志、在线安装并切换 dsh 版本、记录最近访问来源 IP、提供快捷入口。本套件不内置 dsh 本体，版本由面板按需从 npm 下载，因此升级 dsh 不需要重装套件。
-changelog=1.0.32 修复网关代理 proxy.py 在转发 WebSocket 101 时丢弃 Connection 头导致浏览器判定握手非法、面板主页无实时推送（影响经 fnOS 统一网关 5666 的全部入口，含 /p/api/remote.mux 与 /ws）；connection/upgrade 各只透传一次，101 缺失时补齐；新增网关 101 的 smoke 覆盖（无 AF_UNIX 的平台跳过，CI Linux 真跑）。
+changelog=1.0.33 修复面板主页打开后无数据、必须手动刷新才显示的问题：app.js 在 boot() 前一行对 state 调用了 onLeave（该方法在 ctx 上），抛 TypeError 导致 boot() 从未执行、所有 API 请求都没发出；同时内置 v1.0.32 网关代理 101 头修复。
 platform=all
 source=thirdparty
 maintainer=tanging22

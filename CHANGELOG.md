@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.33 - 2026-10-10
+
+### 修复
+
+- 面板主页打开后一片空白、必须手动刷新才有数据。`ui/assets/app.js` 在 `boot()` 之前的一行调用了 `state.onLeave(() => {})`，而 `onLeave` 定义在 `ctx` 上、`state` 只是 `{ tab, logFile }`，于是抛出 `Uncaught TypeError: state.onLeave is not a function`，`boot()` 永远不执行，一个 API 请求都不会发出。该行本身是无意义的空钩子（推送通道由 `closeWs` 在 `beforeunload` 释放），已删除。页面 HTML 是静态的，所以界面看起来一切正常，这也是它长期没被发现的原因。
+
+### 验证
+
+- smoke 新增两条断言：`app.js` 不得出现 `state.onLeave`；且必须保留 `beforeunload` 到 `closeWs` 的绑定。
 ## v1.0.32 - 2026-10-10
 
 ### 修复

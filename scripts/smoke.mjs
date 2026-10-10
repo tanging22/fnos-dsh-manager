@@ -613,6 +613,18 @@ async function pythonBin() {
     'app.js still reads app.hidden — live updates would be silently dropped')
   check('live updates use the real visibility signal',
     appJsText.includes('visibilityState'), 'app.js does not consult document.visibilityState')
+
+  /* `onLeave` lives on `ctx`, not on `state`. A stray `state.onLeave(...)` threw
+   * a TypeError on the line right before `boot()`, so the shell rendered but no
+   * API call was ever made — "打开没数据，要手动刷新". The page looked alive
+   * because the HTML is static, which is why it went unnoticed.
+   */
+  check('app.js does not call onLeave on the wrong object',
+    !/\bstate\.onLeave\b/.test(appJsText),
+    'app.js calls state.onLeave — it throws before boot() runs')
+  check('the push channel is closed on unload',
+    /addEventListener\('beforeunload',\s*closeWs\)/.test(appJsText),
+    'app.js no longer wires beforeunload -> closeWs')
   const script = await fetch(`${base}/assets/app.js`)
   check('the UI bundle is served', script.status === 200, `got ${script.status}`)
   const traversal = await fetch(`${base}/assets/../../cmd/dashboard.js`)

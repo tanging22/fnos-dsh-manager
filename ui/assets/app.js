@@ -194,7 +194,6 @@ const closeWs = ws((event) => {
     if (state.tab === 'overview' || state.tab === 'access') renderTab()
   }
 })
-state.onLeave(() => {})
 window.addEventListener('beforeunload', closeWs)
 
 boot()
