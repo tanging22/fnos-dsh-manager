@@ -1,0 +1,15 @@
+#!/bin/bash
+# config_callback — 套件「设置」页保存后
+#
+# 面板的设置是自己写的（POST /api/settings），fnOS 这一层没有需要落盘的
+# 表单字段。留空脚本是为了让套件设置入口的生命周期完整。
+set -u
+
+APP_NAME="${TRIM_APPNAME:-dsh-console}"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}}"
+DATA_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+
+mkdir -p "${DATA_DIR}" 2>/dev/null || true
+echo "[$(date '+%F %T')] config_callback (no fnOS-level settings; panel manages its own)" \
+    >> "${DATA_DIR}/config.log" 2>/dev/null || true
+exit 0

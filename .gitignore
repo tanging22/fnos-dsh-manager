@@ -1,0 +1,13 @@
+# Ignore all build/test artifacts and local credentials.
+node_modules/
+dist/
+*.fpk
+*.tar.gz
+*.log
+*.tmp
+.DS_Store
+
+# Never commit the panel's own data or secrets.
+.credentials.yaml
+console-config.json
+trusted_hosts.conf

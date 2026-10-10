@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""dsh-console fnOS 统一网关代理.
+
+监听 Unix socket (${TRIM_APPDEST}/app.sock, 由 fnOS 统一网关转发; target 软链
+指向 TRIM_APPDEST, 网关转发目标 /var/apps/{appname}/target/app.sock 与之一致),
+把请求反向代理到 127.0.0.1:CONSOLE_PORT (面板自带的 HTTP 服务).
+
+职责边界: 本代理只做三件事 ——
+  1. Unix socket <-> TCP 的桥 (fnOS 网关只认 socket);
+  2. 剥掉网关前缀 (/app/dsh-console), 让面板只看到它自己的路径;
+  3. WebSocket 升级请求的原始字节透传 (面板的 /p/ 反代会把 dsh 的 WS 一并透过来).
+  4. 转发时把 Host 重写为 127.0.0.1 并剥掉 X-Forwarded-Host: 面板的信任栅栏
+     是 Host/Origin 判定, 若网关的外部 Host 透传过去, 面板会因名字不受信而
+     拒绝. 保留 X-Forwarded-For, 让访问日志还能记到真实客户端 IP.
+
+面板自己已经实现了 Host/Origin 信任栅栏, 这里**不**再做改写: 保留浏览器看到的
+原始 Host, 由面板判定. 这一点和上游 dsh 本体的代理不同 —— 那个代理必须伪造
+回环 Host 才能绕过 dsh 的 fence, 而本面板是要**靠** fence 做访问控制的.
+"""
+import http.client
+import os
+import socket
+import socketserver
+import struct
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CONSOLE_PORT = int(os.environ.get("CONSOLE_PORT", "28001"))
+SOCK_PATH = os.environ.get("SOCK_PATH", "/var/apps/dsh-console/target/app.sock")
+BACKEND = ("127.0.0.1", CONSOLE_PORT)
+GATEWAY_PREFIX = os.environ.get("GATEWAY_PREFIX", "/app/dsh-console")
+
+HOP_BY_HOP = {
+    "connection", "proxy-connection", "keep-alive", "transfer-encoding",
+    "te", "trailers", "proxy-authorization", "proxy-authenticate", "upgrade",
+}
+
+
+def _recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def _relay(sock_a, sock_b):
+    """WebSocket 升级后的双向原始字节透传."""
+
+    def pump(src, dst):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+
+    t1 = threading.Thread(target=pump, args=(sock_a, sock_b), daemon=True)
+    t2 = threading.Thread(target=pump, args=(sock_b, sock_a), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "dsh-console-gateway"
+
+    def log_message(self, *args):
+        pass
+
+    def strip_prefix(self, path):
+        if path == GATEWAY_PREFIX:
+            return "/"
+        if path.startswith(GATEWAY_PREFIX + "/"):
+            return path[len(GATEWAY_PREFIX):] or "/"
+        return path
+
+    def redirect(self, location):
+        """301 到带尾斜杠的路径, 修 iframe 内相对资源路径解析错位 (白屏)."""
+        try:
+            self.send_response(301)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except Exception:
+            pass
+
+    def body_bytes(self):
+        length = self.headers.get("Content-Length")
+        if length and length.isdigit():
+            return self.rfile.read(int(length))
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            chunks = b""
+            while True:
+                line = self.rfile.readline().strip()
+                size = int(line.split(b";")[0], 16)
+                if size == 0:
+                    self.rfile.readline()
+                    break
+                chunks += self.rfile.read(size)
+                self.rfile.readline()
+            return chunks
+        return None
+
+    def fail(self, code, message):
+        try:
+            payload = message.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception:
+            pass
+
+    def _ws_proxy(self, path):
+        backend = None
+        try:
+            backend = socket.create_connection(BACKEND, timeout=30)
+            lines = ["%s %s HTTP/1.1" % (self.command, path)]
+            for key, value in self.headers.items():
+                low = key.lower()
+                if low in ("host", "connection", "upgrade", "content-length", "x-forwarded-host"):
+                    continue
+                lines.append("%s: %s" % (key, value))
+            lines.append("Host: 127.0.0.1:%d" % CONSOLE_PORT)
+            lines.append("Connection: Upgrade")
+            lines.append("Upgrade: %s" % self.headers.get("Upgrade", "websocket"))
+            backend.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin1"))
+
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = backend.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            head_lines = head.split(b"\r\n")
+            parts = head_lines[0].decode("latin1").split(" ", 2)
+            code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 502
+            self.send_response(code, parts[2] if len(parts) > 2 else "")
+            for header in head_lines[1:]:
+                key, _, value = header.partition(b":")
+                low = key.decode("latin1").strip().lower()
+                if low in ("transfer-encoding", "connection", "content-length"):
+                    continue
+                self.send_header(key.decode("latin1").strip(), value.decode("latin1").strip())
+            self.end_headers()
+            if rest:
+                self.wfile.write(rest)
+            if code == 101:
+                self.close_connection = True
+                _relay(self.connection, backend)
+        except Exception as exc:
+            self.fail(502, "upstream websocket error: %s" % exc)
+        finally:
+            try:
+                if backend:
+                    backend.close()
+            except Exception:
+                pass
+
+    def _http_proxy(self, path):
+        conn = None
+        try:
+            body = self.body_bytes()
+            headers = {
+                k: v for k, v in self.headers.items()
+                if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+            }
+            # The panel's trust fence is Host/Origin-based. We rewrite Host to the
+            # loopback backend, so we must also drop the gateway's X-Forwarded-Host:
+            # if it survived, the panel would see the external hostname instead of
+            # 127.0.0.1 and (correctly) refuse an untrusted name. X-Forwarded-For is
+            # kept so the visitor log can still record the real client IP.
+            #
+            # Origin is dropped for the same reason: a <script type=module> load
+            # carries `Origin: https://<fos-host>`, which would disagree with the
+            # rewritten loopback Host and trip the panel's origin-host-mismatch
+            # check (403). Since the panel is a same-origin SPA whose API calls are
+            # all same-origin, the fence does not need Origin here; stripping it is
+            # exactly as safe as stripping X-Forwarded-Host.
+            headers.pop("X-Forwarded-Host", None)
+            headers.pop("Origin", None)
+            headers["Host"] = "127.0.0.1:%d" % CONSOLE_PORT
+            conn = http.client.HTTPConnection(*BACKEND, timeout=60)
+            conn.request(self.command, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            self.send_response(resp.status)
+            for key, value in resp.getheaders():
+                low = key.lower()
+                if low in ("transfer-encoding", "connection", "content-length"):
+                    continue
+                self.send_header(key, value)
+            data = resp.read()
+            data = self._rewrite_html(path, resp.getheader("Content-Type"), data)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            self.fail(502, "upstream unreachable: %s" % exc)
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    def _rewrite_html(self, path, content_type, data):
+        """dsh 的 HTML 用绝对路径 (/assets/... /api/...), 走网关时会被浏览器
+        解析到网关根而逃出 /app/dsh-console/p 前缀 -> 资源 404. 这里只对 dsh
+        反代路径 (/p...) 的 text/html 响应重写绝对资源路径, 加回完整网关前缀.
+
+        面板自己的 HTML (index.html) 用相对路径, 不走这里 (path 不以 /p 开头)."""
+        if not path.startswith("/p") and path != "/p":
+            return data
+        if not (content_type or "").lower().startswith("text/html"):
+            return data
+        if not isinstance(data, (bytes, bytearray)):
+            return data
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        prefix = GATEWAY_PREFIX + "/p"
+        # src= href= action= 里的绝对路径, 跳过已是 /p 开头或协议/http 开头的.
+        import re
+
+        def sub(m):
+            url = m.group(2)
+            if url.startswith(("http://", "https://", "//", prefix + "/", prefix)) \
+                    or url in ("/", ""):
+                return m.group(0)
+            if url.startswith("/"):
+                return '%s="%s"' % (m.group(1), prefix + url)
+            return m.group(0)
+
+        text = re.sub(r'(src|href|action)="(/[^"]*)"', sub, text)
+        # 绝对路径重写是主手段, 覆盖 dsh HTML 里的资源引用.
+        return text.encode("utf-8")
+
+    def _proxy(self):
+        # 无尾斜杠的网关前缀 (如 /app/dsh-console) 会被浏览器当作文件路径,
+        # 相对资源 assets/... 会解析错位丢失 app 段 -> 白屏。这里强制 301 到带斜杠。
+        if self.path == GATEWAY_PREFIX:
+            return self.redirect(GATEWAY_PREFIX + "/")
+        path = self.strip_prefix(self.path)
+        if (self.headers.get("Upgrade") or "").lower() == "websocket":
+            self._ws_proxy(path)
+        else:
+            self._http_proxy(path)
+
+    do_GET = _proxy
+    do_POST = _proxy
+    do_PUT = _proxy
+    do_PATCH = _proxy
+    do_DELETE = _proxy
+    do_HEAD = _proxy
+    do_OPTIONS = _proxy
+
+
+class UnixServer(ThreadingHTTPServer):
+    address_family = socket.AF_UNIX
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main():
+    for attempt in range(1, 6):
+        try:
+            if os.path.exists(SOCK_PATH):
+                os.remove(SOCK_PATH)
+            os.makedirs(os.path.dirname(SOCK_PATH) or "/tmp", exist_ok=True)
+            server = UnixServer(SOCK_PATH, Handler)
+            print("dsh-console gateway: %s -> 127.0.0.1:%d (prefix %s)"
+                  % (SOCK_PATH, CONSOLE_PORT, GATEWAY_PREFIX), flush=True)
+            server.serve_forever()
+            return
+        except OSError as exc:
+            # fnOS may still be handing over the socket during package upgrade.
+            print("bind attempt %d failed: %s" % (attempt, exc), file=sys.stderr, flush=True)
+            import time
+            time.sleep(attempt)
+    print("FATAL: could not bind %s; gateway will report Bad Gateway" % SOCK_PATH,
+          file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

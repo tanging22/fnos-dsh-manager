@@ -1,0 +1,9 @@
+# fnOS lifecycle scripts and the Python bridge must be LF, or the kernel
+# refuses to run them. Enforce LF in the repo and let git do the rest.
+* text=auto
+cmd/* text eol=lf
+config/* text eol=lf
+wizard/* text eol=lf
+manifest text eol=lf
+*.sh text eol=lf
+*.py text eol=lf

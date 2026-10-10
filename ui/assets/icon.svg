@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="dsh console">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#0e1117"/>
+  <path d="M14 40c6 0 9-8 18-8s12 8 18 8" fill="none" stroke="#3b82f6" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="24" cy="26" r="4" fill="#38b000"/>
+  <circle cx="40" cy="26" r="4" fill="#d9822b"/>
+  <path d="M32 14v6" stroke="#8b949e" stroke-width="3" stroke-linecap="round"/>
+</svg>

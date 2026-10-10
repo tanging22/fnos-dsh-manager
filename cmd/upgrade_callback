@@ -1,0 +1,27 @@
+#!/bin/bash
+# upgrade_callback — 升级完成后
+#
+# 新版文件已就位。这里做向下兼容的收尾：
+#  - 确保 node / python 路径仍然解析得到（依赖应用可能换了卷）；
+#  - 确保代理 socket 目录存在；
+#  - 尝试拉起服务，失败也不让升级流程报错（面板里有日志可查）。
+set -u
+
+APP_NAME="${TRIM_APPNAME:-dsh-console}"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}}"
+DATA_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+LOG="${DATA_DIR}/upgrade.log"
+
+mkdir -p "${DATA_DIR}" "$(dirname "${TRIM_APPDEST_SOCK:-/var/apps/${APP_NAME}/target/app.sock}")" 2>/dev/null || true
+echo "[$(date '+%F %T')] upgrade_callback start (new files at ${APP_DIR})" >> "${LOG}"
+
+if [ -x "${APP_DIR}/cmd/main" ]; then
+    "${APP_DIR}/cmd/main" start >> "${LOG}" 2>&1
+    code=$?
+    echo "[$(date '+%F %T')] cmd/main start exit=${code}" >> "${LOG}"
+else
+    echo "[$(date '+%F %T')] WARN: ${APP_DIR}/cmd/main missing; nothing to start" >> "${LOG}"
+fi
+
+echo "[$(date '+%F %T')] upgrade_callback done" >> "${LOG}"
+exit 0

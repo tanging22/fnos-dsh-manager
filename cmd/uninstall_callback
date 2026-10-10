@@ -1,0 +1,17 @@
+#!/bin/bash
+# uninstall_callback — 卸载完成后的收尾
+#
+# 数据默认保留 (fnOS 通常自己会清 ${TRIM_PKGVAR}). 这里只做两件无害的事:
+# 记一笔日志, 并清掉可能在别处留下的 socket.
+set -u
+
+APP_NAME="${TRIM_APPNAME:-dsh-console}"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}}"
+DATA_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+
+mkdir -p "${DATA_DIR}" 2>/dev/null || true
+echo "[$(date '+%F %T')] uninstall_callback: ${APP_NAME} removed from ${APP_DIR}" \
+    >> "${DATA_DIR}/uninstall.log" 2>/dev/null || true
+
+rm -f "${TRIM_APPDEST_SOCK:-/var/apps/${APP_NAME}/target/app.sock}" 2>/dev/null || true
+exit 0

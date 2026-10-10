@@ -1,0 +1,765 @@
+/* dsh console — one stylesheet, system fonts, no build step.
+ * Palette aligned with the techysy/deepseek.harness.fnos (Go) panel:
+ *   primary #1669ff (dark #2b7fff), cards #181b22 / #ffffff, radius 12-16px. */
+
+:root {
+  --bg: #12141a;
+  --panel: #181b22;
+  --panel-2: #1e212b;
+  --line: rgba(255, 255, 255, 0.08);
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #2b7fff;
+  --accent-hover: #4d94ff;
+  --ok: #10b981;
+  --warn: #f59e0b;
+  --fail: #ef4444;
+  --radius: 12px;
+  --sider: #181b22;
+  --brand-bg: rgba(255, 255, 255, 0.04);
+  --brand-hover: rgba(255, 255, 255, 0.12);
+  --brand-hover-bg: rgba(255, 255, 255, 0.07);
+  --menu-hover: rgba(255, 255, 255, 0.05);
+  --menu-active: rgba(43, 127, 255, 0.15);
+  --menu-active-text: #4d94ff;
+  --metric-bg: rgba(255, 255, 255, 0.03);
+  --metric-line: rgba(255, 255, 255, 0.06);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f7fa;
+    --panel: #ffffff;
+    --panel-2: #f8fafc;
+    --line: #e2e8f0;
+    --text: #1e293b;
+    --muted: #656d76;
+    --accent: #1669ff;
+    --accent-hover: #3b82f6;
+    --ok: #10b981;
+    --warn: #f59e0b;
+    --fail: #ef4444;
+    --sider: #ffffff;
+    --brand-bg: #f8fafc;
+    --brand-hover: #e2e8f0;
+    --brand-hover-bg: #f1f5f9;
+    --menu-hover: #f1f5f9;
+    --menu-active: #eef2ff;
+    --menu-active-text: #1669ff;
+    --metric-bg: #f8fafc;
+    --metric-line: #e2e8f0;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.shell {
+  display: flex;
+  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* 折叠箭头伸出侧栏右缘，避免被 .shell 的 overflow:hidden 裁剪。 */
+.main { position: relative; }
+
+/* ---------- sidebar (对齐 Go 版 NLayoutSider 240px) ---------- */
+
+.sider {
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  background: var(--sider);
+  border-right: 1px solid var(--line);
+  /* 侧栏不滚动：内容高度远小于视口（品牌卡 + 7 菜单项），溢出由 .sider-top 的
+     overflow:hidden 吸收。这里保持 overflow:visible，让右缘伸出的折叠箭头
+     （right:-13px）不被裁剪 —— 上一版误用 overflow:hidden 把箭头裁掉了一半。 */
+  overflow: visible;
+  position: relative;
+  transition: width .2s ease;
+}
+
+/* 侧栏折叠：靠边收起为窄条，只留折叠箭头。 */
+.sider.collapsed { width: 44px; }
+.sider.collapsed .sider-top,
+.sider.collapsed .sider-bottom { opacity: 0; pointer-events: none; }
+.sider.collapsed .sider-toggle .toggle-chevron { transform: rotate(180deg); }
+
+/* 折叠箭头：常驻侧栏右缘外侧，点击靠边、再点展开。 */
+.sider-toggle {
+  position: absolute;
+  top: 14px;
+  right: -13px;
+  z-index: 30;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  box-shadow: 0 1px 3px 0 rgba(0,0,0,.3);
+  transition: color .15s ease, background .15s ease, transform .2s ease;
+}
+.sider-toggle:hover { color: var(--text); background: var(--panel-2); }
+.toggle-chevron { transition: transform .2s ease; }
+
+.sider-top { display: flex; flex-direction: column; gap: 12px; padding: 12px; min-height: 0; overflow: hidden; transition: opacity .15s ease; }
+
+/* 品牌卡：点击跳 GitHub（对齐 Go 版品牌卡片） */
+.brand-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 16px;
+  background: var(--brand-bg);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+.brand-card:hover { border-color: var(--brand-hover); background: var(--brand-hover-bg); }
+.brand-mark { display: block; border-radius: 8px; object-fit: contain; flex-shrink: 0; }
+.brand-text { min-width: 0; flex: 1; line-height: 1.25; }
+.brand-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.brand-row strong { font-size: 14px; font-weight: 700; }
+.brand-sub { font-size: 11px; color: var(--muted); }
+
+/* 菜单（对齐 Go 版 n-menu） */
+.menu { display: flex; flex-direction: column; gap: 2px; }
+.menu-item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 10px;
+  padding: 8px 12px;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.menu-item:hover { background: var(--menu-hover); color: var(--text); }
+.menu-item[aria-selected="true"] {
+  background: var(--menu-active);
+  color: var(--menu-active-text);
+}
+.mi-icon { font-size: 15px; width: 20px; text-align: center; flex-shrink: 0; }
+
+.sider-bottom { padding: 12px; border-top: 1px solid var(--line); transition: opacity .15s ease; }
+
+/* ---------- main ---------- */
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  /* 让折叠箭头能盖在主区之上，不被主区的 overflow 裁剪视觉层叠。 */
+  position: relative;
+  z-index: 0;
+}
+
+/* ---------- top bar ---------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.topbar-right { display: flex; align-items: center; gap: 8px; }
+
+.muted { color: var(--muted); }
+
+/* ---------- status pill ---------- */
+
+.pill {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  white-space: nowrap;
+}
+.pill-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.pill-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.pill-fail { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 45%, var(--line)); }
+.pill-idle { color: var(--muted); }
+
+/* ---------- tabs (legacy, replaced by sidebar menu) ---------- */
+
+/* ---------- layout ---------- */
+
+.view {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px calc(24px + env(safe-area-inset-bottom, 0px));
+}
+
+/* 内容居中宽度约束（对齐 Go 版 max-w-6xl） */
+.view > * { max-width: 1152px; margin-left: auto; margin-right: auto; }
+
+/* 首页概览：内容自然文档流，整体统一滚动（不产生卡片内部滚动条）。
+   状态卡 + 面板信息卡紧凑排版，尽量一屏放下全部信息。 */
+.view.overview-view {
+  overflow-y: auto;
+  display: block;
+}
+.view.overview-view > * { width: 100%; }
+.view.overview-view .overview-grid { align-items: stretch; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+/* 首页总览：三列排布，尽量一屏放完所有卡片 */
+.overview-grid {
+  grid-template-columns: repeat(3, 1fr);
+  align-items: stretch;
+}
+@media (max-width: 1000px) {
+  .overview-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 620px) {
+  .overview-grid { grid-template-columns: 1fr; }
+}
+
+/* ---------- overview 核心大卡片（对齐 Go 版 Overview.vue） ---------- */
+
+/* 页头大卡片：应用名 + 版本 + 右侧「进入 Harness」大按钮 */
+.hero-card {
+  display: flex;
+  flex-direction: column;
+  padding: 16px 20px;
+}
+.hero-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.hero-title {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.hero-title .app-name {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  line-height: 1.2;
+}
+.hero-title .app-version {
+  font-size: 13px;
+  color: var(--muted);
+}
+.hero-action .btn {
+  padding: 12px 28px;
+  font-size: 15px;
+  border-radius: 12px;
+}
+
+/* dsh 状态指示灯（替代原「进入 Harness」按钮，颜色表达五态） */
+.status-lamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.status-lamp .lamp-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 20%, transparent);
+}
+.status-lamp.lamp-running { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.status-lamp.lamp-starting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.status-lamp.lamp-building { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.status-lamp.lamp-snapshotting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.status-lamp.lamp-stopped { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 40%, transparent); }
+
+/* 运行控制按钮栏：融入状态卡底部（替代原 action-grid） */
+.action-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.action-bar .btn {
+  padding: 9px 16px;
+  font-size: 13px;
+  border-radius: 10px;
+}
+
+.hero-divider {
+  height: 1px;
+  background: var(--line);
+  margin: 12px 0;
+}
+
+/* 5 列指标网格（运行状态/PID/CPU/内存/运行时间，对齐 Go 版 grid-cols-5） */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+}
+.metric {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 12px 10px;
+  border-radius: 14px;
+  background: var(--metric-bg);
+  border: 1px solid var(--metric-line);
+  text-align: center;
+  transition: border-color .15s ease, background .15s ease;
+}
+.metric:hover { border-color: var(--brand-hover); background: var(--brand-hover-bg); }
+.metric .metric-label {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 500;
+}
+.metric .metric-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (max-width: 860px) {
+  .metric-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* 运行控制区（对齐 Go 版 actionCards 4 列） */
+.section-title {
+  margin: 16px 0 10px;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+}
+@media (max-width: 1000px) {
+  .action-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 620px) {
+  .action-grid { grid-template-columns: 1fr; }
+}
+.action-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 20px 16px;
+  border-radius: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  text-align: center;
+  transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, .3), 0 1px 2px -1px rgba(0, 0, 0, .2);
+}
+.action-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .28);
+}
+.action-card:active { transform: scale(0.97); }
+.action-card.disabled { opacity: 0.5; cursor: not-allowed; }
+.action-card.disabled:hover { border-color: var(--line); box-shadow: none; }
+.action-card .action-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  flex-shrink: 0;
+}
+.action-card .action-icon.icon-rose { background: color-mix(in srgb, var(--fail) 16%, transparent); }
+.action-card .action-icon.icon-emerald { background: color-mix(in srgb, var(--ok) 16%, transparent); }
+.action-card .action-icon.icon-amber { background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.action-card .action-icon.icon-blue { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.action-card .action-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.action-card .action-desc {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+/* 底部状态通知（对齐 Go 版 n-alert last_message） */
+.alert-box {
+  margin-top: 20px;
+  padding: 12px 16px;
+  border-radius: 16px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.alert-info { background: color-mix(in srgb, var(--accent) 10%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); color: var(--text); }
+.alert-warn { background: color-mix(in srgb, var(--warn) 12%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); color: var(--text); }
+.alert-error { background: color-mix(in srgb, var(--fail) 12%, transparent); border: 1px solid color-mix(in srgb, var(--fail) 30%, transparent); color: var(--text); }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 16px 18px;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, .3), 0 1px 2px -1px rgba(0, 0, 0, .2);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.card:hover {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--line));
+  box-shadow: 0 3px 12px rgba(0, 0, 0, .28);
+}
+.card h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.card h3::before {
+  content: '';
+  width: 4px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.card h3 .card-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  flex-shrink: 0;
+}
+.card + .card { margin-top: 14px; }
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+}
+.row + .row { border-top: 1px solid var(--line); }
+.row .k { color: var(--muted); flex-shrink: 0; }
+.row .v { font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
+
+/* 状态徽章（运行中 / 已停止 / 启动中）与彩色小圆点 */
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+.dot-ok { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
+.dot-warn { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 20%, transparent); }
+.dot-fail { background: var(--fail); box-shadow: 0 0 0 3px color-mix(in srgb, var(--fail) 20%, transparent); }
+.dot-idle { background: var(--muted); }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+.badge-ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.badge-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.badge-fail { color: var(--fail); background: color-mix(in srgb, var(--fail) 14%, transparent); }
+.badge-idle { color: var(--muted); background: var(--panel-2); }
+
+/* 卡片头部：图标 + 标题 + 右侧辅助信息，一行对齐 */
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.card-head h3 { margin: 0; }
+
+/* key-value 强化：key 前加一个中性小标记，value 强调可读性 */
+.row .v strong { font-weight: 700; color: var(--text); }
+
+/* ---------- controls ---------- */
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-danger { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 50%, var(--line)); }
+.btn-ghost { background: none; }
+
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+
+input[type="text"], input[type="password"], input[type="number"], select, textarea {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  padding: 7px 9px;
+  font: inherit;
+}
+textarea { resize: vertical; }
+label.field { display: block; margin-bottom: 10px; }
+label.field > span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+label.checkbox { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+label.checkbox input { width: auto; }
+
+/* ---------- log viewer ---------- */
+
+.logbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+pre.log {
+  background: #0b0e14;
+  color: #c9d1d9;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  max-height: 60vh;
+  overflow: auto;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+pre.log.log-sm { max-height: 24vh; margin-top: 8px; }
+@media (prefers-color-scheme: light) {
+  pre.log { background: #fbfcfd; color: #1f2328; }
+}
+
+/* ---------- tables ---------- */
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+table.data th, table.data td {
+  text-align: left;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+table.data th { color: var(--muted); font-weight: 600; }
+table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
+table.data tbody tr:hover { background: var(--panel-2); }
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.tag-ok { color: var(--ok); }
+.tag-warn { color: var(--warn); }
+.tag-fail { color: var(--fail); }
+.tag-current { color: var(--accent); border-color: var(--accent); }
+
+.scroll { overflow-x: auto; }
+
+/* ---------- resource meters ---------- */
+
+.meter {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  overflow: hidden;
+  margin: 2px 0 6px;
+}
+.meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width .5s ease;
+}
+.meter-cpu { background: var(--accent); }
+.meter-mem { background: var(--warn); }
+.meter-high { background: var(--fail); }
+.subhead {
+  margin: 10px 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ---------- toasts ---------- */
+
+.toast-host {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 50;
+}
+.toast {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 9px 13px;
+  max-width: 380px;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, .28);
+}
+.toast-ok { border-left-color: var(--ok); }
+.toast-error { border-left-color: var(--fail); }
+
+/* ---------- auth gate ---------- */
+
+.gate {
+  max-width: 340px;
+  margin: 14vh auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 22px;
+}
+.gate h2 { margin: 0 0 4px; font-size: 17px; }
+.gate p { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+
+.footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 24px;
+  font-size: 12px;
+  border-top: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.empty { color: var(--muted); padding: 14px 0; }
+
+/* 工作区卡片网格（对齐 Go 版工作区页的双列布局） */
+.ws-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+}
+.ws-card code {
+  font-size: 12px;
+  word-break: break-all;
+}
+.browse-link {
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+.browse-link:hover { text-decoration: underline; }
+.browse-box { margin-top: 14px; }
+
+
+/* 首页卡片内占位内容也参与 flex 撑开，让按钮贴底对齐 */
+.overview-grid > .card .empty {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+}
+.overview-grid > .card #resources {
+  flex: 1 1 auto;
+}
+
+.spin { animation: spin 1.1s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.noscript { padding: 24px; }

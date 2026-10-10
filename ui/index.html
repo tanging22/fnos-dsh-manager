@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Asset URLs are relative on purpose. fnOS serves this app through its unified
+  gateway at /app/dsh-console/, where an absolute /assets/... would escape the
+  prefix and 404. Relative URLs resolve correctly both behind that prefix and
+  when the panel is opened directly on :28001. See dom.js for the same rule
+  applied to API calls.
+-->
+<meta name="robots" content="noindex, nofollow">
+<title>DSH 控制台</title>
+<link rel="icon" href="assets/icon.png" type="image/png">
+<link rel="stylesheet" href="assets/app.css">
+</head>
+<body>
+<div id="app" class="shell" hidden>
+  <!-- 左侧边栏：品牌卡 + 主导航 + 底部分隔 + 设置菜单（对齐 Go 版 App.vue 的 NLayoutSider） -->
+  <aside class="sider" id="sider">
+    <button id="sider-toggle" class="sider-toggle" type="button" title="折叠/展开侧栏" aria-label="折叠或展开侧栏">
+      <span class="toggle-chevron">❮</span>
+    </button>
+    <div class="sider-top">
+      <div class="brand-card">
+        <img class="brand-mark" src="assets/icon.png" alt="" width="32" height="32">
+        <div class="brand-text">
+          <div class="brand-row">
+            <strong>DeepSeek</strong>
+          </div>
+          <span class="brand-sub">Harness 管理器</span>
+        </div>
+      </div>
+
+      <nav class="menu" role="tablist">
+        <button class="menu-item" role="tab" data-tab="overview" aria-selected="true"><span class="mi-icon">📊</span>概览</button>
+        <button class="menu-item" role="tab" data-tab="workspace" aria-selected="false"><span class="mi-icon">📁</span>工作区</button>
+        <button class="menu-item" role="tab" data-tab="plugins" aria-selected="false"><span class="mi-icon">🧩</span>插件管理</button>
+        <button class="menu-item" role="tab" data-tab="versions" aria-selected="false"><span class="mi-icon">🔄</span>版本</button>
+        <button class="menu-item" role="tab" data-tab="access" aria-selected="false"><span class="mi-icon">👥</span>访问记录</button>
+        <button class="menu-item" role="tab" data-tab="shortcuts" aria-selected="false"><span class="mi-icon">🔗</span>快捷入口</button>
+        <button class="menu-item" role="tab" data-tab="logs" aria-selected="false"><span class="mi-icon">📄</span>运行日志</button>
+      </nav>
+    </div>
+
+    <div class="sider-bottom">
+      <nav class="menu" role="tablist">
+        <button class="menu-item" role="tab" data-tab="settings" aria-selected="false"><span class="mi-icon">⚙️</span>应用设置</button>
+      </nav>
+    </div>
+  </aside>
+
+  <!-- 右侧主界面 -->
+  <div class="main">
+    <header class="topbar">
+      <h1 id="page-title" class="page-title">概览</h1>
+      <div class="topbar-right">
+        <span id="status-pill" class="pill pill-idle">…</span>
+        <button id="refresh" class="btn" type="button">刷新</button>
+      </div>
+    </header>
+
+    <main id="view" class="view"></main>
+
+    <footer class="footer muted">
+      <span id="footer-left"></span>
+      <span id="footer-right"></span>
+    </footer>
+  </div>
+</div>
+
+<div id="toast-host" class="toast-host" aria-live="polite"></div>
+
+<script type="module" src="assets/app.js"></script>
+<noscript><p class="noscript">此控制台需要启用 JavaScript。</p></noscript>
+</body>
+</html>

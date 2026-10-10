@@ -1,0 +1,32 @@
+#!/bin/bash
+# upgrade_init — 升级前准备
+#
+# 与卸载不同: 升级必须**保留** ${DATA_DIR} 里的配置、访问日志和已下载的
+# dsh 版本。这里只停进程。
+set -u
+
+APP_NAME="${TRIM_APPNAME:-dsh-console}"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}}"
+DATA_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+LOG="${DATA_DIR}/upgrade.log"
+
+mkdir -p "${DATA_DIR}" 2>/dev/null || true
+echo "[$(date '+%F %T')] upgrade_init start (from ${APP_DIR})" >> "${LOG}"
+
+if [ -x "${APP_DIR}/cmd/main" ]; then
+    "${APP_DIR}/cmd/main" stop >> "${LOG}" 2>&1
+    echo "[$(date '+%F %T')] cmd/main stop exit=$?" >> "${LOG}"
+fi
+
+for pidfile in "${DATA_DIR}/console.pid" "${DATA_DIR}/proxy.pid" "${DATA_DIR}/dsh.pid"; do
+    [ -f "${pidfile}" ] || continue
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+        kill "${pid}" 2>/dev/null || true
+        echo "[$(date '+%F %T')] killed ${pid} (${pidfile})" >> "${LOG}"
+    fi
+    rm -f "${pidfile}" 2>/dev/null || true
+done
+
+echo "[$(date '+%F %T')] upgrade_init done; data preserved at ${DATA_DIR}" >> "${LOG}"
+exit 0

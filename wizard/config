@@ -1,0 +1,20 @@
+[
+  {
+    "stepTitle": "面板设置",
+    "items": [
+      {
+        "type": "tips",
+        "field": "wizard_config_note",
+        "helpText": "面板的所有设置（登录密码、受信主机、端口、日志保留、版本切换）都在面板网页里改，无需在此配置。"
+      },
+      {
+        "type": "switch",
+        "field": "wizard_purge_data",
+        "label": "卸载时删除全部数据",
+        "description": "开启后，卸载本应用会把 dsh 工作区（会话、凭据、插件配置）与已下载的 dsh 版本一并删除；关闭则保留数据，重装后可继续使用。默认关闭。",
+        "default": false,
+        "required": false
+      }
+    ]
+  }
+]

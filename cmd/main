@@ -1,0 +1,300 @@
+#!/bin/bash
+# cmd/main — dsh-console 生命周期脚本 (start / stop / status / restart)
+#
+# 启两个进程:
+#   1. Node 面板本身 (cmd/dashboard.js), 监听 CONSOLE_PORT (:28001)
+#   2. Python 网关代理 (cmd/proxy.py), 监听 unix socket -> 面板
+#
+# 健壮性要点 (抄上游 dashboard-app 的教训):
+#   - pid 文件可能陈旧, NAS 重启后 pid 号会被无关进程复用 → 必须校验
+#     /proc/<pid>/cmdline 确实属于本应用再认定"在跑";
+#   - 进程活着 ≠ 端点可用 → 启动后轮询健康检查, 失败自动重试;
+#   - fnOS 升级期间 sock 文件还在交接 → 代理自己有绑定退避.
+set -u
+
+APP_NAME="${TRIM_APPNAME:-dsh-console}"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}}"
+
+# ── 卷与数据目录定位 ──
+# fnOS 会注入 TRIM_APPDEST_VOL (=/vol{n}, 应用所在的存储卷) 与 TRIM_PKGVAR
+# (=运行时数据目录). 这里优先信官方变量; 只有它们缺失时才回退到软链推导.
+# 之前 APP_VOL 只在 TRIM_PKGVAR 为空的分支里算, 而 fnOS 永远注入 TRIM_PKGVAR,
+# 于是 APP_VOL 恒为空, 依赖应用路径(/vol{n}/@appcenter/...)永远拼错 —— 已修.
+APP_VOL="${TRIM_APPDEST_VOL:-}"
+if [ -z "${APP_VOL}" ]; then
+    for probe in "${APP_DIR}/home" "${APP_DIR}"; do
+        APP_VOL="$(readlink -f "${probe}" 2>/dev/null | sed -n 's#^\(/vol[^/]*\)/.*#\1#p')"
+        [ -n "${APP_VOL}" ] && break
+    done
+fi
+
+if [ -n "${TRIM_PKGVAR:-}" ]; then
+    DATA_DIR="${TRIM_PKGVAR}"
+elif [ -n "${APP_VOL}" ]; then
+    DATA_DIR="${APP_VOL}/@appdata/${APP_NAME}"
+else
+    DATA_DIR="${APP_DIR}/var"
+fi
+
+CMD_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROXY_PY="${CMD_DIR}/proxy.py"
+PANEL_JS="${CMD_DIR}/dashboard.js"
+
+# ── 面板静态 UI 目录 ──
+# TRIM_APPDEST 本身就是 target 目录的真实路径 (/vol{n}/@appcenter/{appname}),
+# app.tgz 的 ui/ 就解压在这里, 所以是 ${APP_DIR}/ui 而不是 ${APP_DIR}/target/ui.
+# dashboard-server.js 认 CONSOLE_UI env, 缺省回落到 ../ui (开发树才成立).
+CONSOLE_UI_DIR="${CONSOLE_UI:-}"
+if [ -z "${CONSOLE_UI_DIR}" ]; then
+    for cand in "${APP_DIR}/ui" "${APP_DIR}/target/ui" "${CMD_DIR}/../ui" "${CMD_DIR}/../../ui"; do
+        [ -f "${cand}/index.html" ] && CONSOLE_UI_DIR="$(cd "${cand}" && pwd)" && break
+    done
+fi
+[ -n "${CONSOLE_UI_DIR}" ] || CONSOLE_UI_DIR="${APP_DIR}/ui"
+
+CONSOLE_PORT="${CONSOLE_PORT:-${TRIM_SERVICE_PORT:-28001}}"
+GATEWAY_PREFIX="/app/${APP_NAME}"
+# fnOS 统一网关固定转发到 /var/apps/{appname}/target/app.sock (gatewaySocket 只填
+# 文件名, 网关自己拼路径). 这里直接写软链形式, 与网关转发目标逐字一致:
+#   /var/apps/{appname}/target  ->  /vol{n}/@appcenter/{appname}  (= TRIM_APPDEST)
+# 软链在"fnOS 注入 TRIM_APPDEST"和"手动调试无 TRIM_APPDEST"两种环境都成立, 不依赖
+# TRIM_APPDEST 是否注入. 之前曾写成 ${APP_DIR}/target/app.sock (APP_DIR=TRIM_APPDEST
+# 已是 target 真实路径, 再拼 /target 指向不存在的目录) → 代理 bind 失败 → 网关连
+# 不上 → 内嵌页 Bad Gateway.
+SOCK_PATH="/var/apps/${APP_NAME}/target/app.sock"
+
+PANEL_LOG="${DATA_DIR}/console.log"
+PANEL_PID="${DATA_DIR}/console.pid"
+PROXY_LOG="${DATA_DIR}/proxy.log"
+PROXY_PID="${DATA_DIR}/proxy.pid"
+
+# ── node 定位 ──
+# fnOS 的运行时依赖应用是**按版本隔离**的, 不是 Linux 通用 /usr/bin/node.
+# 实测路径(飞牛论坛确认)有两种视角, 本质是同一处:
+#   /var/apps/nodejs_v22/target/bin   (target 是软链, 指向真实位置)
+#   /vol{n}/@appcenter/nodejs_v22/bin (真实位置, 无 target 层)
+# 版本号会变(v20/v22/v24...), 所以按 nodejs_* 通配扫描 + 多个卷, 再兜底系统路径.
+NODE_BIN=""
+_find_node() {
+    local cand
+    # 1) 依赖应用: 任意版本、任意卷, 两种层级结构都要.
+    for cand in /var/apps/nodejs_*/target/bin/node /var/apps/nodejs_*/bin/node; do
+        [ -x "$cand" ] && { NODE_BIN="$cand"; return 0; }
+    done
+    for cand in /vol[0-9]*/@appcenter/nodejs_*/bin/node /vol[0-9]*/@appcenter/nodejs_*/target/bin/node; do
+        [ -x "$cand" ] && { NODE_BIN="$cand"; return 0; }
+    done
+    # 2) 本应用自身卷下的依赖.
+    for cand in "${APP_VOL:-}/@appcenter/nodejs_*/bin/node"; do
+        [ -x "$cand" ] && { NODE_BIN="$cand"; return 0; }
+    done
+    # 3) 系统兜底.
+    for cand in /usr/local/bin/node /usr/bin/node; do
+        [ -x "$cand" ] && { NODE_BIN="$cand"; return 0; }
+    done
+    return 1
+}
+_find_node || NODE_BIN="$(command -v node 2>/dev/null || true)"
+[ -n "${NODE_BIN}" ] || NODE_BIN="node"
+
+PYTHON_BIN=""
+_find_python() {
+    local cand
+    for cand in /var/apps/python3*/target/bin/python3 /var/apps/python3*/bin/python3; do
+        [ -x "$cand" ] && { PYTHON_BIN="$cand"; return 0; }
+    done
+    for cand in /vol[0-9]*/@appcenter/python3*/bin/python3 /vol[0-9]*/@appcenter/python3*/target/bin/python3; do
+        [ -x "$cand" ] && { PYTHON_BIN="$cand"; return 0; }
+    done
+    for cand in "${APP_VOL:-}/@appcenter/python3*/bin/python3"; do
+        [ -x "$cand" ] && { PYTHON_BIN="$cand"; return 0; }
+    done
+    for cand in /usr/bin/python3 /usr/local/bin/python3 /bin/python3; do
+        [ -x "$cand" ] && { PYTHON_BIN="$cand"; return 0; }
+    done
+    return 1
+}
+_find_python || PYTHON_BIN="$(command -v python3 2>/dev/null || true)"
+[ -n "${PYTHON_BIN}" ] || PYTHON_BIN="python3"
+
+# 把定位结果写进日志, 下次诊断一眼能看到 node 到底找到没有.
+echo "[$(date '+%F %T')] boot: node=${NODE_BIN} python=${PYTHON_BIN} APP_VOL=${APP_VOL:-<none>} DATA_DIR=${DATA_DIR}" >> "${PANEL_LOG}" 2>/dev/null || true
+
+mkdir -p "${DATA_DIR}" "$(dirname "${SOCK_PATH}")" 2>/dev/null || true
+
+# ── 进程身份校验 ──
+# kill -0 只能证明"有个进程", 证明不了"是我们的进程".
+pid_cmdline_has() {
+    local pid="$1" pat="$2"
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -q -- "${pat}" && return 0
+        return 1
+    fi
+    ps -p "${pid}" -o args= 2>/dev/null | grep -q -- "${pat}"
+}
+
+running() {
+    pid_cmdline_has "$(cat "$1" 2>/dev/null || true)" "$2"
+}
+
+port_alive() {
+    bash -c "exec 3<>/dev/tcp/127.0.0.1/${CONSOLE_PORT}" 2>/dev/null
+}
+
+sock_alive() {
+    [ -S "${SOCK_PATH}" ] || return 1
+    "${PYTHON_BIN}" -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(2)
+try:
+    s.connect(sys.argv[1])
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+' "${SOCK_PATH}" 2>/dev/null
+}
+
+start_panel() {
+    local attempt=1 max=3 waited
+    while [ "${attempt}" -le "${max}" ]; do
+        DATA_DIR="${DATA_DIR}" \
+        CONSOLE_PORT="${CONSOLE_PORT}" \
+        CONSOLE_UI="${CONSOLE_UI_DIR}" \
+        TRIM_APPNAME="${APP_NAME}" \
+        TRIM_APPDEST="${APP_DIR}" \
+        TRIM_PKGVAR="${DATA_DIR}" \
+        nohup "${NODE_BIN}" "${PANEL_JS}" >> "${PANEL_LOG}" 2>&1 &
+        echo $! > "${PANEL_PID}"
+        waited=0
+        while [ "${waited}" -lt 20 ]; do
+            sleep 1
+            waited=$((waited + 1))
+            running "${PANEL_PID}" "dashboard.js" || break
+            port_alive && { echo "panel healthy after ${waited}s (pid $(cat "${PANEL_PID}"))"; return 0; }
+        done
+        echo "WARN: panel not healthy after ${waited}s (attempt ${attempt}/${max})" >&2
+        stop_panel
+        attempt=$((attempt + 1))
+        [ "${attempt}" -le "${max}" ] && sleep "$((attempt * 2))"
+    done
+    echo "ERROR: panel failed to start; see ${PANEL_LOG}" >&2
+    return 1
+}
+
+start_proxy() {
+    [ -f "${PROXY_PY}" ] || { echo "WARN: ${PROXY_PY} missing; gateway entry unavailable" >&2; return 0; }
+    CONSOLE_PORT="${CONSOLE_PORT}" \
+    SOCK_PATH="${SOCK_PATH}" \
+    GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
+    nohup "${PYTHON_BIN}" "${PROXY_PY}" >> "${PROXY_LOG}" 2>&1 &
+    echo $! > "${PROXY_PID}"
+    echo "gateway proxy started (pid $(cat "${PROXY_PID}")) ${SOCK_PATH} -> 127.0.0.1:${CONSOLE_PORT}"
+    # 网关拿 socket 当就绪信号: 绑不上 socket, 内嵌页就是 Bad Gateway.
+    # 这里等它真正把 socket 建出来, 建不出来就报错(而不是让网关自己发现).
+    local waited=0
+    while [ "${waited}" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+        [ -S "${SOCK_PATH}" ] && { echo "gateway socket ready after ${waited}s"; return 0; }
+        running "${PROXY_PID}" "proxy.py" || break
+    done
+    echo "ERROR: gateway socket ${SOCK_PATH} not created; see ${PROXY_LOG}" >&2
+    return 1
+}
+
+stop_panel() {
+    if [ -f "${PANEL_PID}" ] && running "${PANEL_PID}" "dashboard.js"; then
+        kill "$(cat "${PANEL_PID}")" 2>/dev/null || true
+    fi
+    rm -f "${PANEL_PID}" 2>/dev/null || true
+    pkill -f "${PANEL_JS}" 2>/dev/null || true
+}
+
+stop_proxy() {
+    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py"; then
+        kill "$(cat "${PROXY_PID}")" 2>/dev/null || true
+    fi
+    rm -f "${PROXY_PID}" 2>/dev/null || true
+    pkill -f "${PROXY_PY}" 2>/dev/null || true
+    [ -e "${SOCK_PATH}" ] && rm -f "${SOCK_PATH}" 2>/dev/null || true
+}
+
+start() {
+    # 陈旧 pid 文件清理: 指向的进程不是我们的 → 删除重来
+    [ -f "${PANEL_PID}" ] && running "${PANEL_PID}" "dashboard.js" || rm -f "${PANEL_PID}" 2>/dev/null || true
+    [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py" || rm -f "${PROXY_PID}" 2>/dev/null || true
+
+    if [ -f "${PANEL_PID}" ]; then
+        if running "${PANEL_PID}" "dashboard.js" && port_alive; then
+            echo "panel already running (pid $(cat "${PANEL_PID}"))"
+        else
+            echo "WARN: panel pid alive but port ${CONSOLE_PORT} dead; restarting"
+            stop_panel
+            sleep 1
+            start_panel || return 1
+        fi
+    else
+        start_panel || return 1
+    fi
+
+    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py" && [ -S "${SOCK_PATH}" ]; then
+        echo "proxy already running (pid $(cat "${PROXY_PID}"))"
+    else
+        [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py" && stop_proxy
+        start_proxy || return 1
+    fi
+    return 0
+}
+
+stop() {
+    stop_proxy
+    stop_panel
+    echo "stopped"
+}
+
+# fnOS 约定 status 的退出码: 0 = 正在运行, 3 = 未运行. (framework.md)
+# 之前这里 return 后被 case 末尾的 exit 0 吞掉, 导致 cmd/main status 永远
+# 退出 0, fnOS 于是永远显示"运行中"而实际进程早没了 —— 这是"图标点开
+# Bad Gateway / 28001 拒绝连接"的根因之一.
+status() {
+    local panel_ok=0 proxy_ok=0
+    if [ -f "${PANEL_PID}" ] && running "${PANEL_PID}" "dashboard.js"; then
+        if port_alive; then
+            echo "panel running (pid $(cat "${PANEL_PID}")) on :${CONSOLE_PORT}"
+        else
+            echo "panel degraded (pid $(cat "${PANEL_PID}") alive, port ${CONSOLE_PORT} unreachable)"
+            panel_ok=1
+        fi
+    else
+        echo "panel stopped"
+        panel_ok=1
+    fi
+    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py"; then
+        if sock_alive; then
+            echo "proxy running (pid $(cat "${PROXY_PID}")) ${SOCK_PATH}"
+        else
+            echo "proxy degraded (pid alive, no socket)"
+            proxy_ok=1
+        fi
+    else
+        echo "proxy stopped"
+        proxy_ok=1
+    fi
+    # 面板活着就算"运行中"(proxy 是可选网关桥, 缺了不该判整个应用停摆).
+    if [ "${panel_ok}" -eq 0 ]; then
+        return 0
+    fi
+    return 3
+}
+
+case "${1:-start}" in
+    start)   start; exit $? ;;
+    stop)    stop; exit $? ;;
+    status)  status; exit $? ;;
+    restart) stop; sleep 1; start; exit $? ;;
+    *) echo "Usage: $0 {start|stop|status|restart}"; exit 1 ;;
+esac

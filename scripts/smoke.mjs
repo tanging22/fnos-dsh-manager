@@ -1,0 +1,434 @@
+#!/usr/bin/env node
+/**
+ * End-to-end smoke test, runnable on the NAS or on a dev box.
+ *
+ * It boots the real panel against a throwaway DATA_DIR, drives its HTTP API the
+ * way the browser does, and asserts the behaviour that actually matters:
+ *  - the trust fence rejects an untrusted Host,
+ *  - there is no auth gate (fnOS's gateway authenticates; the panel serves once
+ *    the trust fence passes, and ignores any x-console-key header),
+ *  - every view's endpoint answers with the shape the UI expects,
+ *  - the reverse proxy records a visit (the whole reason it exists),
+ *  - log tailing survives a file it cannot read.
+ *
+ * Nothing here touches the real dsh instance: DSH_PORT points at a stub the
+ * test starts itself, so `npm run smoke` is safe on a live box.
+ */
+
+import { spawn } from 'node:child_process'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
+import { createServer } from 'node:http'
+import { connect } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+const PANEL_PORT = 29001
+const STUB_PORT = 29000
+const PASSWORD = 'smoke-test-key'
+
+const sandbox = mkdtempSync(join(tmpdir(), 'dsh-console-smoke-'))
+const dataDir = join(sandbox, 'data')
+const homeDir = join(dataDir, 'dsh_home')
+mkdirSync(join(homeDir, 'profiles', 'web'), { recursive: true })
+mkdirSync(join(dataDir, 'logs'), { recursive: true })
+writeFileSync(join(homeDir, '.credentials.yaml'), `DEEPSEEK_API_KEY: ${PASSWORD}\n`)
+writeFileSync(join(dataDir, 'dsh.log'), 'stub log line one\nstub log line two\n')
+
+const checks = []
+function check(name, condition, detail) {
+  checks.push({ name, ok: Boolean(condition), detail })
+  console.log(`${condition ? 'ok  ' : 'FAIL'}  ${name}${condition || !detail ? '' : ` — ${detail}`}`)
+}
+
+/** The dsh the panel proxies to; records that it was reached. */
+let stubHits = 0
+const stub = createServer((request, response) => {
+  stubHits += 1
+  response.writeHead(200, { 'content-type': 'text/plain' })
+  response.end(`stub:${request.url}`)
+})
+
+const panelEnv = {
+  ...process.env,
+  DATA_DIR: dataDir,
+  DSH_HOME: homeDir,
+  CONSOLE_PORT: String(PANEL_PORT),
+  DSH_PORT: String(STUB_PORT),
+  TRIM_APPNAME: 'dsh-console',
+  TRIM_APPDEST: join(sandbox, 'app'),
+  TRIM_PKGVAR: dataDir,
+  MANAGED_APP_DIR: join(sandbox, 'app'),
+  CONSOLE_UI: join(ROOT, 'ui'),
+}
+
+const panel = spawn(process.execPath, [join(ROOT, 'cmd', 'dashboard.js')], {
+  env: panelEnv,
+  stdio: ['ignore', 'pipe', 'pipe'],
+})
+
+let panelOutput = ''
+panel.stdout.on('data', (chunk) => { panelOutput += chunk })
+panel.stderr.on('data', (chunk) => { panelOutput += chunk })
+
+const base = `http://127.0.0.1:${PANEL_PORT}`
+
+async function waitForPanel(timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${base}/api/status`)
+      if (response.status) return true
+    } catch { /* not up yet */ }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  return false
+}
+
+/** Call the API the way the UI does, with the key header. */
+function call(path, { method = 'GET', key = PASSWORD, headers = {}, body } = {}) {
+  const init = { method, headers: { ...headers } }
+  if (key) init.headers['x-console-key'] = key
+  if (body !== undefined) {
+    init.body = JSON.stringify(body)
+    init.headers['content-type'] = 'application/json'
+  }
+  return fetch(`${base}${path}`, init)
+}
+
+async function jsonOf(response) {
+  const text = await response.text()
+  try {
+    return JSON.parse(text)
+  } catch {
+    return { __raw: text }
+  }
+}
+
+/**
+ * Poll `probe` until it returns a non-null value, or fail after `timeoutMs`.
+ *
+ * Several parts of the panel are deliberately asynchronous (the visitor log
+ * batches writes; service start waits on health checks), so the honest test is
+ * "it converges", not "it is instant".
+ */
+async function waitFor(probe, { timeoutMs = 5000, intervalMs = 150, description = 'condition' } = {}) {
+  const deadline = Date.now() + timeoutMs
+  let last = null
+  while (Date.now() < deadline) {
+    last = await probe()
+    if (last !== null && last !== undefined && last !== false) return last
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
+  console.log(`      (timed out waiting for ${description} after ${timeoutMs}ms)`)
+  return last === false ? null : null
+}
+
+/**
+ * Send a raw HTTP/1.1 request and return the status line plus body.
+ *
+ * `fetch` cannot express a forged Host header — undici treats it as forbidden
+ * and silently substitutes the real one — so the trust fence has to be tested
+ * over a plain socket. That is exactly the attack path a hostile client would
+ * take, which makes it the honest test.
+ */
+function rawRequest({ host, path = '/', method = 'GET', extraHeaders = [] }) {
+  return new Promise((resolve, reject) => {
+    const socket = connect(PANEL_PORT, '127.0.0.1', () => {
+      const lines = [
+        `${method} ${path} HTTP/1.1`,
+        `Host: ${host}`,
+        'Connection: close',
+        ...extraHeaders,
+        '',
+        '',
+      ]
+      socket.write(lines.join('\r\n'))
+    })
+    let data = ''
+    socket.setEncoding('utf8')
+    socket.on('data', (chunk) => { data += chunk })
+    socket.on('error', reject)
+    socket.on('end', () => {
+      const status = Number(/^HTTP\/1\.\d (\d{3})/.exec(data)?.[1] ?? 0)
+      const body = data.slice(data.indexOf('\r\n\r\n') + 4)
+      resolve({ status, body })
+    })
+  })
+}
+
+try {
+  await new Promise((resolve) => stub.listen(STUB_PORT, '127.0.0.1', resolve))
+
+  if (!(await waitForPanel())) {
+    console.error('panel did not start within 15s')
+    console.error(panelOutput.slice(-4000))
+    process.exit(1)
+  }
+
+  /* --- trust fence: a Host the panel does not know must be refused --------- */
+  /* Over a raw socket: fetch would rewrite the Host header and the test would
+     pass no matter what the fence does. */
+  const untrusted = await rawRequest({ host: 'evil.example.com', path: '/api/status' })
+  check('untrusted Host is rejected', untrusted.status === 403, `got ${untrusted.status}`)
+  check('rejection names the host', untrusted.body.includes('evil.example.com'), untrusted.body.trim())
+
+  const crossSite = await rawRequest({
+    host: `127.0.0.1:${PANEL_PORT}`,
+    path: '/api/status',
+    extraHeaders: ['Origin: https://evil.example.com'],
+  })
+  check('cross-site Origin is rejected', crossSite.status === 403, `got ${crossSite.status}`)
+
+  const trustedRaw = await rawRequest({ host: `127.0.0.1:${PANEL_PORT}`, path: '/api/status' })
+  check('loopback Host is still allowed', trustedRaw.status === 200, `got ${trustedRaw.status}`)
+
+  /* --- no auth gate: fnOS's gateway authenticates, the panel does not ------ */
+  /* There is deliberately no password check. Every API call is served once it
+     passes the trust fence above; a missing or wrong `x-console-key` header is
+     simply ignored. */
+  const noKey = await call('/api/logs/list', { key: '' })
+  check('request without a key is served', noKey.status === 200, `got ${noKey.status}`)
+
+  const wrongKey = await call('/api/logs/list', { key: 'nope' })
+  check('request with a wrong key is still served', wrongKey.status === 200, `got ${wrongKey.status}`)
+
+  const login = await call('/api/login', { method: 'POST', key: '', body: { password: PASSWORD } })
+  check('login endpoint is gone', login.status === 404, `got ${login.status}`)
+
+  /* --- status ------------------------------------------------------------ */
+  const status = await jsonOf(await call('/api/status'))
+  check('status reports the panel port', status.panel?.port === PANEL_PORT, JSON.stringify(status.panel))
+  check('status reports the configured dsh port', status.port === STUB_PORT, String(status.port))
+  check('status exposes an access-log summary', typeof status.access?.lines === 'number', JSON.stringify(status.access))
+  check('status has no secret in it', !JSON.stringify(status).includes(PASSWORD), 'password leaked into /api/status')
+
+  /* --- logs -------------------------------------------------------------- */
+  const logList = await jsonOf(await call('/api/logs/list'))
+  check('log list finds dsh.log', (logList.files ?? []).some((file) => file.name === 'dsh.log'), JSON.stringify(logList.files))
+  const logBody = await jsonOf(await call('/api/logs?file=dsh.log&lines=10'))
+  /* A file ending in a newline splits to a trailing empty element; the reader
+     keeps it, so compare the meaningful lines. */
+  const meaningful = (logBody.lines ?? []).filter((line) => line !== '')
+  check('log tail returns lines', meaningful.length === 2, JSON.stringify(logBody.lines))
+  const missingLog = await call('/api/logs?file=../../etc/passwd')
+  check('log reader refuses an unknown file', missingLog.status === 404, `got ${missingLog.status}`)
+
+  /* --- versions ---------------------------------------------------------- */
+  const versions = await jsonOf(await call('/api/versions'))
+  check('versions reports a pinned version field', 'current' in versions, JSON.stringify(Object.keys(versions)))
+  check('versions lists installed entries', Array.isArray(versions.installed), JSON.stringify(versions.installed))
+
+  /* --- proxy records a visit (the reason the proxy exists) --------------- */
+  const before = await jsonOf(await call('/api/access?limit=5'))
+  const proxied = await call('/p/hello', { key: '' })
+  check('proxy forwards to dsh', proxied.status === 200, `got ${proxied.status}`)
+  check('proxy upstream actually served it', (await proxied.text()).includes('stub:/hello'), 'stub did not see the request')
+  check('proxy reached the stub exactly once', stubHits === 1, `stubHits=${stubHits}`)
+
+  /* Records are queued and flushed on a timer (see dashboard-access.js), so a
+     read taken immediately after the request can still be empty. Poll instead
+     of asserting instantaneously — that is the real contract. */
+  const after = await waitFor(
+    async () => {
+      const body = await jsonOf(await call('/api/access?limit=5'))
+      return (body.stats?.lines ?? 0) > (before.stats?.lines ?? 0) ? body : null
+    },
+    { timeoutMs: 4000, description: 'access record to appear' },
+  )
+  check('proxy recorded the visit', after !== null,
+    `${before.stats?.lines} -> ${after?.stats?.lines ?? 'unchanged'}`)
+  const newest = after?.entries?.[0]
+  check('recorded entry carries method and path', newest?.method === 'GET' && newest?.path === '/hello', JSON.stringify(newest))
+
+  /* --- diagnostics and settings ----------------------------------------- */
+  const diagnostics = await jsonOf(await call('/api/diagnostics'))
+  /* Diagnostics entries are keyed by `label`; normalise before asserting so the
+     test does not depend on which field the module happens to use. */
+  const checkLabels = (diagnostics.checks ?? []).map((entry) => String(entry.label ?? entry.name ?? entry.id ?? ''))
+  check('diagnostics returns checks', checkLabels.length > 0, JSON.stringify(diagnostics.summary))
+  check('diagnostics flags the missing patch file',
+    checkLabels.some((label) => label.includes('patch')),
+    JSON.stringify(checkLabels))
+
+  const settings = await jsonOf(await call('/api/settings'))
+  check('settings never echoes the key', !JSON.stringify(settings).includes(PASSWORD), JSON.stringify(settings))
+
+  const saved = await jsonOf(await call('/api/settings', {
+    method: 'POST',
+    body: { shortcuts: [{ label: 'Docs', url: 'https://example.com/docs' }], access: { max: 42 } },
+  }))
+  check('settings persist shortcuts', saved.settings?.shortcuts?.[0]?.label === 'Docs', JSON.stringify(saved.settings?.shortcuts))
+  check('settings persist the access cap', saved.settings?.access?.max === 42, String(saved.settings?.access?.max))
+
+  const onDisk = JSON.parse(readFileSync(join(dataDir, 'console-config.json'), 'utf8'))
+  check('settings hit the disk', onDisk.access?.max === 42, JSON.stringify(onDisk.access))
+
+  /* --- shortcuts --------------------------------------------------------- */
+  const shortcuts = await jsonOf(await call('/api/shortcuts'))
+  check('shortcuts include a loopback entry', (shortcuts.entries ?? []).some((entry) => entry.url.includes('127.0.0.1')),
+    JSON.stringify(shortcuts.entries))
+  check('shortcuts include the pinned ones', (shortcuts.custom ?? []).some((entry) => entry.label === 'Docs'),
+    JSON.stringify(shortcuts.custom))
+
+  /* --- service control is safe to call against the stub ------------------ */
+  const stopped = await jsonOf(await call('/api/service/stop', { method: 'POST' }))
+  check('stop reports success', stopped.ok === true, JSON.stringify(stopped))
+
+  /* --- unknown endpoints ------------------------------------------------ */
+  const bogus = await call('/api/does-not-exist')
+  check('unknown endpoint is 404', bogus.status === 404, `got ${bogus.status}`)
+
+  /* --- static UI --------------------------------------------------------- */
+  const html = await fetch(`${base}/`)
+  check('the UI index is served', html.status === 200, `got ${html.status}`)
+  const htmlBody = await html.text()
+  check('UI uses relative asset paths (gateway prefix safe)',
+    htmlBody.includes('assets/app.js') && !htmlBody.includes('"/assets/'), 'absolute /assets/ path found')
+  const script = await fetch(`${base}/assets/app.js`)
+  check('the UI bundle is served', script.status === 200, `got ${script.status}`)
+  const traversal = await fetch(`${base}/assets/../../cmd/dashboard.js`)
+  check('static server refuses traversal', traversal.status === 404, `got ${traversal.status}`)
+
+  /* --- diagnostics shape ------------------------------------------------ */
+  /* The UI renders `c.label`; an earlier API returned `name`, so the whole
+     first column of the Diagnostics table came out blank. Assert the field the
+     UI actually reads, so the two cannot drift apart again. */
+  const diag = await jsonOf(await call('/api/diagnostics'))
+  const diagChecks = diag.checks ?? []
+  check('diagnostics returns checks', diagChecks.length > 0, 'empty checks')
+  check('every diagnostic has a label the UI can render',
+    diagChecks.every((c) => typeof c.label === 'string' && c.label.length > 0),
+    JSON.stringify(diagChecks.map((c) => c.label)))
+  check('every diagnostic has a valid status',
+    diagChecks.every((c) => ['pass', 'warn', 'fail'].includes(c.status)),
+    JSON.stringify(diagChecks.map((c) => c.status)))
+
+  /* --- WebSocket push channel --------------------------------------------
+   *
+   * These are the assertions whose absence let a fatal bug ship: the /ws
+   * handshake used `crypto.createHash`, which throws on Node (the global
+   * `crypto` is WebCrypto and has no createHash). Because the throw happened
+   * inside the server's `upgrade` event with no try/catch, it killed the panel
+   * process — and `ui/assets/app.js` opens /ws unconditionally on load, so
+   * merely opening the panel killed it. `node --check` cannot see that (the
+   * file is in SYNTAX_ONLY, and the code is syntactically valid), and no test
+   * touched /ws, so CI stayed green.
+   *
+   * So: assert the handshake really completes, and assert the panel is STILL
+   * ALIVE afterwards. The liveness half is the one that matters.
+   */
+  let ws
+  try {
+    ws = new WebSocket(`ws://127.0.0.1:${PANEL_PORT}/ws`)
+    const opened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5000)
+      ws.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      ws.addEventListener('error', () => { clearTimeout(timer); resolve(false) })
+    })
+    check('the /ws handshake completes', opened, 'no 101 within 5s')
+
+    // An RFC6455 server must complete the handshake and keep the socket open.
+    check('the /ws socket stays open after the handshake', ws.readyState === 1, `readyState=${ws.readyState}`)
+
+    // A second, concurrent socket must also be served (the client reconnects
+    // on a timer, so more than one panel tab is normal).
+    const second = await new Promise((resolve) => {
+      const s = new WebSocket(`ws://127.0.0.1:${PANEL_PORT}/ws`)
+      const timer = setTimeout(() => resolve(false), 5000)
+      s.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      s.addEventListener('error', () => { clearTimeout(timer); resolve(false) })
+    })
+    check('a second /ws socket is accepted', second, 'second handshake failed')
+    ws?.close()
+  } catch (error) {
+    check('the /ws handshake completes', false, String(error?.message ?? error))
+  }
+
+  // The decisive assertion: the panel must still be serving after /ws traffic.
+  // Before the fix this returned nothing at all — the process was gone.
+  const alive = await call('/api/status').catch((error) => ({ status: `dead: ${error.message}` }))
+  check('the panel SURVIVES the /ws handshake', alive.status === 200, `got ${alive.status}`)
+  check('the panel survives a second request too', (await call('/api/status')).status === 200)
+
+  // A garbage /ws request must be refused without taking the panel with it.
+  // Raw-socket rather than fetch(): fetch() refuses to speak an upgrade, so it
+  // would only prove that the client gave up, not that the server coped.
+  const garbageStatus = await new Promise((resolve) => {
+    const socket = connect(PANEL_PORT, '127.0.0.1', () => {
+      socket.write(`GET /ws HTTP/1.1\r\nHost: 127.0.0.1:${PANEL_PORT}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: x\r\nSec-WebSocket-Version: 13\r\n\r\n`)
+    })
+    const finish = (value) => { try { socket.destroy() } catch { /* ignore */ } resolve(value) }
+    socket.on('data', (chunk) => {
+      const line = String(chunk).split('\r\n')[0] ?? ''
+      const code = Number(/HTTP\/1\.1 (\d{3})/.exec(line)?.[1] ?? 0)
+      finish(code || 'no-status-line')
+    })
+    socket.on('error', () => finish('threw'))
+    setTimeout(() => finish('timeout'), 3000)
+  })
+  check('a malformed /ws handshake is answered, not fatal', /^4|^5/.test(String(garbageStatus)), `got ${garbageStatus}`)
+  check('the panel survives a bad /ws request', (await call('/api/status')).status === 200)
+
+  /* --- config parsing resilience -----------------------------------------
+   * The installer used to write a `//`-commented console-config.json, which
+   * JSON.parse rejects; loadConfig swallowed the error and fell back to
+   * DEFAULTS, so every install-time setting silently vanished.
+   *
+   * Note: this is asserted in-process, in a child that imports
+   * dashboard-config.js fresh. Rewriting the file under the running panel would
+   * NOT exercise the fix — loadConfig memoises for the process lifetime by
+   * design, and a restart is the only thing that re-reads it. That is also
+   * precisely why the original failure was so confusing: the settings had to
+   * survive a panel restart to come back, and nothing said so.
+   */
+  const commentProbe = mkdtempSync(join(tmpdir(), 'dsh-console-cfg-'))
+  const commentDir = join(commentProbe, 'data')
+  mkdirSync(commentDir, { recursive: true })
+  writeFileSync(join(commentDir, 'console-config.json'),
+    '{\n  // an operator left this behind\n  "versions": { "keep": 7 },\n}\n', 'utf8')
+  // A tiny child that imports the panel's own loader with DATA_DIR pointed at
+  // the comment-bearing config — the real code path, not a reimplementation.
+  const probeScript = `
+    process.env.DATA_DIR = ${JSON.stringify(commentDir)}
+    const url = require('url').pathToFileURL(${JSON.stringify(join(ROOT, 'cmd', 'dashboard-config.js'))}).href
+    import(url).then((m) => {
+      const c = m.loadConfig()
+      process.stdout.write(JSON.stringify({ keep: c.versions.keep, err: c.__parseError ?? '' }))
+    }).catch((e) => { process.stdout.write(JSON.stringify({ fatal: String(e && e.message) })) })
+  `
+  const probeOut = await new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e', probeScript], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.on('data', (chunk) => { out += chunk })
+    child.stderr.on('data', () => { /* keep quiet; stdout carries the verdict */ })
+    child.on('close', () => resolve(out))
+    child.on('error', () => resolve(''))
+  })
+  let probed = {}
+  try { probed = JSON.parse(probeOut || '{}') } catch { probed = {} }
+  check('a commented config does not fall back to defaults', probed.keep === 7, `keep=${probed.keep} (want 7) ${probed.fatal ?? ''}${probeOut && !probed.keep ? ` raw=${probeOut.slice(0, 120)}` : ''}`)
+  check('a commented config reports no parse error', probed.err === '', `err=${probed.err}`)
+  rmSync(commentProbe, { recursive: true, force: true })
+  check('the panel is unaffected by the config probe', (await call('/api/status')).status === 200)
+} finally {
+  panel.kill('SIGTERM')
+  stub.close()
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  if (!panel.killed) panel.kill('SIGKILL')
+  if (process.env.KEEP_SMOKE_SANDBOX) {
+    console.log(`sandbox kept at ${sandbox}`)
+  } else {
+    rmSync(sandbox, { recursive: true, force: true })
+  }
+}
+
+const failed = checks.filter((entry) => !entry.ok)
+console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`)
+if (failed.length) {
+  console.log('panel output tail:')
+  console.log(panelOutput.split('\n').slice(-25).join('\n'))
+  process.exit(1)
+}

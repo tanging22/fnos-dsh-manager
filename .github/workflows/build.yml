@@ -1,0 +1,57 @@
+name: build-fpk
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download fnpack 1.2.3 (linux-amd64)
+        run: |
+          mkdir -p tools
+          curl -fsSL -o tools/fnpack https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
+          chmod +x tools/fnpack
+          tools/fnpack --version || true
+
+      - name: Generate icons
+        run: node scripts/make-icons.mjs
+
+      - name: Syntax + import gate
+        run: node scripts/check.mjs
+
+      - name: Smoke test
+        run: node scripts/smoke.mjs
+
+      - name: Build fpk
+        run: bash scripts/build-fpk.sh "$(pwd)/tools/fnpack"
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Upload fpk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-console-fpk
+          path: dist/*.fpk
+          if-no-files-found: error
+
+      - name: Attach to release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.fpk

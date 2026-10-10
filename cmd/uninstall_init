@@ -1,0 +1,62 @@
+#!/bin/bash
+# uninstall_init — 卸载前准备
+#
+# 卸载要停干净: 面板进程、网关代理、以及**由面板拉起的 dsh 实例**都得停.
+# 数据默认保留; 只有应用设置页勾选了 wizard_purge_data 时才把 DATA_DIR 下的
+# dsh 工作区与已下载版本一并删除 (面板本身在应用中心, 不受影响).
+set -u
+
+APP_NAME="${TRIM_APPNAME:-dsh-console}"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}}"
+DATA_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+LOG="${DATA_DIR}/uninstall.log"
+
+mkdir -p "${DATA_DIR}" 2>/dev/null || true
+echo "[$(date '+%F %T')] uninstall_init start" >> "${LOG}"
+
+# 先让生命周期脚本走一遍正常停止 (它认得 pid 文件与进程身份)
+if [ -x "${APP_DIR}/cmd/main" ]; then
+    "${APP_DIR}/cmd/main" stop >> "${LOG}" 2>&1
+    echo "[$(date '+%F %T')] cmd/main stop exit=$?" >> "${LOG}"
+fi
+
+# 兜底: 面板拉起的 dsh 可能有自己的 pid 文件
+for pidfile in "${DATA_DIR}/console.pid" "${DATA_DIR}/proxy.pid" "${DATA_DIR}/dsh.pid"; do
+    [ -f "${pidfile}" ] || continue
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+        kill "${pid}" 2>/dev/null || true
+        echo "[$(date '+%F %T')] killed ${pid} (${pidfile})" >> "${LOG}"
+    fi
+    rm -f "${pidfile}" 2>/dev/null || true
+done
+
+# 网关 socket 残留会让下次安装时代理绑定失败
+[ -e "${TRIM_APPDEST_SOCK:-/var/apps/${APP_NAME}/target/app.sock}" ] \
+    && rm -f "${TRIM_APPDEST_SOCK:-/var/apps/${APP_NAME}/target/app.sock}" 2>/dev/null || true
+
+# ── 可选: 删除全部数据 ──
+# 应用设置页 (wizard/config) 勾选 wizard_purge_data 后, 卸载同时清掉 dsh
+# 工作区 (会话/凭据/插件配置) 与已下载的版本目录. 只在能确认非空 DATA_DIR
+# 时执行, 且日志先落到别处再删, 避免删一半把自己脚下的目录撕了.
+if [ "${wizard_purge_data:-}" = "true" ] || [ "${wizard_purge_data:-}" = "1" ] || [ "${wizard_purge_data:-}" = "on" ]; then
+    PURGE_LOG="/tmp/dsh-console-purge.log"
+    {
+        echo "[$(date '+%F %T')] purge requested (wizard_purge_data), target=${DATA_DIR}"
+        if [ -d "${DATA_DIR}/dsh_home" ]; then
+            rm -rf "${DATA_DIR}/dsh_home" && echo "removed ${DATA_DIR}/dsh_home"
+        fi
+        if [ -d "${DATA_DIR}/versions" ]; then
+            rm -rf "${DATA_DIR}/versions" && echo "removed ${DATA_DIR}/versions"
+        fi
+        # 其余面板数据: 配置/缓存/日志/pid
+        find "${DATA_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null \
+            && echo "removed remaining entries in ${DATA_DIR}"
+        echo "[$(date '+%F %T')] purge done"
+    } >> "${PURGE_LOG}" 2>&1 || true
+    # 数据目录已被清空时 fnOS 卸载流程可能还要写日志, 重建一个空目录兜底
+    mkdir -p "${DATA_DIR}" 2>/dev/null || true
+fi
+
+echo "[$(date '+%F %T')] uninstall_init done (data kept at ${DATA_DIR})" >> "${LOG}"
+exit 0

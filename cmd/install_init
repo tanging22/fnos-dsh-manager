@@ -1,0 +1,6 @@
+#!/bin/bash
+### This script is called before the user installs the application.
+
+# dsh-console 安装前不需要准备任何东西; 数据目录与依赖由
+# install_callback 创建. 保留此脚本纯粹是为了满足 fnpack 的生命周期约定.
+exit 0

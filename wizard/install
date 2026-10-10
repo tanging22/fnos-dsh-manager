@@ -1,0 +1,47 @@
+[
+  {
+    "stepTitle": "基本配置",
+    "items": [
+      {
+        "type": "password",
+        "field": "wizard_deepseek_api_key",
+        "label": "DeepSeek API Key",
+        "description": "粘贴你的 DeepSeek API Key，面板登录密码默认取它。留空则面板随机生成一个登录密码。",
+        "required": false
+      },
+      {
+        "type": "text",
+        "field": "wizard_proxy_ip",
+        "label": "代理 IP",
+        "description": "可选。需要代理访问 npm 时才填。",
+        "required": false
+      },
+      {
+        "type": "text",
+        "field": "wizard_proxy_port",
+        "label": "代理端口",
+        "description": "可选，与代理 IP 配合使用。",
+        "required": false
+      }
+    ]
+  },
+  {
+    "stepTitle": "网络访问",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_fnos_id",
+        "label": "fnOS ID",
+        "description": "可选。填入后自动把 <id>.fnos.net 加入受信主机，方便从外网网关访问。",
+        "required": false
+      },
+      {
+        "type": "text",
+        "field": "wizard_custom_domain",
+        "label": "自定义域名",
+        "description": "可选。额外允许的受信域名。",
+        "required": false
+      }
+    ]
+  }
+]

@@ -1,0 +1,19 @@
+{
+  "data-share": {
+    "shares": [
+      {
+        "name": "dsh",
+        "permission": {
+          "rw": ["dsh"]
+        }
+      },
+      {
+        "name": "dsh/data",
+        "permission": {
+          "rw": ["dsh"]
+        }
+      }
+    ]
+  },
+  "api-scope": ["trim.file.sharedAccess"]
+}

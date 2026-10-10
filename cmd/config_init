@@ -1,0 +1,22 @@
+#!/bin/bash
+# config_init — 套件「设置」页被打开前的准备
+#
+# 面板自带设置页（Settings 标签），fnOS 的套件设置入口只是把浏览器指向面板，
+# 所以这里只负责确认面板在跑；不在跑就拉起来。
+set -u
+
+APP_NAME="${TRIM_APPNAME:-dsh-console}"
+APP_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}}"
+DATA_DIR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+CONSOLE_PORT="${CONSOLE_PORT:-28001}"
+LOG="${DATA_DIR}/config.log"
+
+mkdir -p "${DATA_DIR}" 2>/dev/null || true
+echo "[$(date '+%F %T')] config_init" >> "${LOG}"
+
+if ! bash -c "exec 3<>/dev/tcp/127.0.0.1/${CONSOLE_PORT}" 2>/dev/null; then
+    echo "[$(date '+%F %T')] panel not listening; starting" >> "${LOG}"
+    [ -x "${APP_DIR}/cmd/main" ] && "${APP_DIR}/cmd/main" start >> "${LOG}" 2>&1
+fi
+
+exit 0
