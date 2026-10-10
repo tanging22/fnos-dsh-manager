@@ -25,6 +25,7 @@ import { dirname, join } from 'node:path'
 import {
   activeDshHome,
   lanAddresses,
+  nodeDirEnv,
   runWithTimeout,
 } from './dashboard-utils.js'
 import {
@@ -656,7 +657,14 @@ export async function startDsh() {
   // /bin/sh (always present, even on a minimal NAS), and finally to the panel's
   // own inherited SHELL. This is the one terminal fix within the panel's power.
   const terminalShell = identity.shell || process.env.SHELL || '/bin/sh'
-  const env = {
+  // nodeDirEnv 把 node 的 bin 目录 + 系统目录补进 PATH：面板自身是被 fnOS 套件
+  // 框架降权启动的，环境里通常**没有 PATH**（实测 /proc/<pid>/environ 缺 PATH）。
+  // 若原样 `...process.env` 传给 dsh，dsh 装插件时内部 pnpm 要执行依赖的
+  // postinstall 脚本（如 protobufjs 的 `node scripts/postinstall`），spawn 的
+  // shell 靠 PATH 找 `node` 却找不到 → `Failed to spawn lifecycle script ...
+  // No such file or directory (os error 2)`。面板 spawn npm 时已经用 nodeDirEnv
+  // 补过 PATH，这里 spawn dsh 也必须补，否则带 postinstall 的插件永远装不上。
+  const env = nodeDirEnv({
     ...process.env,
     HOME: home,
     DSH_HOME: home,
@@ -677,7 +685,7 @@ export async function startDsh() {
     // CI=true 让 dsh 不要尝试任何交互式 TTY 探测。
     CI: 'true',
     DSH_AGENTS_HOME: join(home, 'agents'),
-  }
+  })
   try {
     const fd = openSync(DSH_LOG, 'a')
     // dsh runs AS the panel (no setuid) — the panel lacks CAP_SETUID, so any

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.37 - 2026-10-11
+
+### 修复
+
+- 安装带 postinstall 生命周期脚本的插件（如 `dsh-workbuddy-connect@0.7.2` 依赖的 `protobufjs@7.6.6`）时报 `Failed to spawn lifecycle script ... No such file or directory (os error 2)`、`pnpm add` exit 1。根因：面板被 fnOS 套件框架降权启动，自身环境里**没有 `PATH`**，spawn dsh 时原样 `...process.env` 把残缺环境传给了 dsh；dsh 内部装插件时 pnpm 要执行依赖的 postinstall 脚本，spawn shell 靠 `PATH` 找 `node` 却找不到 → ENOENT。此前面板 spawn npm 已经用 `nodeDirEnv()` 补过 PATH，唯独 spawn dsh 漏了这步。现改为 `nodeDirEnv({ ...process.env, ... })`，把 node 的 bin 目录 + 系统目录补进 PATH，带生命周期脚本的插件可正常安装。
+
+### 验证
+
+- `node --check` 0 失败；`check.mjs` 31 parsed / 15 imported / 0 failure；`smoke.mjs` 83/83 全通过。
+
 ## v1.0.36 - 2026-10-11
 
 ### 修复
