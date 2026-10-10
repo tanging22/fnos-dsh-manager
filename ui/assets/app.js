@@ -115,7 +115,19 @@ function applyPill(status) {
   }
 }
 
-async function renderTab() {
+// A push event (WS status/visit/access) can re-enter renderTab() while an
+// earlier call is still awaiting its view. Serialising the whole body keeps a
+// slow render from being torn down by the next one, so each view registers
+// exactly one cleanup — otherwise its pollers accumulate without bound (see
+// the usage timer in overview.js, which used to leak one 3s /api/usage poll per
+// missed cleanup: measured at 20-29 requests/second against a designed 1/3s).
+let renderQueue = Promise.resolve()
+function renderTab() {
+  const next = renderQueue.then(runRenderTab, runRenderTab)
+  renderQueue = next.catch(() => {})
+  return next
+}
+async function runRenderTab() {
   for (const fn of leavers.splice(0, leavers.length)) {
     try { fn() } catch { /* a failed cleanup must not block the next tab */ }
   }

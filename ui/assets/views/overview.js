@@ -186,13 +186,22 @@ export async function render(host, ctx) {
     btn.addEventListener('click', () => { window.open(url('/p/'), '_blank', 'noopener') })
   }
 
-  // dsh 进程树资源：独立加载 + 定时刷新，注册到 ctx.onLeave 清理定时器。
-  const cleanupUsage = renderDshUsage(host)
+  // dsh 进程树资源：定时刷新。
+  //
+  // 清理函数必须在任何 await 之前注册。renderTab() 的流程是
+  // 「先 leavers.splice() 回收上一轮的清理函数，再 await module.render()」，
+  // 而 WS 推送（app.js 的 status/visit/access 事件）随时可能在这个 await
+  // 期间再次调用 renderTab()。若等 await 结束才注册，那一次并发渲染会把
+  // 尚未入列的清理函数漏掉，于是每漏一个就永久多留一个 3s 定时器，
+  // /api/usage 的请求量呈指数增长（实测每秒 20~29 次，正常应为每 3s 一次）。
+  const cleanupUsage = startUsageTimer(host)
   ctx.onLeave(() => { cleanupUsage() })
 }
 
 // dsh 进程树 CPU/内存采样：写入 5 列指标网格的 #m-cpu / #m-mem。
-async function renderDshUsage(host) {
+// 同步返回清理函数，不再 await 首次采样——首次采样在后台触发即可。
+function startUsageTimer(host) {
+  let stopped = false
   const draw = async () => {
     let usage
     try {
@@ -200,14 +209,17 @@ async function renderDshUsage(host) {
     } catch {
       usage = { cpu: '-', memory: '-' }
     }
+    // 请求期间可能已被切走：此时 DOM 里已没有 #m-cpu/#m-mem，querySelector
+    // 自然返回 null，无需再判断，也不写任何已卸载节点。
+    if (stopped) return
     const cpuEl = host.querySelector('#m-cpu')
     const memEl = host.querySelector('#m-mem')
     if (cpuEl) cpuEl.textContent = usage.cpu ?? '-'
     if (memEl) memEl.textContent = usage.memory ?? '-'
   }
-  await draw()
+  draw()
   const timer = setInterval(draw, 3000)
-  return () => clearInterval(timer)
+  return () => { stopped = true; clearInterval(timer) }
 }
 
 function fmtUptime(ms) {

@@ -627,6 +627,48 @@ async function pythonBin() {
     'app.js no longer wires beforeunload -> closeWs')
   const script = await fetch(`${base}/assets/app.js`)
   check('the UI bundle is served', script.status === 200, `got ${script.status}`)
+
+  /* --- the usage poller must be cancelable from the moment it is created ---
+   *
+   * renderTab() drains the previous leavers and then `await`s the view. The
+   * overview view used to `await` its first /api/usage sample and only then
+   * register the clearInterval cleanup, so a push event arriving inside that
+   * window (WS status/visit/access all call renderTab) dropped the cleanup on
+   * the floor. Every miss leaked one 3s timer forever and /api/usage grew
+   * exponentially — measured at 20-29 requests/second against a designed 1/3s.
+   */
+  const overviewJs = await (await fetch(`${base}/assets/views/overview.js`)).text()
+  const usageAnchor = overviewJs.indexOf('startUsageTimer(host)')
+  check('the overview view creates its usage timer synchronously',
+    usageAnchor !== -1, 'overview.js no longer uses startUsageTimer(host)')
+  const beforeAwait = (() => {
+    const decl = overviewJs.indexOf('function startUsageTimer(')
+    if (decl === -1 || usageAnchor === -1) return false
+    // The factory must be synchronous: an `await` inside it would reopen the
+    // very window this fix closes.
+    const body = overviewJs.slice(decl, overviewJs.indexOf('\n}', decl))
+    if (/\basync\b[^\n]*function startUsageTimer/.test(overviewJs)) return false
+    if (/await\s+draw\(\)/.test(body)) return false
+    // Registration must sit immediately after the factory call.
+    const at = overviewJs.indexOf("ctx.onLeave(() => { cleanupUsage() })")
+    const between = overviewJs.slice(usageAnchor, at === -1 ? usageAnchor : at)
+    return at !== -1 && !/await/.test(between) && !/\bdraw\(/.test(between)
+  })()
+  check('the usage cleanup is registered before any await',
+    beforeAwait, 'overview.js registers ctx.onLeave after an await — a concurrent re-render can leak the timer')
+  check('the usage cleanup also guards writes after the request',
+    /let stopped = false/.test(overviewJs) && /if \(stopped\) return/.test(overviewJs),
+    'overview.js has no stopped guard — a late response can write into a torn-down view')
+
+  /* The second half of the fix: serialise renderTab() itself. Even with a
+   * synchronously-created timer, two overlapping renders would still each
+   * register a cleanup while only the last one gets drained. */
+  check('renderTab is serialised through a queue',
+    /let renderQueue = Promise\.resolve\(\)[\s\S]*?renderQueue\.then\(runRenderTab/.test(appJsText),
+    'app.js still re-enters renderTab concurrently — a view can register two cleanups')
+  check('the render queue drains leavers inside the serialised body',
+    /async function runRenderTab\(\)[\s\S]{0,200}leavers\.splice/.test(appJsText),
+    'app.js drains leavers outside the queued body')
   const traversal = await fetch(`${base}/assets/../../cmd/dashboard.js`)
   check('static server refuses traversal', traversal.status === 404, `got ${traversal.status}`)
 
