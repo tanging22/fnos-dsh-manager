@@ -18,7 +18,6 @@ import {
   CONSOLE_PORT,
   DATA_DIR,
   applyLanBinding,
-  preferredPatchHost,
   saveConfig,
   loadConfig,
   logFiles,
@@ -410,14 +409,11 @@ function settingsView() {
   const config = loadConfig()
   return {
     mode: effectiveMode(),
-    // Tri-state going out as well as coming in. Old configs — and the installer
-    // — seed the boolean `true`, so it is folded into auto here; leaving it as
-    // `true` would make the address <select> silently disagree with reality.
-    lanBind: config.lanBind === false || config.lanBind === 'false'
-      ? false
-      : (typeof config.lanBind === 'string' && config.lanBind.trim() && config.lanBind.trim() !== 'true' ? config.lanBind.trim() : ''),
-    // What the next apply writes into the patch; `null` means loopback-by-removal.
-    lanBindResolved: config.lanBind === false || config.lanBind === 'false' ? null : preferredPatchHost(),
+    // `lanBind` 已废弃（dsh 永远只听自己的原生回环默认值）。仍然回显为 false，
+    // 好让旧版 UI 的复选框不至于显示成一个「开着但没生效」的状态。
+    lanBind: false,
+    // dsh 实际绑定地址恒为回环，局域网一律走面板的反代入口。
+    lanBindResolved: null,
     lanCandidates: lanAddresses(),
     proxyEnabled: config.proxy?.enabled !== false,
     trustedHosts: config.trustedHosts ?? [],
@@ -698,15 +694,17 @@ const routes = {
   },
 
   'GET /api/shortcuts': async (request, response) => {
+    // dsh 只听 127.0.0.1:3080，所以只有回环这一条是「dsh 本体」；其余 LAN 条目
+    // 指向面板带 token 的直连口（:28000），等效于本机访问。
     const port = listenPort()
     const lan = lanAddresses()
-    const bound = webserverHost()
     json(response, 200, {
       entries: [
-        { label: 'Loopback', url: `http://127.0.0.1:${port}/`, note: bound === '127.0.0.1' ? 'what dsh is bound to' : 'unreachable: dsh is bound to one address only' },
-        { label: 'Loopback (panel proxy)', url: `http://127.0.0.1:${CONSOLE_PORT}/p/`, note: 'recorded' },
-        ...lan.map((ip) => ({ label: `LAN ${ip}`, url: `http://${ip}:${port}/`, note: ip === bound ? 'what dsh is bound to' : 'needs this address selected in Settings' })),
-        { label: 'Hostname', url: `http://${localHost()}:${port}/`, note: 'mDNS may be needed' },
+        { label: 'Loopback (dsh 本体)', url: `http://127.0.0.1:${port}/`, note: '只信任本机，需 token' },
+        { label: 'Loopback (面板代理)', url: `http://127.0.0.1:${CONSOLE_PORT}/p/`, note: 'recorded' },
+        { label: '直连口 (免 token)', url: `http://127.0.0.1:${LAN_PROXY_PORT}/`, note: 'recorded，自动注入 token' },
+        ...lan.map((ip) => ({ label: `LAN ${ip}`, url: `http://${ip}:${LAN_PROXY_PORT}/`, note: '免 token 直连 dsh' })),
+        { label: 'Hostname', url: `http://${localHost()}:${LAN_PROXY_PORT}/`, note: 'mDNS may be needed' },
       ],
       custom: loadConfig().shortcuts ?? [],
     })
@@ -912,8 +910,21 @@ async function proxyToDsh(request, response, { pathPrefix }) {
   const upstreamHost = webserverHost()
   const authority = `${upstreamHost}:${target}`
   const headers = { ...request.headers }
-  for (const hop of ['host', 'connection', 'upgrade', 'proxy-connection', 'te', 'trailers', 'transfer-encoding']) {
+  // 升级请求（WebSocket）必须把握手头原样送上游：剥掉 `Upgrade` / `Connection` /
+  // `Sec-WebSocket-*` 会让 dsh 把 WS 当普通 HTTP 请求处理，路由不匹配 → 404，
+  // 前端 `client.js` 的 remote.mux 永远握手失败 → 「连接断开」。因此只在非升级
+  // 请求上剥 hop-by-hop 头。
+  const isUpgrade = Boolean(request.headers.upgrade)
+  const hops = isUpgrade
+    ? ['host', 'proxy-connection', 'te', 'trailers', 'transfer-encoding']
+    : ['host', 'connection', 'upgrade', 'proxy-connection', 'te', 'trailers', 'transfer-encoding']
+  for (const hop of hops) {
     delete headers[hop]
+  }
+  if (isUpgrade) {
+    // Connection 逐跳、必须由代理自己声明；Sec-WebSocket-* 必须透传。
+    headers.connection = 'Upgrade'
+    headers.upgrade = request.headers.upgrade
   }
   // 回环 Host：上游计算的 authority 恒定（Go Rewrite 阶段）。
   headers.host = authority
@@ -969,8 +980,13 @@ async function proxyToDsh(request, response, { pathPrefix }) {
       const status = upstreamResponse.statusCode ?? 502
       const contentType = String(upstreamResponse.headers['content-type'] || '').toLowerCase()
       const out = { ...upstreamResponse.headers }
-      delete out['connection']
-      delete out['transfer-encoding']
+      // 101 Switching Protocols 里 `Connection: Upgrade` / `Upgrade` 是握手结果的一部分，
+      // 剥掉会让浏览器判定握手失败（"WebSocket is closed before the connection is
+      // established"）。其余情况才按逐跳头剥掉。
+      if (!(isUpgrade && status === 101)) {
+        delete out['connection']
+        delete out['transfer-encoding']
+      }
 
       // SSE：流式直通，只修缓冲/压缩头，不读 body（Go ModifyResponse 同款）。
       if (contentType.startsWith('text/event-stream')) {
@@ -1054,6 +1070,131 @@ async function proxyToDsh(request, response, { pathPrefix }) {
 }
 
 /**
+ * WebSocket 反代（socket 级转发）。
+ *
+ * 升级请求不会走普通 HTTP handler：Node 把它们单独派发到 server 的 'upgrade'
+ * 事件，proxyToDsh() 拿不到 response，也就永远不会执行——之前 /p/ 与 28002 上
+ * 所有非 /ws 的 WS 握手都在这里被吞掉（console 侧回 404，lan-proxy 侧直接销毁
+ * socket），前端 `remote.mux` 于是永远连不上。这里显式做一次握手并把两条裸 socket
+ * 互相对接，与 cmd/proxy.py 的 _relay() 同款。
+ */
+async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
+  const target = listenPort()
+  const upstreamHost = webserverHost()
+  const authority = `${upstreamHost}:${target}`
+  const headers = { ...request.headers }
+  // 只剥逐跳头；Connection / Upgrade 由本代理自己声明，Sec-WebSocket-* 必须透传。
+  for (const hop of ['host', 'proxy-connection', 'te', 'trailers', 'transfer-encoding']) {
+    delete headers[hop]
+  }
+  headers.connection = 'Upgrade'
+  headers.upgrade = request.headers.upgrade
+  headers.host = authority
+  headers.origin = `http://${authority}`
+  headers['sec-fetch-site'] = 'same-origin'
+  headers['accept-encoding'] = 'identity'
+  const realIp = clientIp(request.socket, request.headers)
+  if (realIp) headers['x-forwarded-for'] = realIp
+  const sessionCookie = await GetDshSessionCookie()
+  if (sessionCookie) headers.cookie = appendDshSessionCookie(request.headers.cookie, sessionCookie)
+
+  let upstream = request.url.slice(pathPrefix.length) || '/'
+  const qIdx = upstream.indexOf('?')
+  const upPath = qIdx >= 0 ? upstream.slice(0, qIdx) : upstream
+  const rawQuery = qIdx >= 0 ? upstream.slice(qIdx + 1) : ''
+  if (upPath === '/plugins/' && !rawQuery.startsWith('?') && rawQuery.includes('client.js')) {
+    upstream = `${upPath}?${rawQuery}`
+  }
+
+  const startedAt = Date.now()
+  const fail = (error, status, detail) => {
+    try {
+      socket.write(`HTTP/1.1 ${status} ${detail}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
+    } catch { /* socket already gone */ }
+    socket.destroy()
+    recordVisit({
+      ip: realIp,
+      method: request.method,
+      path: upstream,
+      status,
+      tookMs: Date.now() - startedAt,
+      userAgent: request.headers['user-agent'],
+      auth: 'passthrough',
+    })
+    console.log(`[ws-proxy] ${upstream} failed: ${error}`)
+  }
+
+  const proxied = httpRequest({ host: upstreamHost, port: target, path: upstream, method: request.method, headers })
+
+  proxied.on('upgrade', (upstreamResponse, upstreamSocket, upstreamHead) => {
+    try {
+      // 101 的响应头就是握手结果本身，逐跳头必须原样带回（除 transfer-encoding）。
+      const out = {}
+      for (const [key, value] of Object.entries(upstreamResponse.headers)) {
+        const lower = key.toLowerCase()
+        if (lower === 'transfer-encoding') continue
+        out[key] = value
+      }
+      out.Connection = 'Upgrade'
+      out.Upgrade = upstreamResponse.headers.upgrade || request.headers.upgrade
+      let headText = `HTTP/1.1 101 Switching Protocols\r\n`
+      for (const [key, value] of Object.entries(out)) headText += `${key}: ${value}\r\n`
+      headText += '\r\n'
+      socket.write(headText)
+      socket.setNoDelay(true)
+      upstreamSocket.setNoDelay(true)
+      // 升级后 socket 长期空闲，继承的 timeout 会把隧道掐断（同 proxy.py 的 None）。
+      socket.setTimeout(0)
+      upstreamSocket.setTimeout(0)
+      if (upstreamHead && upstreamHead.length) socket.write(upstreamHead)
+      if (head && head.length) upstreamSocket.write(head)
+      socket.on('error', () => upstreamSocket.destroy())
+      upstreamSocket.on('error', () => socket.destroy())
+      upstreamSocket.pipe(socket).pipe(upstreamSocket)
+      recordVisit({
+        ip: realIp,
+        method: request.method,
+        path: upstream,
+        status: 101,
+        tookMs: Date.now() - startedAt,
+        userAgent: request.headers['user-agent'],
+        auth: 'passthrough',
+      })
+    } catch (error) {
+      fail(error?.message ?? error, 502, 'Bad Gateway')
+    }
+  })
+
+  // 上游以普通响应拒绝升级（404/401/400…）：原样回给客户端，别假装成功。
+  proxied.on('response', (upstreamResponse) => {
+    const status = upstreamResponse.statusCode ?? 502
+    let text = `HTTP/1.1 ${status} ${upstreamResponse.statusMessage || ''}\r\n`
+    for (const [key, value] of Object.entries(upstreamResponse.headers)) {
+      if (key.toLowerCase() === 'transfer-encoding' || key.toLowerCase() === 'content-length') continue
+      text += `${key}: ${value}\r\n`
+    }
+    text += 'Connection: close\r\nContent-Length: 0\r\n\r\n'
+    try { socket.end(text) } catch { /* ignore */ }
+    upstreamResponse.resume()
+    recordVisit({
+      ip: realIp,
+      method: request.method,
+      path: upstream,
+      status,
+      tookMs: Date.now() - startedAt,
+      userAgent: request.headers['user-agent'],
+      auth: 'passthrough',
+    })
+  })
+
+  proxied.on('error', (error) => {
+    fail(error?.code ?? error?.message ?? error, 502, 'Bad Gateway')
+  })
+
+  proxied.end()
+}
+
+/**
  * A dedicated LAN-only reverse proxy: it forwards every request straight to
  * dsh (same upstream resolution as `/p/`), so a client on the same network can
  * open `http://<NAS-IP>:28002` and land directly in the suite — no `/p/` path,
@@ -1066,7 +1207,7 @@ async function proxyToDsh(request, response, { pathPrefix }) {
  * `dsh-auth-*` cookie upstream, so this port needs no token either.
  */
 export function createLanProxyServer() {
-  return createServer((request, response) => {
+  const server = createServer((request, response) => {
     const startedAt = Date.now()
 
     // Same trust fence as the console server, so a stranger's Host header
@@ -1086,6 +1227,24 @@ export function createLanProxyServer() {
       if (ms > 2000) console.log(`[lan-proxy] slow ${request.method} ${request.url} ${ms}ms`)
     })
   })
+
+  // LAN 直连同样要把 dsh 的 remote.mux 升级请求接上去，否则连 28002 也连不上。
+  server.on('upgrade', (request, socket, head) => {
+    try {
+      const trust = isTrustedRequest(request.headers)
+      if (!trust.ok) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
+        socket.destroy()
+        return
+      }
+      proxyUpgradeToDsh(request, socket, head, { pathPrefix: '' })
+    } catch (error) {
+      console.log(`[lan-proxy] upgrade handler failed: ${error?.message ?? error}`)
+      try { socket.destroy() } catch { /* ignore */ }
+    }
+  })
+
+  return server
 }
 
 async function serveStatic(request, response, pathname) {
@@ -1162,21 +1321,28 @@ export function createConsoleServer() {
   server.on('upgrade', (request, socket, head) => {
     try {
       const pathname = new URL(request.url, 'http://localhost').pathname
-      if (pathname !== '/ws') {
-        socket.write('HTTP/1.1 404 Not Found\r\n\r\n')
-        socket.destroy()
+      if (pathname === '/ws') {
+        const trust = isTrustedRequest(request.headers)
+        if (!trust.ok) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
+          socket.destroy()
+          return
+        }
+        if (!acceptWebSocket(request, socket, head)) {
+          socket.write('HTTP/1.1 400 Bad Request\r\n\r\n')
+          socket.destroy()
+        }
         return
       }
-      const trust = isTrustedRequest(request.headers)
-      if (!trust.ok) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
-        socket.destroy()
+      // 其余升级请求（例如 dsh 的 /api/remote.mux）必须转给上游，不能在这里 404。
+      const proxyEnabled = loadConfig().proxy?.enabled !== false
+      const prefix = loadConfig().proxy?.pathPrefix || '/p'
+      if (proxyEnabled && (pathname === prefix || pathname.startsWith(`${prefix}/`))) {
+        proxyUpgradeToDsh(request, socket, head, { pathPrefix: prefix })
         return
       }
-      if (!acceptWebSocket(request, socket, head)) {
-        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n')
-        socket.destroy()
-      }
+      socket.write('HTTP/1.1 404 Not Found\r\n\r\n')
+      socket.destroy()
     } catch (error) {
       console.log(`[ws] upgrade handler failed: ${error?.message ?? error}`)
       try { socket.destroy() } catch { /* ignore */ }

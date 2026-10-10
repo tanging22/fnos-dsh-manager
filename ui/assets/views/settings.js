@@ -23,15 +23,7 @@ export async function render(host, ctx) {
         <span>可信主机（逗号分隔）</span>
         <input id="trusted" value="${esc((data.trustedHosts ?? []).join(', '))}" placeholder="dsh.example.com">
       </label>
-      <label class="checkbox"><input type="checkbox" id="lan-bind" ${data.lanBind !== false ? 'checked' : ''}> 允许 LAN 直连 dsh（绑到下面选的网卡地址）</label>
-      <label class="field">
-        <span>LAN 绑定地址</span>
-        <select id="lan-host">
-          <option value="" ${!data.lanBind ? 'selected' : ''}>自动（第一个非内网 IPv4）</option>
-          ${(data.lanCandidates ?? []).map((ip) => `<option value="${esc(ip)}" ${data.lanBind === ip ? 'selected' : ''}>${esc(ip)}</option>`).join('')}
-        </select>
-      </label>
-      <p class="muted">dsh 只绑一个具体地址，不能绑 0.0.0.0；关掉则回到 127.0.0.1。LAN 访问也可以全程走面板代理（/p/）。${data.lanBindResolved ? ` 当前实际写入：${esc(data.lanBindResolved)}` : ''}</p>
+      <p class="muted">dsh 始终只听 <code>127.0.0.1:3080</code>（它自己的原生默认值，只信任本机）。局域网访问一律走面板的反代入口：<code>:28001</code> 的 <code>/p/</code>，以及 <code>:28000</code> 的直连口（自动带 token，无需手输）。切换 dsh 版本不需要改任何配置。</p>
       <label class="checkbox"><input type="checkbox" id="proxy-enabled" ${data.proxyEnabled !== false ? 'checked' : ''}> 通过面板代理提供 dsh (/p/)</label>
       <div class="btn-row"><button class="btn btn-primary" id="save-net">保存网络设置</button></div>
     </div>
@@ -94,12 +86,10 @@ export async function render(host, ctx) {
   host.querySelector('#save-net').addEventListener('click', () => {
     const trustedHosts = host.querySelector('#trusted').value
       .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
-    // `lanBind` is tri-state: false = loopback, '' = auto, '<ip>' = one NIC.
-    const lanEnabled = host.querySelector('#lan-bind').checked
-    const lanHost = host.querySelector('#lan-host').value.trim()
+    // lanBind 已废弃：dsh 永远只听自己的原生回环默认值，LAN 走面板反代。
     post({
       trustedHosts,
-      lanBind: !lanEnabled ? false : lanHost,
+      lanBind: false,
       proxy: { enabled: host.querySelector('#proxy-enabled').checked },
     }, '网络设置已保存')
   })

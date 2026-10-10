@@ -1,5 +1,58 @@
 # Changelog
 
+## v1.0.29 — 2026-10-10
+
+### 修复
+
+- **dsh web「模型加载不出 → 断开连接」（P0，本条是真正的根因）**
+  浏览器 Console 一直报：
+  `ws://.../p/api/remote.mux  WebSocket is closed before the connection is established`
+  加上 `GET /p/plugins/events  502 (Bad Gateway)`。
+  根因是**面板的反代根本没有 WebSocket 通路**，两处都漏了：
+  - `proxyToDsh()` 把 `upgrade` / `connection` 当成逐跳头删掉了。升级请求的握手头必须原样送上游，
+    剥掉之后 dsh 把它当成普通 HTTP 请求，路由不匹配 → 404。
+  - 更根本的是：升级请求**不会进普通 HTTP handler**，Node 把它单独派发到 `server.on('upgrade')`，
+    而 `createConsoleServer()` 的 upgrade 监听器只放行 `/ws`（面板自己的推送通道），
+    其余一律 `HTTP/1.1 404` + destroy；`createLanProxyServer()` 更是**压根没有 upgrade 监听器**，
+    Node 默认直接销毁 socket（连接被静默关闭，没有任何响应）。
+    所以即使把 `proxyToDsh()` 的头修好，WS 也依然连不上——必须在 upgrade 事件里做 socket 级转发。
+
+  新增 `proxyUpgradeToDsh(request, socket, head, { pathPrefix })`：完成上游握手后把 101 响应头原样回写
+  （跳过 `transfer-encoding`，补 `Connection` / `Upgrade`），两端 `setNoDelay(true)` + `setTimeout(0)`
+  （继承的 socket 超时会把长期空闲的隧道掐断），双向 pipe 并互相关联 error。
+  上游以普通响应拒绝升级时（401 / 404 / 400）原样把状态码回给客户端，不假装成功。
+  对照物是同项目的 `cmd/proxy.py`——它早就显式重建 `Connection: Upgrade` 并把 socket timeout
+  设回阻塞模式，作者懂 WS，只是 `dashboard-server.js` 漏了这条路径。
+
+- **dsh 的 `webserver` 覆盖彻底移除，dsh 原封不动（P1）**
+  过去每次启动前 `applyLanBinding()` 都会整体重写 `- id: webserver` 块（host + port），
+  这有三个问题：
+  1. `webserver.host` 的 schema 在 dsh 各版本之间**不相交**（<= 0.2.1-alpha.1 只收
+     `"127.0.0.1" | "0.0.0.0"`，>= 0.2.1-alpha.2 只收具体 IP 字面量且直接拒通配），
+     这个覆盖因此成了**换版本时必须手工迁移的遗留物**。
+  2. 它锁死端口，跟 dsh 自己的默认值打架——面板把 dsh 从 3080 拽到了 28000，
+     一旦面板重启而 dsh 独立存活，端口就对不上。
+  3. 它是「dsh 起来就白屏 / 连不上」的经典诱因，且失败信息只落在没人打开的日志里。
+
+  现在 `applyLanBinding()` 只做清理（删掉历史版本可能写下的 webserver 块）。
+  **dsh 永远只听自己的原生默认值 `127.0.0.1:3080`，只信任本机，一行配置都不用改**，
+  切换任意 dsh 版本都不需要任何配置迁移。
+
+- **局域网直连入口从 :28002 改到 :28000**
+  直连口是一个**带 token 的入口**：监听 `0.0.0.0`，转发时把面板刚换到的启动 token
+  （`dsh.log` 末行 `dsh web: http://127.0.0.1:3080/?token=...`）换成 `dsh-auth-*`
+  会话 cookie 注入上游（dashboard-session.js），所以内网客户端打开
+  `http://<NAS-IP>:28000/` **免 token 直达 dsh**，而 dsh 本身仍然只信任回环——
+  等价于「我就是 `127.0.0.1:3080/tokenxxx` 在访问」。
+  端口号沿用历史直连入口；面板自己的 :28001 不受影响。
+
+### 变更
+
+- **面板 :28001 不动**（路由、端口、UI 全不变）。LAN 访问仍走 `:28001/p/`（有访问记录）
+  或 `:28000`（免 token 直连）。
+- **设置页移除「LAN 直连 dsh / LAN 绑定地址」**：dsh 恒为回环绑定，该选项已无实际作用，
+  留着只会让人以为「开了就等于让 dsh 绑网卡」。`lanBind` 保留为 `false` 供旧配置兼容。
+
 ## v1.0.28 — 2026-10-10
 
 按用户实机反馈修复四个问题：**首屏白屏十几秒**、**面板版本显示 v0.0.0**、

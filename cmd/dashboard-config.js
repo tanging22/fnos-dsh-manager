@@ -779,15 +779,19 @@ export function clearWebserverPatch() {
  * dials dsh on a hard-coded loopback any more (see webserverHost()).
  */
 export function applyLanBinding() {
-  const enabled = loadConfig().lanBind !== false
-  if (enabled) {
-    try {
-      const text = writeWebserverPatch()
-      return { ok: true, lan: true, host: patchHostOf(text) }
-    } catch (error) {
-      return { ok: false, lan: true, error: error?.message ?? String(error) }
-    }
-  }
+  // **不再向 dsh 的 profile 注入 webserver 覆盖。**
+  //
+  // 旧实现会在每次启动前把 `- id: webserver` 块整体重写一遍（host+port），
+  // 那有三个问题：dsh 的 `webserver.host` schema 在各版本之间是不相交的
+  // （<=0.2.1-alpha.1 只收 "127.0.0.1"|"0.0.0.0"，>=0.2.1-alpha.2 只收具体
+  // IP 字面量且直接拒通配），换版本时这个覆盖就成了必须手工迁移的遗留物；
+  // 而且它锁死了端口，跟 dsh 自己的默认值打架。
+  //
+  // 现在 dsh 原封不动：永远只听 `127.0.0.1:3080`（原生默认，只信任本机），
+  // 局域网访问一律走面板自己的反代入口（:28001 的 `/p/`，以及 :28000 的
+  // 直连口）。切换 dsh 版本因此不需要任何配置迁移。
+  //
+  // 只做清理：把历史版本可能写下的 webserver 块删掉。
   try {
     clearWebserverPatch()
     return { ok: true, lan: false, host: '127.0.0.1' }

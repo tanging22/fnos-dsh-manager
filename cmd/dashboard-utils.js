@@ -30,14 +30,27 @@ export const APP_DIR = process.env.MANAGED_APP_DIR || `/var/apps/${APP_NAME}`
 
 export const DATA_DIR = process.env.DATA_DIR || process.env.TRIM_PKGVAR || `${CONSOLE_APP_DIR}/var`
 export const CONSOLE_PORT = Number(process.env.CONSOLE_PORT || 28001)
-export const DSH_PORT = Number(process.env.DSH_PORT || process.env.MANAGED_SERVICE_PORT || 28000)
 /**
- * A second, purpose-built LAN port that only proxies to dsh (no panel UI, no
- * API). The panel's own :28001 also serves `/p/`, but that shares the console
- * surface; this port is a clean http://<NAS-IP>:28002 straight into the suite
- * for LAN clients, with dsh's browser-token gate already bypassed at launch.
+ * dsh 自己监听的端口。**必须是 dsh 的原生默认值（3080）**，面板只按它拨号，
+ * 不去改 dsh 的 `webserver` 配置——换 dsh 版本时这个值恒定不变，因为所有版本
+ * 的默认值都一样。
+ *
+ * 面板注入的 `webserver` patch 已被彻底移除（见 dashboard-config.js 的
+ * applyLanBinding）：dsh 永远只听 `127.0.0.1:3080`，对局域网只暴露面板自带的
+ * 反代入口。多版本之间因此不需要任何配置迁移。
  */
-export const LAN_PROXY_PORT = Number(process.env.LAN_PROXY_PORT || 28002)
+export const DSH_PORT = Number(process.env.DSH_PORT || process.env.MANAGED_SERVICE_PORT || 3080)
+/**
+ * 局域网直连 dsh 的入口，监听 `0.0.0.0`。
+ *
+ * 它是一个**带 token 的入口**：转发时把面板刚换到的启动 token 换成 `dsh-auth-*`
+ * 会话 cookie 注入上游（dashboard-session.js），所以内网客户端打开
+ * `http://<NAS-IP>:28000/` 免 token 直达 dsh，而 dsh 本身仍然只信任回环
+ * `127.0.0.1:3080` —— 等价于「我就是 127.0.0.1:3080/tokenxxx 在访问」。
+ *
+ * 端口号沿用历史直连入口（早期 dsh 曾直接绑在这里）；面板自己的 :28001 不受影响。
+ */
+export const LAN_PROXY_PORT = Number(process.env.LAN_PROXY_PORT || 28000)
 export const CMD_MAIN = process.env.CMD_MAIN || `${CONSOLE_APP_DIR}/cmd/main`
 export const MANIFEST = process.env.MANIFEST || `${CONSOLE_APP_DIR}/manifest`
 export const DSH_HOME = process.env.DSH_HOME || `${DATA_DIR}/dsh_home`
