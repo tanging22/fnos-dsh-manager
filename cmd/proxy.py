@@ -219,7 +219,13 @@ class Handler(BaseHTTPRequestHandler):
             lines = ["%s %s HTTP/1.1" % (self.command, path)]
             for key, value in self.headers.items():
                 low = key.lower()
-                if low in ("host", "connection", "upgrade", "content-length", "x-forwarded-host"):
+                # origin 也必须剥掉：与 _http_proxy 同理，浏览器 WS 握手带
+                # `Origin: http://10.11.12.13:5666`，而这里把 Host 重写成
+                # `127.0.0.1`，Origin 透传过去会和 loopback Host 不一致，触发
+                # 面板 isTrustedRequest 的 origin-host-mismatch → 403，/ws 推送
+                # 通道经网关永远连不上。面板是 same-origin SPA，WS 握手同样来自
+                # 面板自己，剥 Origin 与 _http_proxy 一样安全。
+                if low in ("host", "connection", "upgrade", "content-length", "x-forwarded-host", "origin"):
                     continue
                 lines.append("%s: %s" % (key, value))
             lines.append("Host: 127.0.0.1:%d" % CONSOLE_PORT)

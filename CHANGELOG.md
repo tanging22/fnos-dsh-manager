@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.36 - 2026-10-11
+
+### 修复
+
+- 经 fnOS 网关访问时，面板 `/ws` 推送通道握手被信任栅栏判 `origin-host-mismatch` 拒绝（403），浏览器反复报 `WebSocket connection failed`，UI 只能靠 15 秒轮询兜底。根因是 `proxy.py` 的 `_ws_proxy` 把 `Host` 重写为 `127.0.0.1` 却原样透传了浏览器的 `Origin`（`http://<网关host>:5666`），两者不一致被 `isTrustedRequest` 拒绝；而 `_http_proxy` 早就有 `headers.pop("Origin")`，`_ws_proxy` 漏了这步对称处理。现已对齐：WS 握手的头转发同样剥掉 `origin`，经网关访问时推送通道恢复正常。
+
 ## v1.0.35 - 2026-10-11
 
 ### 修复

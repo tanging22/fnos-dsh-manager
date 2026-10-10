@@ -1,8 +1,8 @@
 appname=fnos-dsh-manager
-version=1.0.35
+version=1.0.36
 display_name=DSH 管理器
 desc=DeepSeek Harness 的 fnOS 管理面板：查看运行状态与实时日志、在线安装并切换 dsh 版本、记录最近访问来源 IP、提供快捷入口。本套件不内置 dsh 本体，版本由面板按需从 npm 下载，因此升级 dsh 不需要重装套件。
-changelog=1.0.35 系统化加固：修复反代升级崩溃链（async 无 catch 崩面板）、socket 无 error 监听崩溃窗口、隧道无超时/无对称清理、/plugins/?? 折叠还原过窄导致偶发 404、DSH_LOG fd 泄漏、服务操作无互斥；修复网关代理半死 WS 线程泄漏、无读超时、HEAD 误写 body、带 query 前缀漏剥；修复信任围栏 X-Forwarded-Host 伪造绕过（高危）、Origin 端口未校验；修复 lan-proxy 端口被占永久挂起（高危）、插件安装旧快照回写、access 队列无界 requeue、listDirectory 符号链接逃逸；前端 WS 高频事件去抖、安装轮询重入守卫。check 31/15/0、smoke 81/81。
+changelog=1.0.36 修复经 fnOS 网关访问时面板 /ws 推送通道握手被 origin-host-mismatch 拒绝（403）、浏览器反复报 WebSocket connection failed 的问题：proxy.py 的 _ws_proxy 此前重写 Host 为 127.0.0.1 却透传浏览器 Origin，与 loopback Host 冲突被信任栅栏拒绝，现已对齐 _http_proxy 剥掉 Origin，网关访问时推送通道恢复正常。1.0.35 系统化加固：修复反代升级崩溃链、/plugins/?? 折叠还原过窄致偶发 404、DSH_LOG fd 泄漏、服务操作无互斥；网关代理半死 WS 线程泄漏、无读超时；信任围栏 X-Forwarded-Host 伪造绕过（高危）；lan-proxy 端口被占永久挂起（高危）等 13 文件。check 31/15/0、smoke 81/81。
 platform=all
 source=thirdparty
 maintainer=tanging22
