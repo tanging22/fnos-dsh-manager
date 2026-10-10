@@ -1,6 +1,9 @@
-﻿appname=fnos-dsh-manager
+appname=fnos-dsh-manager
 version=1.0.29
-display_name=DSH 绠＄悊鍣?desc=DeepSeek Harness 鐨?fnOS 绠＄悊闈㈡澘锛氭煡鐪嬭繍琛岀姸鎬佷笌瀹炴椂鏃ュ織銆佸湪绾垮畨瑁呭苟鍒囨崲 dsh 鐗堟湰銆佽褰曟渶杩戣闂潵婧?IP銆佹彁渚涘揩鎹峰叆鍙ｃ€傛湰濂椾欢涓嶅唴缃?dsh 鏈綋锛岀増鏈敱闈㈡澘鎸夐渶浠?npm 涓嬭浇锛屽洜姝ゅ崌绾?dsh 涓嶉渶瑕侀噸瑁呭浠躲€?changelog=1.0.28 棣栧睆鐧藉睆锛?view 鍘熶负绌轰笖棣栧睆瑕佺瓑 /api/status锛屾敼涓哄湪 index.html 閲屽唴缃鏋跺睆锛堢涓€甯у嵆鏈夊唴瀹癸級锛涢潰鏉跨増鏈樉绀?v0.0.0锛歁ANIFEST 榛樿鎸囧悜杞摼璺緞涓?cmd/main 浠庢湭 export瀹冿紝鏀逛负鏄惧紡浼犵湡瀹炶矾寰勫苟璁?readManifest 澶辫触鏃舵墦鍗板憡璀︼紱dsh web 棰戠箒閲嶈繛锛歝reate_connection 鐨?30s socket 瓒呮椂闄勭潃鍒?socket 涓婅 _relay 鐨?recv 缁ф壙锛岀┖闂插嵆鏂紝鏀逛负鍒囧洖闃诲妯″紡锛涚粓绔棤娉曡繍琛岋細琛?TERM/CI/DSH_AGENTS_HOME锛涙墦寮€鏂囦欢澶癸細娌跨埗绐楀彛閾炬壘 SDK 骞惰鍏滃簳鎻愮ず璇氬疄锛沜heck.mjs 鏂板 Python/Shell 璇硶闂ㄧ锛泂moke 57鈫?9 椤瑰苟琛ヤ笂 MANIFEST銆?platform=all
+display_name=DSH 管理器
+desc=DeepSeek Harness 的 fnOS 管理面板：查看运行状态与实时日志、在线安装并切换 dsh 版本、记录最近访问来源 IP、提供快捷入口。本套件不内置 dsh 本体，版本由面板按需从 npm 下载，因此升级 dsh 不需要重装套件。
+changelog=1.0.29 修复 dsh web「断开连接」：面板反代补上 WebSocket 通路（remote.mux 此前必 404 或被静默关闭）；dsh 的 webserver 覆盖彻底移除，dsh 恒定只听原生 127.0.0.1:3080，换版本零配置迁移；局域网直连入口移到 :28000，自动注入当次启动 token，内网免 token 直达；面板 :28001 不变。
+platform=all
 source=thirdparty
 maintainer=tanging22
 maintainer_url=https://github.com/tanging22/dsh-fnos-console
