@@ -7,7 +7,7 @@
  * is attributable while adding nothing to dsh itself. See dashboard-access.js.
  */
 
-import { createReadStream, existsSync, statSync } from 'node:fs'
+import { createReadStream, existsSync, statSync, realpathSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -972,7 +972,7 @@ async function proxyToDsh(request, response, { pathPrefix }) {
   const qIdx = upstream.indexOf('?')
   const upPath = qIdx >= 0 ? upstream.slice(0, qIdx) : upstream
   const rawQuery = qIdx >= 0 ? upstream.slice(qIdx + 1) : '' // 不含前导 `?`（对应 Go RawQuery）
-  if (upPath === '/plugins/' && !rawQuery.startsWith('?') && rawQuery.includes('client.js')) {
+  if (upPath === '/plugins/' && !rawQuery.startsWith('?')) {
     upstream = `${upPath}?${rawQuery}` // '/plugins/' + '?' + 'client.js...' == '/plugins/??client.js...'
   }
 
@@ -1018,7 +1018,14 @@ async function proxyToDsh(request, response, { pathPrefix }) {
       // HTML：读完整 body，移除 CSP、注入 __DSH_TRANSPORT__ 补丁、禁用强缓存。
       if (contentType.includes('text/html')) {
         const chunks = []
-        upstreamResponse.on('data', (c) => chunks.push(c))
+        let buffered = 0
+        // 上限保护：上游误标 content-type 或超大 HTML 会让单请求吃任意内存。
+        // 超 8MB 直接放弃注入，原样透传（管道直通，无内存驻留）。
+        const HTML_BUFFER_CAP = 8 * 1024 * 1024
+        upstreamResponse.on('data', (c) => {
+          buffered += c.length
+          if (buffered <= HTML_BUFFER_CAP) chunks.push(c)
+        })
         upstreamResponse.on('end', () => {
           // 对齐 Go 版 rewriteFnGatewayHtml：先给 manifest 注入 crossorigin
           // （网关鉴权 Cookie 携带），再注入特权声明 + 样式隐藏补丁。
@@ -1033,7 +1040,9 @@ async function proxyToDsh(request, response, { pathPrefix }) {
           const raw = Buffer.concat(chunks)
           let body = raw
           try {
-            body = injectDshHtml(injectManifestCredentials(raw), DSH_HTML_SHIM)
+            if (buffered <= HTML_BUFFER_CAP) {
+              body = injectDshHtml(injectManifestCredentials(raw), DSH_HTML_SHIM)
+            }
           } catch (error) {
             body = raw
             console.log(`[proxy] html injection skipped: ${error?.message ?? error}`)
@@ -1095,6 +1104,14 @@ async function proxyToDsh(request, response, { pathPrefix }) {
  * 互相对接，与 cmd/proxy.py 的 _relay() 同款。
  */
 async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
+  // 客户端 socket 必须在第一个 await 之前就有 error 兜底：换 cookie 的窗口期里
+  // 浏览器断开（重连风暴常态）会 emit 'error'，无监听即 uncaughtException →
+  // 整个面板崩溃。先挂上；upstreamSocket 引用由闭包在 upgrade 成功后补齐。
+  let upstreamSocketRef = null
+  socket.once('error', () => {
+    try { socket.destroy() } catch { /* ignore */ }
+    if (upstreamSocketRef) { try { upstreamSocketRef.destroy() } catch { /* ignore */ } }
+  })
   const target = listenPort()
   const upstreamHost = webserverHost()
   const authority = `${upstreamHost}:${target}`
@@ -1118,7 +1135,10 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
   const qIdx = upstream.indexOf('?')
   const upPath = qIdx >= 0 ? upstream.slice(0, qIdx) : upstream
   const rawQuery = qIdx >= 0 ? upstream.slice(qIdx + 1) : ''
-  if (upPath === '/plugins/' && !rawQuery.startsWith('?') && rawQuery.includes('client.js')) {
+  // 404 真凶修复：折叠还原不再只认 client.js。任何 /plugins/ + 被 gateway
+  // 折叠成裸 query 的多路复用资源（worker.js、hash 化资源名等）都要还原，
+  // 与 Go 版 `!HasPrefix(RawQuery, "?")` 行为对齐（Go 版没有文件名过滤）。
+  if (upPath === '/plugins/' && !rawQuery.startsWith('?')) {
     upstream = `${upPath}?${rawQuery}`
   }
 
@@ -1141,6 +1161,14 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
   }
 
   const proxied = httpRequest({ host: upstreamHost, port: target, path: upstream, method: request.method, headers })
+  // 握手阶段超时：上游 TCP 连上却迟迟不回 101 时（dsh 慢启动/卡死），
+  // 之前 proxied 永远挂起，客户端 socket 跟着挂。10s 内没有 upgrade/response
+  // 就当 504 收尾，两侧都销毁。
+  const handshakeTimer = setTimeout(() => {
+    try { proxied.destroy() } catch { /* ignore */ }
+    fail('handshake-timeout', 504, 'Gateway Timeout')
+  }, 10000)
+  handshakeTimer.unref?.()
 
   proxied.on('upgrade', (upstreamResponse, upstreamSocket, upstreamHead) => {
     try {
@@ -1168,6 +1196,7 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
       }
       headText += '\r\n'
       socket.write(headText)
+      clearTimeout(handshakeTimer)
       socket.setNoDelay(true)
       upstreamSocket.setNoDelay(true)
       // 升级后 socket 长期空闲，继承的 timeout 会把隧道掐断（同 proxy.py 的 None）。
@@ -1177,6 +1206,12 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
       if (head && head.length) upstreamSocket.write(head)
       socket.on('error', () => upstreamSocket.destroy())
       upstreamSocket.on('error', () => socket.destroy())
+      // 对称 close 清理：一侧被 destroy()（非 error 路径，如握手兜底、对端半关闭）
+      // 时 pipe 只 unpipe 不销毁对端 → 半死连接泄漏一条到 dsh 的 socket。
+      // 双向互挂 close，先到者赢。
+      upstreamSocketRef = upstreamSocket
+      socket.on('close', () => { try { upstreamSocket.destroy() } catch { /* ignore */ } })
+      upstreamSocket.on('close', () => { try { socket.destroy() } catch { /* ignore */ } })
       upstreamSocket.pipe(socket).pipe(upstreamSocket)
       recordVisit({
         ip: realIp,
@@ -1194,6 +1229,7 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
 
   // 上游以普通响应拒绝升级（404/401/400…）：原样回给客户端，别假装成功。
   proxied.on('response', (upstreamResponse) => {
+    clearTimeout(handshakeTimer)
     const status = upstreamResponse.statusCode ?? 502
     let text = `HTTP/1.1 ${status} ${upstreamResponse.statusMessage || ''}\r\n`
     for (const [key, value] of Object.entries(upstreamResponse.headers)) {
@@ -1215,10 +1251,24 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
   })
 
   proxied.on('error', (error) => {
+    clearTimeout(handshakeTimer)
     fail(error?.code ?? error?.message ?? error, 502, 'Bad Gateway')
   })
 
   proxied.end()
+}
+
+/**
+ * 安全包装：proxyUpgradeToDsh 是 async，两个 upgrade 事件调用点都不 await。
+ * 任何 rejection（GetDshSessionCookie 失败、写 socket 抛错）都会变成
+ * unhandledRejection —— Node 默认策略直接崩掉面板。统一在这里兜住并销毁
+ * 客户端 socket，调用点保持一行。
+ */
+function proxyUpgradeToDshSafe(request, socket, head, opts) {
+  proxyUpgradeToDsh(request, socket, head, opts).catch((error) => {
+    console.log(`[ws-proxy] upgrade failed: ${error?.message ?? error}`)
+    try { socket.destroy() } catch { /* ignore */ }
+  })
 }
 
 /**
@@ -1264,7 +1314,7 @@ export function createLanProxyServer() {
         socket.destroy()
         return
       }
-      proxyUpgradeToDsh(request, socket, head, { pathPrefix: '' })
+      proxyUpgradeToDshSafe(request, socket, head, { pathPrefix: '' })
     } catch (error) {
       console.log(`[lan-proxy] upgrade handler failed: ${error?.message ?? error}`)
       try { socket.destroy() } catch { /* ignore */ }
@@ -1280,11 +1330,18 @@ async function serveStatic(request, response, pathname) {
   if (!full.startsWith(UI_DIR) || !existsSync(full) || !statSync(full).isFile()) {
     return badRequest(response, 'not-found', 404)
   }
+  // 符号链接逃逸：前缀校验是词法的，createReadStream 会跟随 ui 目录内指向
+  // 外部的 symlink 读取任意文件。realpath 校验真实路径仍在 UI_DIR 内。
+  try {
+    const real = realpathSync(full)
+    if (!real.startsWith(realpathSync(UI_DIR))) return badRequest(response, 'not-found', 404)
+  } catch { return badRequest(response, 'not-found', 404) }
   response.writeHead(200, {
     'content-type': MIME[extname(full).toLowerCase()] || 'application/octet-stream',
     'cache-control': 'no-cache',
   })
   const stream = createReadStream(full)
+  stream.on('error', () => { try { response.destroy() } catch { /* ignore */ } })
   stream.pipe(response)
 }
 
@@ -1293,6 +1350,9 @@ export function createConsoleServer() {
     const startedAt = Date.now()
     const url = new URL(request.url, 'http://localhost')
     const pathname = url.pathname
+    // 每个 response 必须有 error 兜底：客户端中途断开时后续写操作会在
+    // response 上 emit 'error'，无监听即 uncaughtException → 面板崩溃。
+    response.on('error', () => { /* client went away mid-response; nothing to do */ })
 
     // The trust fence runs first: an untrusted Host never reaches routing.
     // Deliberately Host/Origin-based, not socket-peer-based — see
@@ -1329,7 +1389,14 @@ export function createConsoleServer() {
 
       badRequest(response, 'not-found', 404)
     } catch (error) {
-      json(response, 500, { error: 'internal', detail: String(error?.message ?? error) })
+      // handler 可能在已经 end() 之后才抛错（先 json 再 await 的路由），
+      // 对已结束的 response 二次 writeHead 会抛 ERR_STREAM_ALREADY_FINISHED
+      // 或在 response 上 emit 'error'（全程无监听）→ uncaughtException。
+      if (!response.headersSent && !response.writableEnded) {
+        json(response, 500, { error: 'internal', detail: String(error?.message ?? error) })
+      } else {
+        console.log(`[console] post-response error: ${error?.message ?? error}`)
+      }
     } finally {
       response.once('finish', () => {
         const ms = Date.now() - startedAt
@@ -1365,7 +1432,7 @@ export function createConsoleServer() {
       const proxyEnabled = loadConfig().proxy?.enabled !== false
       const prefix = loadConfig().proxy?.pathPrefix || '/p'
       if (proxyEnabled && (pathname === prefix || pathname.startsWith(`${prefix}/`))) {
-        proxyUpgradeToDsh(request, socket, head, { pathPrefix: prefix })
+        proxyUpgradeToDshSafe(request, socket, head, { pathPrefix: prefix })
         return
       }
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n')

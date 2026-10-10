@@ -61,6 +61,13 @@ def _relay(sock_a, sock_b):
 
     升级完成后协议本身要靠心跳保活（面板每 30s 发 ping，浏览器自动回 pong），
     这里不需要也不应该用读超时去代替它。
+
+    半死连接清理: TCP 半关闭（对端断开但本端不知道）时 recv 会永久阻塞,
+    之前这里 `t1.join(); t2.join()` 要等两端都 EOF 才返回 —— 一条半死 WS
+    会永久泄漏 2 个 pump 线程 + 2 个 socket。现在任一个 pump 结束即通过
+    Event 通知, 并立即关闭两端（shutdown 会让对端 recv 返回 EOF, 两个
+    pump 线程都会退出）。配合 Handler.timeout 与 TCP keepalive, 彻底堵住
+    线程/句柄只增不减的泄漏路径。
     """
 
     def to_blocking(sock):
@@ -69,12 +76,29 @@ def _relay(sock_a, sock_b):
         except Exception:
             pass
 
+    def enable_keepalive(sock):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Linux 专属: 60s 空闲后 10s 间隔探测, 更快发现半死对端。
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except Exception:
+            pass
+
     to_blocking(sock_a)
     to_blocking(sock_b)
+    enable_keepalive(sock_a)
+    enable_keepalive(sock_b)
+
+    done = threading.Event()
 
     def pump(src, dst):
         try:
-            while True:
+            while not done.is_set():
                 data = src.recv(65536)
                 if not data:
                     break
@@ -82,10 +106,18 @@ def _relay(sock_a, sock_b):
         except Exception:
             pass
         finally:
-            # 半关闭写端，让对端知道"这边没有更多数据了"，
-            # 但仍然可以往这个方向发。只在真正结束时才做。
+            # 任一方向结束即整体收尾: 关掉两端, 让对端的 recv 也立刻返回。
+            done.set()
             try:
                 dst.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+            try:
+                src.close()
+            except Exception:
+                pass
+            try:
+                dst.close()
             except Exception:
                 pass
 
@@ -93,8 +125,7 @@ def _relay(sock_a, sock_b):
     t2 = threading.Thread(target=pump, args=(sock_b, sock_a), daemon=True)
     t1.start()
     t2.start()
-    # 任一方向结束就整体收尾：dsh 侧的会话可能长时间无流量，
-    # 等两端都 EOF 会让连接白白挂着。
+    # 任一路结束（EOF 或 done 置位）就返回, 不再等两端都 EOF。
     t1.join()
     t2.join()
 
@@ -102,15 +133,25 @@ def _relay(sock_a, sock_b):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "dsh-console-gateway"
+    # 全链路读超时: 半开连接 / keep-alive 空闲连接各占一条线程, ThreadingHTTPServer
+    # 的线程只增不减。没有这个超时, rfile.readline() 会永久阻塞, 线程耗尽后整个
+    # 网关停摆（"时好时坏"、重启即恢复的典型形态）。60s 覆盖慢请求与空闲 keep-alive。
+    timeout = 60
 
     def log_message(self, *args):
         pass
 
     def strip_prefix(self, path):
-        if path == GATEWAY_PREFIX:
-            return "/"
-        if path.startswith(GATEWAY_PREFIX + "/"):
-            return path[len(GATEWAY_PREFIX):] or "/"
+        # 带 query 的前缀路径之前不做剥离（整串比较），带 query 的请求会
+        # 漏剥前缀 → 面板收到 /app/.../p/...?x 的 path → 404。先去掉 query 再剥。
+        bare = path.split("?", 1)[0]
+        if bare == GATEWAY_PREFIX:
+            return "/" + ("?" + path.split("?", 1)[1] if "?" in path else "")
+        if bare.startswith(GATEWAY_PREFIX + "/"):
+            stripped = bare[len(GATEWAY_PREFIX):] or "/"
+            if "?" in path:
+                stripped += "?" + path.split("?", 1)[1]
+            return stripped
         return path
 
     def redirect(self, location):
@@ -125,15 +166,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def body_bytes(self):
         length = self.headers.get("Content-Length")
-        if length and length.isdigit():
+        if length is not None:
+            if not length.strip().isdigit():
+                # 非数字 CL（畸形请求）会让 keep-alive 帧失步, 必须关连接。
+                self.close_connection = True
+                return None
             return self.rfile.read(int(length))
-        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
             chunks = b""
             while True:
                 line = self.rfile.readline().strip()
-                size = int(line.split(b";")[0], 16)
+                try:
+                    size = int(line.split(b";")[0], 16)
+                except Exception:
+                    # 非法的 chunk size 行 → 帧失步, 关连接。
+                    self.close_connection = True
+                    return None
                 if size == 0:
-                    self.rfile.readline()
+                    # 消费 trailer（直到空行）。
+                    while True:
+                        trailer = self.rfile.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
                     break
                 chunks += self.rfile.read(size)
                 self.rfile.readline()
@@ -143,6 +198,12 @@ class Handler(BaseHTTPRequestHandler):
     def fail(self, code, message):
         try:
             payload = message.encode("utf-8")
+            # 状态行二次写防护: 若响应流已经开始了（如 _http_proxy 已经
+            # send_response 之后再抛错），再写状态行会污染已发送的流。此时
+            # 只能直接关连接，让客户端感知中断。
+            if getattr(self, "_response_started", False):
+                self.close_connection = True
+                return
             self.send_response(code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
@@ -173,10 +234,15 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 buf += chunk
             head, _, rest = buf.partition(b"\r\n\r\n")
+            # 后端提前断开, 返回的不是完整响应头: 残缺 buf 不能当头透传。
+            if b"\r\n\r\n" not in buf or not head.strip():
+                self.fail(502, "upstream closed before handshake")
+                return
             head_lines = head.split(b"\r\n")
             parts = head_lines[0].decode("latin1").split(" ", 2)
             code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 502
             self.send_response(code, parts[2] if len(parts) > 2 else "")
+            self._response_started = True
             sent_connection = False
             sent_upgrade = False
             for header in head_lines[1:]:
@@ -214,6 +280,13 @@ class Handler(BaseHTTPRequestHandler):
             if code == 101:
                 self.close_connection = True
                 _relay(self.connection, backend)
+            else:
+                # 非 101 响应（如 401/403 被面板拒绝）: rest 里可能已带部分
+                # body, 已在上方 wfile.write(rest) 发出。若后端仍持有连接且
+                # 还有剩余 body, 这里按 Content-Length 或 chunked 把它读干净,
+                # 否则 keep-alive 连接会帧失步。同时显式关连接（WS 升级失败
+                # 后这条连接通常不会复用）。
+                self.close_connection = True
         except Exception as exc:
             self.fail(502, "upstream websocket error: %s" % exc)
         finally:
@@ -249,12 +322,23 @@ class Handler(BaseHTTPRequestHandler):
             conn = http.client.HTTPConnection(*BACKEND, timeout=60)
             conn.request(self.command, path, body=body, headers=headers)
             resp = conn.getresponse()
+            # HEAD 响应没有 body, 但下方 _rewrite_html 与 body 转发假定有 body。
+            # HEAD 只回状态行 + 头, 不能写 body。
+            is_head = self.command == "HEAD"
             self.send_response(resp.status)
+            self._response_started = True
             for key, value in resp.getheaders():
                 low = key.lower()
                 if low in ("transfer-encoding", "connection", "content-length"):
                     continue
                 self.send_header(key, value)
+            if is_head:
+                # Content-Length 透传（原值）以便客户端正确解析 HEAD。
+                cl = resp.getheader("Content-Length")
+                if cl is not None:
+                    self.send_header("Content-Length", cl)
+                self.end_headers()
+                return
             data = resp.read()
             data = self._rewrite_html(path, resp.getheader("Content-Type"), data)
             self.send_header("Content-Length", str(len(data)))
@@ -295,10 +379,11 @@ class Handler(BaseHTTPRequestHandler):
                     or url in ("/", ""):
                 return m.group(0)
             if url.startswith("/"):
-                return '%s="%s"' % (m.group(1), prefix + url)
+                # 用单引号包 URL, 避免 URL 内含双引号实体/引号时正则失配或注入。
+                return "%s='%s'" % (m.group(1), prefix + url)
             return m.group(0)
 
-        text = re.sub(r'(src|href|action)="(/[^"]*)"', sub, text)
+        text = re.sub(r"(src|href|action)=([\"'])(/[^\"']*)\2", sub, text)
         # 绝对路径重写是主手段, 覆盖 dsh HTML 里的资源引用.
         return text.encode("utf-8")
 

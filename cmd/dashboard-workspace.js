@@ -14,7 +14,7 @@
  * 的任意路径 —— 目录浏览严格限制在「workspace.json 里声明过的 path」范围内。
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import { activeDshHome } from './dashboard-utils.js'
 
@@ -114,6 +114,29 @@ export function listDirectory(requested) {
     }
   })
   if (!allowed) {
+    return { ok: false, error: 'path-not-declared', status: 403 }
+  }
+
+  // 符号链接逃逸修复：上面的边界检查是词法比较（resolve 不解析符号链接），
+  // 而 statSync/readdirSync 会跟随软链。工作区内一个指向 / 或任意目录的
+  // symlink 会被 stat 成 directory，前端再下钻时词法仍在 base 内、实际 readdir
+  // 的是链接目标，绕过「严格限制在声明 path 之内」的边界。用 realpath 校验
+  // 真实路径仍以某个声明 path 的 realpath 为前缀。
+  let realTarget
+  try {
+    realTarget = realpathSync(target)
+  } catch {
+    return { ok: false, error: 'not-found', status: 404 }
+  }
+  const realAllowed = declared.some((p) => {
+    try {
+      const base = realpathSync(resolve(p))
+      return realTarget === base || realTarget.startsWith(base + sep)
+    } catch {
+      return false
+    }
+  })
+  if (!realAllowed) {
     return { ok: false, error: 'path-not-declared', status: 403 }
   }
 

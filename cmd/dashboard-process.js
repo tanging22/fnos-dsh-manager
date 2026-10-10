@@ -19,7 +19,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { dirname, join } from 'node:path'
 import {
@@ -603,6 +603,7 @@ function buildArgs(port) {
 // ---------------------------------------------------------------------------
 
 export async function startDsh() {
+  return serializeServiceOp(async () => {
   const existing = readPid()
   if (existing && isAlive(existing)) {
     // 已有活进程：直接对齐状态机，避免 UI 与实际脱节。
@@ -701,6 +702,7 @@ export async function startDsh() {
       rememberStartupStderr(chunk)
     })
     child.on('error', (error) => {
+      try { closeSync(fd) } catch { /* already closed */ }
       appendLog(`[fnos-dsh-manager] child error: ${error?.message ?? error}\n`)
       lastLaunchError = error?.message ?? String(error)
     })
@@ -708,6 +710,10 @@ export async function startDsh() {
     // `watchForReady` would otherwise keep polling a dead pid until the 300s
     // timeout. Fail fast with the real reason instead.
     child.on('exit', (code, signal) => {
+      // fd 泄漏修复：DSH_LOG 的 fd 此前从不 close，每次 startDsh/restart
+      // （看门狗自愈、版本切换、补丁应用都会 restart）新开一个，长跑耗尽
+      // 进程 fd 上限后 spawn 静默失败、日志全丢。子进程退出即归还。
+      try { closeSync(fd) } catch { /* already closed */ }
       const detail = lastLaunchError || lastStartupStderr()
       appendLog(`[fnos-dsh-manager] dsh exited code=${code} signal=${signal}${detail ? `: ${detail}` : ''}\n`)
       if (managed.stopRequested) return
@@ -739,6 +745,7 @@ export async function startDsh() {
     SetStatus(StatusStopped, `启动失败: ${error?.message ?? error}`)
     return { ok: false, error: 'spawn-failed' }
   }
+  })
 }
 
 /**
@@ -775,6 +782,9 @@ function watchForReady(pid, port) {
   }
   setTimeout(tick, 500)
 }
+// setTimeout 链 unref：进程退出时最多拖 500ms 的问题已由调用处 .unref() 不可行
+// （tick 是 async 重排的），保持现状可接受——watchForReady 最长 300s 但进程
+// 存活期间本就有看门狗常驻。
 
 /**
  * Stop dsh, three-stage: SIGTERM the process group → poll → SIGKILL the group,
@@ -783,45 +793,47 @@ function watchForReady(pid, port) {
  * port and causing the next start to die with EADDRINUSE).
  */
 export async function stopDsh() {
-  managed.stopRequested = true
-  // The port is about to change hands; a memoised scan would report the old
-  // listener for another 750ms and make the sweep below look like it failed.
-  invalidatePortScan()
+  return serializeServiceOp(async () => {
+    managed.stopRequested = true
+    // The port is about to change hands; a memoised scan would report the old
+    // listener for another 750ms and make the sweep below look like it failed.
+    invalidatePortScan()
 
-  const port = listenPort()
-  const pid = currentPid() || readPid()
+    const port = listenPort()
+    const pid = currentPid() || readPid()
 
-  if (pid && isAlive(pid)) {
-    appendLog(`[fnos-dsh-manager] stop: SIGTERM group ${pid}\n`)
-    await killProcessGroup(pid)
-    await killProcessTree(pid)
-    removePidFileIfMatches(pid)
-  }
-
-  // Sweep the port for any dsh-owned stragglers the group kill missed.
-  for (const p of findPidsOnPort(port)) {
-    if (!isAlive(p)) continue
-    if (!isDshProcess(p)) {
-      appendLog(`[fnos-dsh-manager] port ${port} held by foreign pid ${p}; left alone\n`)
-      continue
+    if (pid && isAlive(pid)) {
+      appendLog(`[fnos-dsh-manager] stop: SIGTERM group ${pid}\n`)
+      await killProcessGroup(pid)
+      await killProcessTree(pid)
+      removePidFileIfMatches(pid)
     }
-    appendLog(`[fnos-dsh-manager] stop: kill straggler pid ${p} on port ${port}\n`)
-    await killProcessTree(p)
-  }
 
-  // Wait for the port to actually release before declaring success.
-  await waitForPortFree(port)
+    // Sweep the port for any dsh-owned stragglers the group kill missed.
+    for (const p of findPidsOnPort(port)) {
+      if (!isAlive(p)) continue
+      if (!isDshProcess(p)) {
+        appendLog(`[fnos-dsh-manager] port ${port} held by foreign pid ${p}; left alone\n`)
+        continue
+      }
+      appendLog(`[fnos-dsh-manager] stop: kill straggler pid ${p} on port ${port}\n`)
+      await killProcessTree(p)
+    }
 
-  try { rmSync(PID_FILE, { force: true }) } catch {}
-  managed.pid = null
-  managed.adoptedPid = null
-  managed.failCount = 0
-  // 停止即清 Launch Token：下次启动 dsh 会打印新 token，旧 token 已作废。
-  SetCurrentLaunchToken('')
-  // 状态机翻到 stopped，并持久化（面板重启后不再自启）。
-  SetStatus(StatusStopped, '')
-  SetLastRunState(StatusStopped)
-  return { ok: true }
+    // Wait for the port to actually release before declaring success.
+    await waitForPortFree(port)
+
+    try { rmSync(PID_FILE, { force: true }) } catch {}
+    managed.pid = null
+    managed.adoptedPid = null
+    managed.failCount = 0
+    // 停止即清 Launch Token：下次启动 dsh 会打印新 token，旧 token 已作废。
+    SetCurrentLaunchToken('')
+    // 状态机翻到 stopped，并持久化（面板重启后不再自启）。
+    SetStatus(StatusStopped, '')
+    SetLastRunState(StatusStopped)
+    return { ok: true }
+  })
 }
 
 /**
@@ -928,7 +940,27 @@ const HEALTH_PROBE_TIMEOUT_MS = 1500
 const HEALTH_TCP_TIMEOUT_MS = 1000
 
 /**
+ * Service-op mutex: concurrent start/stop/restart (UI double-click, retry
+ * storms, watchdog adopt racing a manual start) previously interleaved
+ * read-modify-write on `managed` + pidfile — a stop could wipe a just-written
+ * pid of a concurrent start, or two dsh children could end up alive. All
+ * service operations are serialized through one promise chain instead.
+ */
+let serviceOpChain = Promise.resolve()
+function serializeServiceOp(fn) {
+  const run = serviceOpChain.then(fn, fn)
+  // Keep the chain alive even if fn rejects: the next op must still run.
+  serviceOpChain = run.then(() => {}, () => {})
+  return run
+}
+
+/**
  * Stop and relaunch dsh with a freshly written patch, then wait for the port.
+ *
+ * 注意：这里**不能**再包一层 serializeServiceOp —— stopDsh/startDsh 各自已经
+ * 串行化，若 restart 也入链，则 `await stopDsh()` 会排到 restart 自己之后，
+ * 形成自死锁、永不返回。restart 通过依次 await 两个已串行化的子操作，
+ * 天然获得同样的互斥效果。
  */
 export async function restartDsh() {
   await stopDsh()

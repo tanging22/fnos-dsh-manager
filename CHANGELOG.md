@@ -1,5 +1,64 @@
 # Changelog
 
+## v1.0.35 - 2026-10-11
+
+### 修复
+
+本次为深度审计后的系统化加固，覆盖四路审计（核心服务端 / cmd 其余模块 / 网关代理 / 前端）发现的所有 bug、拥堵与内存泄漏。共改动 13 个文件。
+
+#### 核心服务端（cmd/dashboard-server.js、dashboard-process.js）
+
+- **反代升级崩溃链**：`proxyUpgradeToDsh` 是 async 函数却没有任何 `.catch`，上游在握手期间抛错会变成未处理的 Promise rejection 直接崩掉面板进程。现在两个调用点（lan-proxy 与 console）都走 `proxyUpgradeToDshSafe` 包装，出错时销毁 socket 并记录，面板不再因此退出。
+- **socket 无 error 监听的崩溃窗口**：升级请求在 `await` 换取 dsh 会话 Cookie 的间隙里，客户端 socket 若中途断开，`socket.on('error')` 未注册会抛出未捕获异常。现在在 await 之前就挂上兜底监听。
+- **隧道无超时 + 无对称清理**：握手加 10 秒超时（超时销毁上游并回 504）；升级成功后双向绑定 `close` → 销毁对端，半死连接不再永久挂留。
+- **`/plugins/??` 折叠还原过窄（偶发 404 直接原因）**：原来只在 query 含 `client.js` 时才还原折叠，其他插件文件会被原样透传导致 404。改为仅凭 `!rawQuery.startsWith('?')` 判断，对齐 Go 参考实现。
+- **DSH_LOG fd 永不关闭**：每次 start/restart 都新开一个日志 fd 且从不 close，长跑耗尽进程 fd 上限后 spawn 静默失败、日志全丢。现在子进程 exit/error 时归还 fd。
+- **服务操作互斥**：start/stop/restart 之前无并发互斥，双击或看门狗竞态会交错读写 `managed` 与 pidfile（一个 stop 可能清掉并发 start 刚写的 pid，或两个 dsh 同时存活）。三个操作现在走 `serializeServiceOp` 串行链；`restartDsh` 复用 stop/start 的锁、不再重复入链（避免自死锁）。
+- **外层 catch 对已结束响应二次写入**：createConsoleServer 的兜底 catch 之前无论响应是否已发送都再写一次状态行，污染已发送的流。现在判 `headersSent/writableEnded`，且每请求补 `response.on('error')` 兜底。
+- **HTML 注入缓冲无上限**：给注入缓冲加 8MB 上限，超限跳过注入、原样透传。
+- **serveStatic 符号链接逃逸**：静态文件服务加 `realpathSync` 前缀校验。
+
+#### 网关代理（cmd/proxy.py）
+
+- **全链路读超时**：`Handler.timeout = 60`，堵住半开/空闲连接永久占用 ThreadingHTTPServer 线程（线程只增不减，耗尽即整网关停摆）。
+- **WS 半死连接线程泄漏**：`_relay` 原来要等两端都 EOF 才返回，一条半死 WS 永久泄漏 2 线程 + 2 socket。改为任一路结束即通过 Event 通知并关闭两端，同时加 TCP keepalive 主动发现半死对端。
+- **非 101 升级失败分支**：升级被拒（401/403）时显式关连接，避免 keep-alive 帧失步。
+- **HEAD 响应误写 body**：HEAD 现在只回状态行 + 头。
+- **响应流二次写防护**：`fail()` 判 `_response_started`，状态行已发出后不再污染流。
+- **带 query 的前缀漏剥**：`strip_prefix` 先剥离 query 再匹配前缀，带 query 的请求不再 404。
+- **chunked/CL 解析加固**：非数字 Content-Length 与非法 chunk size 标记关连接，避免帧失步；完整消费 trailer。
+- **残缺响应头防护**：上游提前断开时不再把残缺 buf 当头透传。
+- **HTML 重写引号加固**：绝对路径重写改用单引号包裹并支持单双引号两种引号形式。
+
+#### 信任围栏（cmd/dashboard-trust.js）
+
+- **X-Forwarded-Host 伪造绕过（高危）**：原来无条件优先采信 `X-Forwarded-Host`，LAN 客户端自设 `X-Forwarded-Host: localhost` 即可绕过 `isTrustedRequest`。现在仅在网关之后才采信，否则强制用 `headers.host`。
+- **X-Forwarded-For 伪造**：clientIp 只在网关之后且未显式关闭 `trustProxyHeaders` 时才信任。
+- **Origin 端口校验**：`isTrustedRequest` 新增 Origin 端口校验，非面板监听端口（28001/28000）的跨端口 Origin 被拒。
+
+#### 面板入口（cmd/dashboard.js）
+
+- **lan-proxy 端口被占时永久挂起（高危）**：error 事件原先只 log 不 settle Promise，端口被占时 `await` 永久挂起、后面的 SIGTERM/SIGINT 注册永不执行。现在绑定失败会 reject，信号处理始终注册。
+
+#### 插件 / 会话 / 访问 / 工作区（dashboard-plugins.js、dashboard-session.js、dashboard-access.js、dashboard-workspace.js）
+
+- **插件安装旧快照回写**：npm install 后改从磁盘重读 package.json，不再用 install 前的旧快照覆盖 npm 写入的依赖。
+- **插件读-改-写无互斥**：四个插件操作函数包进 `withPluginWriteLock` 串行化。
+- **换 Cookie 响应流缺 error 监听**：连接重置时 Promise 不再永不 settle（避免随后 2 秒静默空 cookie 引发的间歇 401）。
+- **access 队列无界 requeue（内存泄漏）**：写失败时硬上限 1000 条、丢最旧并计数，加 5 秒退避重试。
+- **listDirectory 符号链接逃逸**：词法边界检查后加 `realpathSync` 真实路径校验。
+
+#### 前端（ui/assets/app.js、views/versions.js、views/plugins.js、views/access.js）
+
+- **WS visit/access 高频事件无节流**：一次代理请求推一条 visit 事件，突发流量会排队一整串整页重渲。改为 800ms 尾沿去抖。
+- **版本/插件安装轮询重入**：`setInterval(watch)` 直调 async watch，某次请求 >2s 即并发重叠。加 in-flight 守卫 + 串行自续。
+- **访问页自动刷新竞态**：10s 轮询加 in-flight 守卫，避免刷新超过 10s 时堆积。
+
+### 验证
+
+- check.mjs：31 parsed / 15 imported / 0 failure（含 proxy.py 编译、manifest 字节校验、crypto 误用扫描）。
+- smoke.mjs：81/81 通过。
+
 ## v1.0.34 - 2026-10-10
 
 ### 修复

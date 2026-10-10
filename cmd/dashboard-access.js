@@ -23,6 +23,8 @@ export const LOGIN_LOG_PATH = `${DATA_DIR}/login.log`
 let queue = []
 let flushing = false
 let timer = null
+let retryTimer = null
+let droppedCount = 0
 
 function ensureFile() {
   mkdirSync(dirname(ACCESS_LOG_PATH), { recursive: true })
@@ -62,7 +64,18 @@ export async function flush() {
     invalidateStats()
     trimLog()
   } catch {
-    queue = batch.concat(queue)
+    // 无界 requeue 修复：写失败（磁盘满/只读）时若无限制地把整批塞回队列，
+    // 每个代理请求仍持续 push → queue 只增不减，长期运行内存泄漏。改成
+    // 硬上限：超出的丢最旧（并计丢失数），绝不让队列无限膨胀。
+    const merged = batch.concat(queue)
+    const MAX_PENDING = 1000
+    droppedCount += Math.max(0, merged.length - MAX_PENDING)
+    queue = merged.slice(-MAX_PENDING)
+    // 失败后安排一次退避重试，否则唯一触发 flush 的途径是再来 20 条。
+    if (!retryTimer) {
+      retryTimer = setTimeout(() => { retryTimer = null; void flush() }, 5000)
+      retryTimer.unref?.()
+    }
   } finally {
     flushing = false
   }

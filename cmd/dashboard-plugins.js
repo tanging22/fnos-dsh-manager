@@ -207,13 +207,26 @@ function renderPatchEntries(entries, text) {
   return `${header}\n${bodyText}\n`
 }
 
+/** Plugin write mutex: all four write paths (setPluginEnabled / installBundle /
+ * removeBundle / setBundleEnabled) read-modify-write package.json and
+ * cordis.patch.yml. Two concurrent requests (double-click, two tabs) used to
+ * interleave read→read→write→write, so the second write clobbered the first —
+ * the UI reported success while the file lost one change. Serialize them. */
+let pluginWriteChain = Promise.resolve()
+function withPluginWriteLock(fn) {
+  const run = pluginWriteChain.then(fn, fn)
+  pluginWriteChain = run.then(() => {}, () => {})
+  return run
+}
+
 /**
  * Set a plugin entry's `disabled` state. `id` is the composition entry id (the
  * loader row id), `name` the module name. Mirrors
  * `writePluginEnabled(patch.ts)` but keeps the edit line-level and dependency-free.
  */
 export function setPluginEnabled(id, name, enabled) {
-  const { entries, text } = readPatchEntries()
+  return withPluginWriteLock(() => {
+    const { entries, text } = readPatchEntries()
   // Find the last matching override: an entry with this id, no `insert`, and a
   // matching (or absent) `name`.
   let target = null
@@ -249,6 +262,7 @@ export function setPluginEnabled(id, name, enabled) {
   mkdirSync(dirname(profilePatchPath()), { recursive: true })
   writeFileSync(profilePatchPath(), out, 'utf8')
   return { ok: true, changed: Boolean(target) || !enabled }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +277,8 @@ function npmArgs(subcommand, args = []) {
 
 /** Install a bundle into the profile and select it. */
 export async function installBundle(spec, { onProgress } = {}) {
-  const name = String(spec || '').trim()
+  return withPluginWriteLock(async () => {
+    const name = String(spec || '').trim()
   if (!name) return { ok: false, error: 'missing-package' }
 
   // Registry inspection: normalize `name@version` and validate the package exists.
@@ -300,47 +315,54 @@ export async function installBundle(spec, { onProgress } = {}) {
     }
   }
 
-  // Add to dependencies + bundles so dsh selects it on next start.
-  pkg.dependencies = pkg.dependencies ?? {}
-  pkg.dependencies[inspect.name] = `^${inspect.latest}`
-  const bundles = readBundles(pkg)
+  // 旧快照回写修复：npm install 自己已经把依赖写进了 package.json。若在
+  // install 前读取的旧 pkg 上整体回写，会把 npm 刚写入的 dependencies（以及
+  // 其它并发/历史变更）覆盖掉。install 成功后重新读，在新鲜副本上合并。
+  const fresh = readProfilePackage()
+  fresh.dependencies = fresh.dependencies ?? {}
+  fresh.dependencies[inspect.name] = `^${inspect.latest}`
+  const bundles = readBundles(fresh)
   if (!bundles.includes(inspect.name)) bundles.push(inspect.name)
-  writeBundles(pkg, bundles)
+  writeBundles(fresh, bundles)
 
   return { ok: true, name: inspect.name, version: inspect.latest, restartRequired: true }
+  })
 }
-
 /** Remove a bundle: deselect, then uninstall the package. */
 export async function removeBundle(name) {
-  const pkg = readProfilePackage()
-  const bundles = readBundles(pkg).filter((entry) => entry !== name)
-  writeBundles(pkg, bundles)
+  return withPluginWriteLock(async () => {
+    const pkg = readProfilePackage()
+    const bundles = readBundles(pkg).filter((entry) => entry !== name)
+    writeBundles(pkg, bundles)
 
-  const dir = profileDir()
-  const result = await runWithTimeout(npmBin(), npmArgs('remove', ['--prefix', dir, name]), 10 * 60 * 1000, {
-    env: await npmEnv(),
-    cwd: dir,
+    const dir = profileDir()
+    const result = await runWithTimeout(npmBin(), npmArgs('remove', ['--prefix', dir, name]), 10 * 60 * 1000, {
+      env: await npmEnv(),
+      cwd: dir,
+    })
+    if (result.code !== 0) {
+      return { ok: false, error: 'remove-failed', detail: (result.stderr || '').trim().slice(-2000) }
+    }
+    // npm may leave a stray dir; clean it defensively.
+    try { rmSync(installedDir(name), { recursive: true, force: true }) } catch {}
+    return { ok: true, name, restartRequired: true }
   })
-  if (result.code !== 0) {
-    return { ok: false, error: 'remove-failed', detail: (result.stderr || '').trim().slice(-2000) }
-  }
-  // npm may leave a stray dir; clean it defensively.
-  try { rmSync(installedDir(name), { recursive: true, force: true }) } catch {}
-  return { ok: true, name, restartRequired: true }
 }
 
 /** Toggle a bundle's selection (enable/disable) without touching the install. */
 export function setBundleEnabled(name, enabled) {
-  const pkg = readProfilePackage()
-  const bundles = readBundles(pkg)
-  const has = bundles.includes(name)
-  if (enabled && !has) bundles.push(name)
-  if (!enabled && has) {
-    const idx = bundles.indexOf(name)
-    bundles.splice(idx, 1)
-  }
-  writeBundles(pkg, bundles)
-  return { ok: true, name, enabled, restartRequired: true }
+  return withPluginWriteLock(() => {
+    const pkg = readProfilePackage()
+    const bundles = readBundles(pkg)
+    const has = bundles.includes(name)
+    if (enabled && !has) bundles.push(name)
+    if (!enabled && has) {
+      const idx = bundles.indexOf(name)
+      bundles.splice(idx, 1)
+    }
+    writeBundles(pkg, bundles)
+    return { ok: true, name, enabled, restartRequired: true }
+  })
 }
 
 // ---------------------------------------------------------------------------

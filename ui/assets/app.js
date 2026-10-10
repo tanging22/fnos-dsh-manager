@@ -189,6 +189,17 @@ setInterval(() => {
 // Status/access/visit events re-render the active view; a status event also
 // refreshes the header pill. The interval above stays as a safety net for when
 // the gateway strips WS upgrades (then push silently no-ops and poll carries).
+//
+// visit/access 是高频事件（一次代理请求就推一条）, 若每条都触发整页 renderTab,
+// 突发流量会瞬间排队一长串重渲。这里做 800ms 尾沿去抖: 只在事件停歇后渲一次。
+let visitDebounce = null
+function scheduleSoftRefresh() {
+  if (visitDebounce) clearTimeout(visitDebounce)
+  visitDebounce = setTimeout(() => {
+    visitDebounce = null
+    if (state.tab === 'overview' || state.tab === 'access') renderTab()
+  }, 800)
+}
 const closeWs = ws((event) => {
   if (!isPanelVisible()) return
   if (event.type === 'status') {
@@ -203,7 +214,7 @@ const closeWs = ws((event) => {
       if (memEl) memEl.textContent = event.memory ?? '-'
     }
   } else if (event.type === 'visit' || event.type === 'access') {
-    if (state.tab === 'overview' || state.tab === 'access') renderTab()
+    scheduleSoftRefresh()
   }
 })
 window.addEventListener('beforeunload', closeWs)

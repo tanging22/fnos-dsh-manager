@@ -100,6 +100,10 @@ function exchangeDshSessionCookie(token) {
           if (cookie) cachedCookie = cookie
           resolve(cookie)
         })
+        // 响应流的 'error' 与 'end' 是互斥的：连接重置时只有前者到达，
+        // 之前没有监听 → Promise 永不 settle，且 lastTryAt 已置位导致
+        // 随后 2s 内静默拿空 cookie，表现为反代间歇 401 且无日志。
+        res.on('error', () => resolve(''))
       },
     )
     req.setTimeout(5000, () => {

@@ -85,17 +85,26 @@ async function main() {
   // so a same-network client can open http://<NAS-IP>:28002 and land straight in
   // the suite. Best-effort: if the port is taken, the panel must still run.
   const lanProxy = createLanProxyServer()
-  lanProxy.on('error', (error) => {
-    log(`lan-proxy on :${LAN_PROXY_PORT} error: ${error.code === 'EADDRINUSE' ? 'port in use' : error.message}`)
-  })
-  try {
-    await new Promise((resolvePromise) => {
-      lanProxy.listen(LAN_PROXY_PORT, '0.0.0.0', resolvePromise)
+  // 绑定失败时 error 事件以异步事件到达，listen() 本身不 throw。之前
+  // Promise 的 error 分支只 log 不 settle → main() 永久停在 await，
+  // 后面的 SIGTERM/SIGINT 注册永远执行不到，面板无法优雅关停。
+  // now: reject 让 await 立刻落到 catch，信号处理照常注册。
+  await new Promise((resolvePromise, rejectPromise) => {
+    lanProxy.once('error', rejectPromise)
+    lanProxy.listen(LAN_PROXY_PORT, '0.0.0.0', () => {
+      lanProxy.off('error', rejectPromise)
+      // 之后的运行期错误（如 accept 失败）只记日志，不能再影响主流程。
+      lanProxy.on('error', (error) => {
+        log(`lan-proxy on :${LAN_PROXY_PORT} error: ${error.code === 'EADDRINUSE' ? 'port in use' : error.message}`)
+      })
+      resolvePromise()
     })
-    log(`lan-proxy listening on http://0.0.0.0:${LAN_PROXY_PORT}/ -> dsh (direct, no /p/ prefix)`)
-  } catch (error) {
+  }).catch((error) => {
+    // 兜底 error 监听必须保留：解绑 rejectPromise 后再出错会变 unhandled 'error'。
+    lanProxy.on('error', () => { /* runtime accept errors are non-fatal */ })
     log(`lan-proxy failed to bind :${LAN_PROXY_PORT}: ${error?.message ?? error}`)
-  }
+  })
+  log(`lan-proxy listening on http://0.0.0.0:${LAN_PROXY_PORT}/ -> dsh (direct, no /p/ prefix)`)
 
   const shutdown = (signal) => {
     log(`received ${signal}; closing`)

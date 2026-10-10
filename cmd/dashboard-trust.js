@@ -15,7 +15,22 @@
  */
 
 import { existsSync } from 'node:fs'
-import { APP_DIR, CONSOLE_APP_DIR, lanAddresses, localHost } from './dashboard-utils.js'
+import { APP_DIR, CONSOLE_APP_DIR, LAN_PROXY_PORT, lanAddresses, localHost } from './dashboard-utils.js'
+
+/** 本面板自己的监听端口：console 28001 + LAN 直连口。Origin 端口检查用。 */
+const CONSOLE_PORT = 28001
+const OWN_LISTEN_PORTS = new Set([CONSOLE_PORT, LAN_PROXY_PORT])
+
+/** 提取 Origin 头的端口（无端口返回 ''；https 默认 443 也返回 ''——不惩罚）。 */
+function originPortOf(origin) {
+  try {
+    const u = new URL(String(origin))
+    if (u.protocol === 'https:') return '' // https 默认口，通常来自网关 TLS 终结
+    return u.port ? String(Number(u.port)) : ''
+  } catch {
+    return ''
+  }
+}
 import { loadConfig, trustedHosts } from './dashboard-config.js'
 
 /** Hosts dsh would itself accept, plus this host's own LAN addresses. */
@@ -42,8 +57,15 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost'])
 const IPV4 = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 
 export function requestHost(headers) {
+  // x-forwarded-host 只在真的有 fnOS 网关时才可信。面板直接暴露在
+  // 0.0.0.0（lan-proxy 28000/28002），LAN 上任意客户端可以自设
+  // `X-Forwarded-Host: localhost` 绕过 isTrustedRequest 的本地判定——
+  // 与本文件自己的原则矛盾（"Host 头不可作为本地证据，谁都能发"，
+  // X-Forwarded-Host 同样谁都能发）。只有 behindGateway() 为真（部署
+  // 在网关后面）时才采信它；直连时强制用真实 Host 头。
   const forwarded = headers['x-forwarded-host']
-  const raw = (Array.isArray(forwarded) ? forwarded[0] : forwarded) || headers['host'] || ''
+  const fromProxy = behindGateway() ? (Array.isArray(forwarded) ? forwarded[0] : forwarded) : null
+  const raw = fromProxy || headers['host'] || ''
   return normalizeHost(raw)
 }
 
@@ -93,6 +115,16 @@ export function isTrustedRequest(headers) {
      regardless of trust, because that is what stops a browser on a trusted
      page from being used to drive this panel. */
   if (originHost && originHost !== host) return { ok: false, reason: 'origin-host-mismatch' }
+  // Origin 的端口也要在面板自己的监听集合里：之前只比 hostname，
+  // `http://localhost:3000` 的页面也能过 `localhost:28000` 的检查（跨端口
+  // CSRF 弱化）。面板监听 28001（console）与 LAN_PROXY_PORT（直连），
+  // Origin 端口必须是其中之一（或 Origin 没写端口且是 https 默认口时跳过）。
+  if (originHost) {
+    const originPort = originPortOf(headers['origin'])
+    if (originPort && !OWN_LISTEN_PORTS.has(originPort)) {
+      return { ok: false, reason: 'origin-port-mismatch' }
+    }
+  }
 
   if (isLocalAddress(host)) return { ok: true }
 
@@ -109,7 +141,9 @@ export function isTrustedRequest(headers) {
  * off (or behind no proxy) the socket peer is used, which cannot be spoofed.
  */
 export function clientIp(socket, headers) {
-  if (loadConfig().access?.trustProxyHeaders !== false) {
+  // 同 requestHost：X-Forwarded-For / X-Real-IP 只在网关后面才可信。
+  // 直连时这些头谁都能伪造，会污染访问记录。socket peer 无法伪造。
+  if (behindGateway() && loadConfig().access?.trustProxyHeaders !== false) {
     const forwarded = headers['x-forwarded-for']
     const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded
     if (raw) {

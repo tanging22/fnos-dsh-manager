@@ -89,41 +89,60 @@ export async function render(host, ctx) {
   const jobLine = host.querySelector('#job')
   const jobLog = host.querySelector('#joblog')
 
+  // 轮询重入防护（同 versions.js）: watch 是 async, setInterval 直调会并发重叠。
+  let watching = false
+  let watchStopped = false
+
   const watch = async () => {
-    const job = await api('/api/plugins/job').catch(() => ({ job: null }))
-    const current = job.job
-    if (!current || current.status !== 'running') {
-      clearInterval(poll)
-      poll = null
-      if (current?.status === 'done') {
-        toast(`已安装 ${current.name ?? current.spec}`, 'ok')
-        jobLine.textContent = ''
-        jobLog.hidden = true
-        jobLog.textContent = ''
-        await ctx.render()
+    if (watching || watchStopped) return
+    watching = true
+    try {
+      const job = await api('/api/plugins/job').catch(() => ({ job: null }))
+      const current = job.job
+      if (!current || current.status !== 'running') {
+        stopPoll()
+        if (current?.status === 'done') {
+          toast(`已安装 ${current.name ?? current.spec}`, 'ok')
+          jobLine.textContent = ''
+          jobLog.hidden = true
+          jobLog.textContent = ''
+          await ctx.render()
+          return
+        }
+        if (current?.status === 'failed') {
+          toast(`安装失败: ${current.error ?? '未知'}`, 'error', 8000)
+          jobLine.textContent = current.detail ? String(current.detail).slice(-500) : ''
+          jobLog.hidden = true
+        }
         return
       }
-      if (current?.status === 'failed') {
-        toast(`安装失败: ${current.error ?? '未知'}`, 'error', 8000)
-        jobLine.textContent = current.detail ? String(current.detail).slice(-500) : ''
-        jobLog.hidden = true
+      jobLine.textContent = `正在安装 ${current.spec ?? ''}...`
+      if (current.log) {
+        jobLog.hidden = false
+        jobLog.textContent = current.log
+        jobLog.scrollTop = jobLog.scrollHeight
       }
-      return
+    } finally {
+      watching = false
     }
-    jobLine.textContent = `正在安装 ${current.spec ?? ''}...`
-    if (current.log) {
-      jobLog.hidden = false
-      jobLog.textContent = current.log
-      jobLog.scrollTop = jobLog.scrollHeight
-    }
+  }
+
+  const stopPoll = () => {
+    clearInterval(poll)
+    poll = null
+  }
+
+  const startPoll = () => {
+    stopPoll()
+    watchStopped = false
+    poll = setInterval(watch, 2000)
   }
 
   const startInstall = async (spec) => {
     try {
       await api('/api/plugins/install', { method: 'POST', body: { spec } })
       toast(`安装已开始: ${spec}`, 'ok')
-      clearInterval(poll)
-      poll = setInterval(watch, 2000)
+      startPoll()
       jobLine.textContent = `正在安装 ${spec}...`
     } catch (error) {
       toast(error.message, 'error')
@@ -215,8 +234,8 @@ export async function render(host, ctx) {
   })
 
   ctx.onLeave(() => {
-    clearInterval(poll)
-    poll = null
+    watchStopped = true
+    stopPoll()
   })
 
   // Pick up an install already running before this tab opened.

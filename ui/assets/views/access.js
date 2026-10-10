@@ -3,6 +3,7 @@
 import { api, esc, timeAgo, toast } from '../dom.js'
 
 let poll = null
+let refreshing = false
 
 export async function render(host, ctx) {
   let data
@@ -63,7 +64,15 @@ export async function render(host, ctx) {
   host.querySelector('#live').addEventListener('change', (event) => {
     clearInterval(poll)
     poll = null
-    if (event.target.checked) poll = setInterval(() => ctx.refresh(), 10000)
+    if (event.target.checked) {
+      // 自动刷新用 ctx.refresh() 会整页重渲（走 renderTab 串行队列）, 10s 一次
+      // 频率下尚可接受, 但若一次刷新 >10s 会堆积。加 in-flight 守卫避免重叠。
+      poll = setInterval(() => {
+        if (refreshing) return
+        refreshing = true
+        ctx.refresh().finally(() => { refreshing = false })
+      }, 10000)
+    }
   })
 
   host.querySelector('#clear').addEventListener('click', async () => {

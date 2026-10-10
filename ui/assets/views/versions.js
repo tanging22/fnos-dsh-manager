@@ -66,33 +66,57 @@ export async function render(host, ctx) {
   const jobLine = host.querySelector('#job')
   const jobLog = host.querySelector('#joblog')
 
+  // 轮询重入防护: watch 是 async 的, 直接 `setInterval(watch, 2000)` 时, 若某次
+  // /api/versions/job 耗时 > 2s, 下一次 tick 会在上一次未结束时再次进入 → 并发
+  // 重叠的 watch, 每个都在 done 时调用 ctx.render() 且互相不清 poll, 轻则重复
+  // toast 与整页重渲, 重则 poll 被多个闭包交错 clear/set 后失控。这里改成
+  // 「in-flight 守卫 + 串行自续」: 同一时刻至多一个 watch 在飞, 完成后按需再排。
+  let watching = false
+  let watchStopped = false
+
   const watch = async () => {
-    const job = await api('/api/versions/job').catch(() => ({ job: null }))
-    const current = job.job
-    if (!current || current.status !== 'running') {
-      clearInterval(poll)
-      poll = null
-      if (current?.status === 'done') {
-        toast(`已安装 ${current.version}`, 'ok')
-        jobLine.textContent = ''
-        jobLog.hidden = true
-        jobLog.textContent = ''
-        await ctx.render()
+    if (watching || watchStopped) return
+    watching = true
+    try {
+      const job = await api('/api/versions/job').catch(() => ({ job: null }))
+      const current = job.job
+      if (!current || current.status !== 'running') {
+        stopPoll()
+        if (current?.status === 'done') {
+          toast(`已安装 ${current.version}`, 'ok')
+          jobLine.textContent = ''
+          jobLog.hidden = true
+          jobLog.textContent = ''
+          await ctx.render()
+          return
+        }
+        if (current?.status === 'failed') {
+          toast(`安装失败: ${current.error ?? '未知'}`, 'error', 8000)
+          jobLine.textContent = current.detail ? String(current.detail).slice(-500) : ''
+          jobLog.hidden = true
+        }
         return
       }
-      if (current?.status === 'failed') {
-        toast(`安装失败: ${current.error ?? '未知'}`, 'error', 8000)
-        jobLine.textContent = current.detail ? String(current.detail).slice(-500) : ''
-        jobLog.hidden = true
+      jobLine.textContent = `正在安装 ${current.version}...`
+      if (current.log) {
+        jobLog.hidden = false
+        jobLog.textContent = current.log
+        jobLog.scrollTop = jobLog.scrollHeight
       }
-      return
+    } finally {
+      watching = false
     }
-    jobLine.textContent = `正在安装 ${current.version}...`
-    if (current.log) {
-      jobLog.hidden = false
-      jobLog.textContent = current.log
-      jobLog.scrollTop = jobLog.scrollHeight
-    }
+  }
+
+  const stopPoll = () => {
+    clearInterval(poll)
+    poll = null
+  }
+
+  const startPoll = () => {
+    stopPoll()
+    watchStopped = false
+    poll = setInterval(watch, 2000)
   }
 
   host.querySelector('#install').addEventListener('click', async () => {
@@ -101,8 +125,7 @@ export async function render(host, ctx) {
     try {
       await api('/api/versions/install', { method: 'POST', body: { version } })
       toast(`安装已开始: ${version}`, 'ok')
-      clearInterval(poll)
-      poll = setInterval(watch, 2000)
+      startPoll()
       jobLine.textContent = `正在安装 ${version}...`
     } catch (error) {
       toast(error.message, 'error')
@@ -156,8 +179,8 @@ export async function render(host, ctx) {
   })
 
   ctx.onLeave(() => {
-    clearInterval(poll)
-    poll = null
+    watchStopped = true
+    stopPoll()
   })
 
   // Pick up an install that was already running before this tab opened.
