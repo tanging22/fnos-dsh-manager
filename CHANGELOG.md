@@ -5,6 +5,11 @@
 ### 修复
 
 - 经 fnOS 网关访问时，面板 `/ws` 推送通道握手被信任栅栏判 `origin-host-mismatch` 拒绝（403），浏览器反复报 `WebSocket connection failed`，UI 只能靠 15 秒轮询兜底。根因是 `proxy.py` 的 `_ws_proxy` 把 `Host` 重写为 `127.0.0.1` 却原样透传了浏览器的 `Origin`（`http://<网关host>:5666`），两者不一致被 `isTrustedRequest` 拒绝；而 `_http_proxy` 早就有 `headers.pop("Origin")`，`_ws_proxy` 漏了这步对称处理。现已对齐：WS 握手的头转发同样剥掉 `origin`，经网关访问时推送通道恢复正常。
+- 面板发往客户端的 WS 控制帧（ping/pong/close）误带 mask 位：`[0x89, 0x80, 0,0,0,0]` 里第二个字节 `0x80` 是 mask 位（RFC 6455 规定服务端→客户端**绝不能** mask），浏览器据此报 `A server must not mask any frames that it sends to the client` 并丢弃推送通道。改为正确的空控制帧 `[0x89, 0x00]` 等三处。此 bug 为原有问题，之前经网关 `/ws` 握手就被 403 挡在帧阶段之前，从未暴露。
+
+### 验证
+
+- smoke 新增 2 条断言：`dashboard-server.js` 的服务端→客户端控制帧不得含 mask 位、文本帧保持 `0x81` 无 mask。81 → 83 项全通过。
 
 ## v1.0.35 - 2026-10-11
 

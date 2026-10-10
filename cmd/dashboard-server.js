@@ -295,13 +295,13 @@ function acceptWebSocket(request, socket, head) {
 
         if (frame.opcode === 0x8) {
           // Close: echo a close frame back, then let `end` flush it.
-          try { socket.write(Buffer.from([0x88, 0x80, 0, 0, 0, 0])) } catch { /* ignore */ }
+          try { socket.write(Buffer.from([0x88, 0x00])) } catch { /* ignore */ }
           socket.end()
           wsClients.delete(socket)
           return
         }
         if (frame.opcode === 0x9) {
-          try { socket.write(Buffer.from([0x8a, 0x80, 0, 0, 0, 0])) } catch { /* ignore */ }
+          try { socket.write(Buffer.from([0x8a, 0x00])) } catch { /* ignore */ }
           continue
         }
         if (frame.opcode === 0xa) continue // pong: liveness already recorded
@@ -343,7 +343,7 @@ export function StartWebSocketHeartbeat() {
         wsClients.delete(socket)
         continue
       }
-      try { socket.write(Buffer.from([0x89, 0x80, 0, 0, 0, 0])) } catch { /* ignore */ }
+      try { socket.write(Buffer.from([0x89, 0x00])) } catch { /* ignore */ }
     }
   }, WS_PING_INTERVAL_MS)
   timer.unref()

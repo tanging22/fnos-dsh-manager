@@ -774,6 +774,23 @@ async function pythonBin() {
   check('a malformed /ws handshake is answered, not fatal', /^4|^5/.test(String(garbageStatus)), `got ${garbageStatus}`)
   check('the panel survives a bad /ws request', (await call('/api/status')).status === 200)
 
+  /* --- the panel's server→client WS frames must never carry the mask bit ---
+   *
+   * RFC6455 §5.1: a client MUST mask, a server MUST NOT. The ping/pong/close
+   * frames used to be written as `[0x89, 0x80, 0,0,0,0]` — the `0x80` is the
+   * mask bit, so the browser rejected every one of them with "A server must not
+   * mask any frames that it sends to the client" and dropped the /ws push
+   * channel. The undici WebSocket client above never sends pings, so the
+   * handshake assertions stayed green while real browsers failed. Assert the
+   * frame bytes directly so this cannot regress.
+   */
+  const serverJsText = readFileSync(join(ROOT, 'cmd', 'dashboard-server.js'), 'utf8')
+  check('server→client control frames are unmasked',
+    !/\[0x8[89a],\s*0x80\]/.test(serverJsText) && !/0x8[89a],\s*0x80,/.test(serverJsText),
+    'dashboard-server.js still emits a masked ping/pong/close frame')
+  check('server→client text frames are unmasked (0x81)',
+    /0x81/.test(serverJsText), 'encodeWsText lost its unmasked text opcode')
+
   /* --- config parsing resilience -----------------------------------------
    * The installer used to write a `//`-commented console-config.json, which
    * JSON.parse rejects; loadConfig swallowed the error and fell back to
