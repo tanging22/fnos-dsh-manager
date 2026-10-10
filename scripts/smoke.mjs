@@ -253,6 +253,47 @@ function rawUpgrade({ host, port = PANEL_PORT, path, protocol = 'typert-mux' }) 
   })
 }
 
+/* Same as rawUpgrade, but over the gateway proxy's Unix socket — the last hop
+ * between the browser and the panel, i.e. exactly what the fnOS 统一网关 does. */
+function rawUpgradeUnix({ socketPath, host, path, protocol = 'typert-mux' }) {
+  return new Promise((resolve, reject) => {
+    const socket = connect(socketPath, () => {
+      socket.write([
+        `GET ${path} HTTP/1.1`,
+        `Host: ${host}`,
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version: 13',
+        `Sec-WebSocket-Protocol: ${protocol}`,
+        '',
+        '',
+      ].join('\r\n'))
+    })
+    const chunks = []
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      const text = Buffer.concat(chunks).toString('binary')
+      const split = text.indexOf('\r\n\r\n')
+      resolve({
+        head: split === -1 ? text : text.slice(0, split),
+        tail: split === -1 ? '' : text.slice(split + 4),
+      })
+      socket.destroy()
+    }
+    socket.on('data', (chunk) => {
+      chunks.push(chunk)
+      const text = Buffer.concat(chunks).toString('binary')
+      if (text.indexOf('\r\n\r\n') !== -1 && text.length >= text.indexOf('\r\n\r\n') + 6) finish()
+    })
+    socket.on('error', (error) => { if (!done) { done = true; reject(error) } })
+    socket.on('close', finish)
+    setTimeout(finish, 3000).unref?.()
+  })
+}
+
 try {
   await new Promise((resolve) => stub.listen(STUB_PORT, '127.0.0.1', resolve))
 
@@ -470,22 +511,39 @@ try {
    * The fnOS 统一网关 is documented to support WebSocket, so this hop has to
    * hand a valid 101 back on its own.
    */
-  /* The gateway hop needs a real AF_UNIX socket; where the interpreter has no
+  /* Some images only ship `python3`; pick whichever this platform actually has. */
+async function pythonBin() {
+  for (const candidate of ['python3', 'python']) {
+    const found = await new Promise((resolve) => {
+      const probe = spawn(candidate, ['-c', 'import sys;sys.exit(0)'], { stdio: 'ignore' })
+      probe.on('error', () => resolve(false))
+      probe.on('close', (code) => resolve(code === 0))
+    })
+    if (found) return candidate
+  }
+  return null
+}
+
+/* The gateway hop needs a real AF_UNIX socket; where the interpreter has no
    * AF_UNIX (some Windows builds) there is nothing to bind, so skip rather than
    * report a false failure. CI runs Linux and does cover this. */
   let hasUnixSocket = true
-  try {
-    const probe = spawn('python', ['-c', 'import socket,sys;sys.exit(0 if hasattr(socket,"AF_UNIX") else 1)'], { stdio: 'ignore' })
-    hasUnixSocket = await new Promise((resolve) => probe.on('close', (code) => resolve(code === 0)))
-  } catch {
+  const python = await pythonBin()
+  if (!python) {
+    hasUnixSocket = false
+  } else if (await new Promise((resolve) => {
+    const probe = spawn(python, ['-c', 'import socket,sys;sys.exit(0 if hasattr(socket,"AF_UNIX") else 1)'], { stdio: 'ignore' })
+    probe.on('error', () => resolve(false))
+    probe.on('close', (code) => resolve(code === 0))
+  }) !== true) {
     hasUnixSocket = false
   }
 
   if (!hasUnixSocket) {
-    console.log('  ~ skipped 6 gateway checks (python has no AF_UNIX on this platform)')
+    console.log('  ~ skipped 6 gateway checks (no python with AF_UNIX on this platform)')
   } else {
   const gatewaySock = join(sandbox, 'gateway.sock')
-  const gateway = spawn('python', [join(ROOT, 'cmd', 'proxy.py')], {
+  const gateway = spawn(python, [join(ROOT, 'cmd', 'proxy.py')], {
     env: {
       ...process.env,
       CONSOLE_PORT: String(PANEL_PORT),
@@ -500,24 +558,27 @@ try {
 
   try {
     if (!(await waitFor(() => existsSync(gatewaySock), { description: 'gateway socket' }))) {
-      throw new Error('proxy.py did not bind its socket')
+        console.error('proxy.py did not bind its socket')
+        console.error(gatewayOutput.slice(-4000))
+        check('the gateway proxy starts and binds its socket', false, 'no socket appeared')
+      } else {
+        const gw = await rawUpgradeUnix({
+          socketPath: gatewaySock,
+          host: 'gw.local',
+          path: '/app/gw/p/api/remote.mux',
+        })
+        check('the gateway proxy completes the handshake', /^HTTP\/1\.1 101 /.test(gw.head), gw.head.split('\r\n')[0] ?? '(empty)')
+        for (const name of ['connection', 'upgrade']) {
+          const count = (gw.head.match(new RegExp(`^${name}:`, 'gmi')) ?? []).length
+          check(`the gateway 101 carries ${name} exactly once`, count === 1, `count=${count} head=${gw.head.replace(/\r\n/g, ' | ')}`)
+        }
+        check('the gateway 101 keeps the subprotocol', /sec-websocket-protocol: typert-mux/i.test(gw.head),
+          gw.head.replace(/\r\n/g, ' | '))
+        check('the gateway tunnel carries upstream frames back', gw.tail.includes('hi'), `tail=${JSON.stringify(gw.tail)}`)
+      }
+    } finally {
+      gateway.kill()
     }
-    const gw = await rawUpgradeUnix({
-      socketPath: gatewaySock,
-      host: 'gw.local',
-      path: '/app/gw/p/api/remote.mux',
-    })
-    check('the gateway proxy completes the handshake', /^HTTP\/1\.1 101 /.test(gw.head), gw.head.split('\r\n')[0] ?? '(empty)')
-    for (const name of ['connection', 'upgrade']) {
-      const count = (gw.head.match(new RegExp(`^${name}:`, 'gmi')) ?? []).length
-      check(`the gateway 101 carries ${name} exactly once`, count === 1, `count=${count} head=${gw.head.replace(/\r\n/g, ' | ')}`)
-    }
-    check('the gateway 101 keeps the subprotocol', /sec-websocket-protocol: typert-mux/i.test(gw.head),
-      gw.head.replace(/\r\n/g, ' | '))
-    check('the gateway tunnel carries upstream frames back', gw.tail.includes('hi'), `tail=${JSON.stringify(gw.tail)}`)
-  } finally {
-    gateway.kill()
-  }
   }
 
   /* --- unknown endpoints ------------------------------------------------ */
