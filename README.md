@@ -1,4 +1,4 @@
-# DSH 控制台（dsh-fnos-console）
+# DSH 控制台（fnos-dsh-manager）
 
 给 **fnOS（飞牛 NAS）** 用的 DeepSeek Harness（DSH）管理面板套件。
 

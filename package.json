@@ -1,5 +1,5 @@
 {
-  "name": "dsh-fnos-console",
+  "name": "fnos-dsh-manager",
   "version": "1.0.25",
   "private": true,
   "description": "DeepSeek Harness (dsh) 专属 fnOS 应用封装：管理后台（状态/日志/版本切换/访问 IP）+ 反代快捷入口",
@@ -18,6 +18,6 @@
   "author": "tanging22",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tanging22/dsh-fnos-console.git"
+    "url": "git+https://github.com/tanging22/fnos-dsh-manager.git"
   }
 }
