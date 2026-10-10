@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.32 - 2026-10-10
+
+### 修复
+
+- 网关代理 `cmd/proxy.py` 回写上游 101 响应头时，不再把 `connection` 当作 hop-by-hop 一丢了之。`Connection: Upgrade` 只曾被补往上游方向，从未补回客户端，于是经 fnOS 统一网关（:5666）的 101 只带 `Upgrade`、不带 `Connection`，违反 RFC 6455：浏览器判定握手非法、丢弃 socket、循环重试，而面板日志一路记录 101，故障完全不可见。面板自身是相反方向的缺陷（同一段逻辑补重了），v1.0.31 已修。
+- 现在 `connection`/`upgrade` 各只透传一次，且仅在 101 缺失时补齐，面板主页的实时推送（`/ws`）与 dsh 隧道（`/p/api/remote.mux`）经网关均能正常建立。
+
+### 验证
+
+- smoke 新增网关 101 覆盖：启动真实 `proxy.py` 监听 unix socket，断言握手 101、`connection`/`upgrade` 各恰好一次、子协议保留、上游帧能穿隧道回来、且普通 HTTP 反代不受影响。本机 python 缺 `AF_UNIX` 时跳过这 6 项，CI（Linux）实际执行。
 ## v1.0.31 - 2026-10-10
 
 ### 修复

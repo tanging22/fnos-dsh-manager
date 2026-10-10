@@ -461,6 +461,65 @@ try {
   const refused = await rawUpgrade({ host: `127.0.0.1:${PANEL_PORT}`, path: '/p/nope' })
   check('a refused upgrade is not reported as 101', !/^HTTP\/1\.1 101 /.test(refused.head), refused.head.split('\r\n')[0] ?? '(empty)')
 
+  /* --- the gateway proxy: a 101 must keep Connection, not drop it ---------
+   *
+   * proxy.py dropped `connection` as hop-by-hop on every response and only
+   * re-sent `Connection: Upgrade` upstream — never back to the client. The
+   * browser therefore saw a 101 carrying `Upgrade` alone, rejected the
+   * handshake, and dropped the socket while the panel logged a clean 101.
+   * The fnOS 统一网关 is documented to support WebSocket, so this hop has to
+   * hand a valid 101 back on its own.
+   */
+  /* The gateway hop needs a real AF_UNIX socket; where the interpreter has no
+   * AF_UNIX (some Windows builds) there is nothing to bind, so skip rather than
+   * report a false failure. CI runs Linux and does cover this. */
+  let hasUnixSocket = true
+  try {
+    const probe = spawn('python', ['-c', 'import socket,sys;sys.exit(0 if hasattr(socket,"AF_UNIX") else 1)'], { stdio: 'ignore' })
+    hasUnixSocket = await new Promise((resolve) => probe.on('close', (code) => resolve(code === 0)))
+  } catch {
+    hasUnixSocket = false
+  }
+
+  if (!hasUnixSocket) {
+    console.log('  ~ skipped 6 gateway checks (python has no AF_UNIX on this platform)')
+  } else {
+  const gatewaySock = join(sandbox, 'gateway.sock')
+  const gateway = spawn('python', [join(ROOT, 'cmd', 'proxy.py')], {
+    env: {
+      ...process.env,
+      CONSOLE_PORT: String(PANEL_PORT),
+      SOCK_PATH: gatewaySock,
+      GATEWAY_PREFIX: '/app/gw',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let gatewayOutput = ''
+  gateway.stdout.on('data', (chunk) => { gatewayOutput += chunk })
+  gateway.stderr.on('data', (chunk) => { gatewayOutput += chunk })
+
+  try {
+    if (!(await waitFor(() => existsSync(gatewaySock), { description: 'gateway socket' }))) {
+      throw new Error('proxy.py did not bind its socket')
+    }
+    const gw = await rawUpgradeUnix({
+      socketPath: gatewaySock,
+      host: 'gw.local',
+      path: '/app/gw/p/api/remote.mux',
+    })
+    check('the gateway proxy completes the handshake', /^HTTP\/1\.1 101 /.test(gw.head), gw.head.split('\r\n')[0] ?? '(empty)')
+    for (const name of ['connection', 'upgrade']) {
+      const count = (gw.head.match(new RegExp(`^${name}:`, 'gmi')) ?? []).length
+      check(`the gateway 101 carries ${name} exactly once`, count === 1, `count=${count} head=${gw.head.replace(/\r\n/g, ' | ')}`)
+    }
+    check('the gateway 101 keeps the subprotocol', /sec-websocket-protocol: typert-mux/i.test(gw.head),
+      gw.head.replace(/\r\n/g, ' | '))
+    check('the gateway tunnel carries upstream frames back', gw.tail.includes('hi'), `tail=${JSON.stringify(gw.tail)}`)
+  } finally {
+    gateway.kill()
+  }
+  }
+
   /* --- unknown endpoints ------------------------------------------------ */
   const bogus = await call('/api/does-not-exist')
   check('unknown endpoint is 404', bogus.status === 404, `got ${bogus.status}`)

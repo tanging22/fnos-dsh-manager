@@ -177,12 +177,37 @@ class Handler(BaseHTTPRequestHandler):
             parts = head_lines[0].decode("latin1").split(" ", 2)
             code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 502
             self.send_response(code, parts[2] if len(parts) > 2 else "")
+            sent_connection = False
+            sent_upgrade = False
             for header in head_lines[1:]:
                 key, _, value = header.partition(b":")
-                low = key.decode("latin1").strip().lower()
-                if low in ("transfer-encoding", "connection", "content-length"):
+                name = key.decode("latin1").strip()
+                val = value.decode("latin1").strip()
+                low = name.lower()
+                # `connection` is hop-by-hop for ordinary responses, but on a 101
+                # it IS the handshake: RFC 6455 requires the client to see
+                # `Connection: Upgrade`. Dropping it as we do below and never
+                # putting it back is what left the browser holding a 101 that
+                # carried only `Upgrade` — an invalid handshake it rejects
+                # outright, so the tunnel never comes up.
+                if low in ("transfer-encoding", "content-length"):
                     continue
-                self.send_header(key.decode("latin1").strip(), value.decode("latin1").strip())
+                if low == "connection":
+                    if not sent_connection:
+                        self.send_header(name, val)
+                        sent_connection = True
+                    continue
+                if low == "upgrade" and sent_upgrade:
+                    continue
+                self.send_header(name, val)
+                if low == "upgrade":
+                    sent_upgrade = True
+            if code == 101 and not sent_connection:
+                # Backend dropped `Connection` from its own 101 — the browser will
+                # not accept the handshake without it, so re-assert it here.
+                self.send_header("Connection", "Upgrade")
+            if code == 101 and not sent_upgrade:
+                self.send_header("Upgrade", self.headers.get("Upgrade", "websocket"))
             self.end_headers()
             if rest:
                 self.wfile.write(rest)
