@@ -1151,10 +1151,21 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
         if (lower === 'transfer-encoding') continue
         out[key] = value
       }
-      out.Connection = 'Upgrade'
-      out.Upgrade = upstreamResponse.headers.upgrade || request.headers.upgrade
+      // 上游头是 HTTP/1.1 大小写不敏感的，重复的 Connection/Upgrade 会被浏览器
+      // 判为非法握手（服务端记 101，客户端直接 failed）。所以只在缺失时补。
+      const hasConnection = Object.keys(out).some((key) => key.toLowerCase() === 'connection')
+      const hasUpgrade = Object.keys(out).some((key) => key.toLowerCase() === 'upgrade')
+      if (!hasConnection) out.Connection = 'Upgrade'
+      if (!hasUpgrade) out.Upgrade = upstreamResponse.headers.upgrade || request.headers.upgrade
+      // 逐个头写一行；同名的只能出现一次。
+      const seen = new Set()
       let headText = `HTTP/1.1 101 Switching Protocols\r\n`
-      for (const [key, value] of Object.entries(out)) headText += `${key}: ${value}\r\n`
+      for (const [key, value] of Object.entries(out)) {
+        const lower = key.toLowerCase()
+        if (seen.has(lower)) continue
+        seen.add(lower)
+        headText += `${key}: ${value}\r\n`
+      }
       headText += '\r\n'
       socket.write(headText)
       socket.setNoDelay(true)

@@ -70,6 +70,33 @@ const stub = createServer((request, response) => {
   response.end(`stub:${url}`)
 })
 
+/* The stub has to speak WebSocket upgrades, because the panel's WS proxy is a
+ * separate code path from the HTTP proxy and the bug that shipped in 1.0.29/
+ * 1.0.30 lived only there. Node's HTTP server emits the 101 handshake headers
+ * in LOWERCASE, and the proxy used to append its own capitalised `Connection` /
+ * `Upgrade` on top, so the browser saw each name twice and refused the socket
+ * while the access log happily recorded 101. Reproducing the lowercase form
+ * here is the whole point: an upstream that capitalised them would have hidden
+ * the bug. */
+stub.on('upgrade', (request, socket, head) => {
+  if (!(request.url ?? '').startsWith('/api/remote.mux')) {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n')
+    socket.destroy()
+    return
+  }
+  socket.write([
+    'HTTP/1.1 101 Switching Protocols',
+    'upgrade: websocket',
+    'connection: Upgrade',
+    'sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZbK+xOoo=',
+    'sec-websocket-protocol: typert-mux',
+    '',
+    '',
+  ].join('\r\n'))
+  if (head && head.length) socket.unshift(head)
+  socket.write(Buffer.from([0x81, 0x02, 0x68, 0x69])) // a masked-less text frame "hi"
+})
+
 const panelEnv = {
   ...process.env,
   DATA_DIR: dataDir,
@@ -181,6 +208,48 @@ function rawRequest({ host, path = '/', method = 'GET', extraHeaders = [] }) {
       const body = data.slice(data.indexOf('\r\n\r\n') + 4)
       resolve({ status, body })
     })
+  })
+}
+
+/* Same trick as rawRequest, but for an upgrade: keep reading past the headers so
+ * the test can prove the tunnel is live and upstream frames come back. */
+function rawUpgrade({ host, port = PANEL_PORT, path, protocol = 'typert-mux' }) {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write([
+        `GET ${path} HTTP/1.1`,
+        `Host: ${host}`,
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version: 13',
+        `Sec-WebSocket-Protocol: ${protocol}`,
+        '',
+        '',
+      ].join('\r\n'))
+    })
+    const chunks = []
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      const text = Buffer.concat(chunks).toString('binary')
+      const split = text.indexOf('\r\n\r\n')
+      resolve({
+        head: split === -1 ? text : text.slice(0, split),
+        tail: split === -1 ? '' : text.slice(split + 4),
+      })
+      socket.destroy()
+    }
+    socket.on('data', (chunk) => {
+      chunks.push(chunk)
+      const text = Buffer.concat(chunks).toString('binary')
+      // Headers plus the two "hi" payload bytes: enough to prove the pipe works.
+      if (text.indexOf('\r\n\r\n') !== -1 && text.length >= text.indexOf('\r\n\r\n') + 6) finish()
+    })
+    socket.on('error', (error) => { if (!done) { done = true; reject(error) } })
+    socket.on('close', finish)
+    setTimeout(finish, 3000).unref?.()
   })
 }
 
@@ -364,6 +433,33 @@ try {
   check('re-applying is a no-op, not a double patch', (appliedAgain.versions ?? [])
     .flatMap((v) => v.files).filter((f) => f.state === 'patched').length === 0,
     JSON.stringify(appliedAgain).slice(0, 200))
+
+  /* --- the WS proxy: one handshake header per name ------------------------
+   *
+   * In 1.0.29/1.0.30 `proxyUpgradeToDsh` rebuilt `Connection: Upgrade` /
+   * `Upgrade: websocket` on top of the lowercase copies Node had already parsed
+   * out of the upstream 101, so each name appeared twice. HTTP header names are
+   * case-insensitive, but a browser treats a duplicated `Connection` as a
+   * malformed handshake: the panel logged 101, the browser dropped the socket and
+   * the UI looped on `connection lost, retry #1..#4`. The access log was all
+   * green the whole time, which is exactly why it went unnoticed.
+   */
+  const mux = await rawUpgrade({ host: `127.0.0.1:${PANEL_PORT}`, path: '/p/api/remote.mux' })
+  check('the WS proxy completes the handshake', /^HTTP\/1\.1 101 /.test(mux.head), mux.head.split('\r\n')[0] ?? '(empty)')
+  for (const name of ['connection', 'upgrade', 'sec-websocket-protocol']) {
+    const count = (mux.head.match(new RegExp(`^${name}:`, 'gmi')) ?? []).length
+    check(`the 101 carries ${name} exactly once`, count === 1, `count=${count} head=${mux.head.replace(/\r\n/g, ' | ')}`)
+  }
+  check('the 101 keeps the upstream subprotocol', /sec-websocket-protocol: typert-mux/i.test(mux.head),
+    mux.head.replace(/\r\n/g, ' | '))
+  check('the 101 keeps the upstream accept key', /sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZbK\+xOoo=/i.test(mux.head),
+    mux.head.replace(/\r\n/g, ' | '))
+  check('the tunnel carries upstream frames back', mux.tail.includes('hi'), `tail=${JSON.stringify(mux.tail)}`)
+  check('the panel survives the proxied handshake', (await call('/api/status')).status === 200)
+
+  /* An upstream that refuses the upgrade must not be dressed up as success. */
+  const refused = await rawUpgrade({ host: `127.0.0.1:${PANEL_PORT}`, path: '/p/nope' })
+  check('a refused upgrade is not reported as 101', !/^HTTP\/1\.1 101 /.test(refused.head), refused.head.split('\r\n')[0] ?? '(empty)')
 
   /* --- unknown endpoints ------------------------------------------------ */
   const bogus = await call('/api/does-not-exist')
