@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.0.30 — 2026-10-10
+
+### 新增
+
+- **「补丁」面板：把 dsh settings 的 host-mode 判定强制改为 `host`**
+  局域网通过面板访问 dsh 时，插件与模型设置整页空白，根因在 dsh 自己的客户端 bundle：
+  `dsh-client-ui-settings/lib/client.js` 里有一行
+  `const persistence = ctx.remote.$host.isLoopback ? "host" : "memory";`
+  而 `$host.isLoopback` 是**浏览器端**根据 `location.hostname` 判定的
+  （`dsh-client-connection` 的 `installConnection()`：
+  `transport?.ownsHost === true || isLoopbackHostname(pageLocation.hostname)`），
+  所以 `10.11.12.13:5666` 必然为 `false`，dsh 判定你不是本机 → 设置落回内存 → 刷新即丢、页面读不到。
+  反代改不动这个值（它在浏览器里算），所以只能改 bundle。
+
+  新增 `cmd/dashboard-patches.js`，只做这一件事：
+  - 扫 `VERSIONS_DIR` 下**所有**含 `node_modules/@deepseek-ai` 的版本目录
+    （面板支持多版本切换，只补 `current` 一切换就掉）
+  - 对 `dsh-client-ui-settings/lib/client.js` 与 `dsh-client-ui-settings-models/lib/client.js`
+    把 `[\w.$]+\.isLoopback \? "host" : "memory"` 替换为 `"host"`
+  - 首行写入 marker `/* dsh-console: settings host-mode patch */` 作为幂等锚点与溯源依据
+  - 状态机 `already` / `pending` / `missing` / `error`：
+    `missing` = 上游已不需要此补丁（dsh 自己改了写法），此时面板**不报错**，
+    只是显示「上游已不需要」；重复应用是 no-op，不会叠补丁。
+
+  面板侧：新增 `GET /api/patches`（只读上报）与 `POST /api/patches/apply`
+  （应用后 `await restartDsh()`，因为 bundle 是 dsh 启动时读进内存的，不重启不生效），
+  UI 新增「🩹 补丁」标签页，逐版本逐文件列出状态，一个按钮完成应用与重启。
+
+  **代价（写进代码注释，别当成无害改动）**：这等于解除了 dsh 有意的回环限制，
+  把「哪些前端算本机」的信任面从 dsh 内部搬到面板围栏上。
+
 ## v1.0.29 — 2026-10-10
 
 ### 修复

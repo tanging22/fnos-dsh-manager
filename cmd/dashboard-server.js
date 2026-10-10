@@ -55,6 +55,7 @@ import {
   MARKET_PACKAGE,
 } from './dashboard-plugins.js'
 import { GetDshSessionCookie, appendDshSessionCookie } from './dashboard-session.js'
+import { applyPatches, patchState } from './dashboard-patches.js'
 
 const UI_DIR = process.env.CONSOLE_UI
   ? join(process.env.CONSOLE_UI)
@@ -663,6 +664,21 @@ const routes = {
 
   'GET /api/diagnostics': async (request, response) => {
     json(response, 200, runDiagnostics())
+  },
+
+  // 补丁状态/应用：面板内改 dsh 自己的客户端 bundle（见 dashboard-patches.js）。
+  // 应用后必须重启 dsh 才生效——bundle 是启动时读进内存的。
+  'GET /api/patches': async (request, response) => {
+    json(response, 200, patchState())
+  },
+
+  'POST /api/patches/apply': async (request, response) => {
+    const result = applyPatches()
+    if (!result.ok) return badRequest(response, 'patch-failed', 500)
+    // Patched bundles are read at startup, so a running dsh still serves the
+    // old copy. Restart here rather than making the operator remember to.
+    await restartDsh()
+    json(response, 200, { ...result, restarted: true })
   },
 
   'GET /api/env': async (request, response) => {

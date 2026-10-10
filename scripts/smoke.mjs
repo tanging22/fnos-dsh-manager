@@ -337,6 +337,34 @@ try {
   const stopped = await jsonOf(await call('/api/service/stop', { method: 'POST' }))
   check('stop reports success', stopped.ok === true, JSON.stringify(stopped))
 
+  /* --- patches ----------------------------------------------------------- */
+  /* The settings host-mode patch edits dsh's own client bundles, so a fake
+     version dir is all it needs: the module scans `${VERSIONS_DIR}` by name and
+     never imports anything from the version. */
+  const fakeVersion = '0.0.0-smoke'
+  const fakeClient = join(dataDir, 'versions', fakeVersion, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'lib', 'client.js')
+  mkdirSync(join(dataDir, 'versions', fakeVersion), { recursive: true })
+  mkdirSync(join(dirname(fakeClient)), { recursive: true })
+  writeFileSync(fakeClient, 'window.__ModuleLoader__ = { t: ctx.remote.$host.isLoopback ? "host" : "memory" };\n', 'utf8')
+
+  const patchStateBefore = await jsonOf(await call('/api/patches'))
+  check('patches report an install before the fix', (patchStateBefore.versions ?? [])
+    .flatMap((v) => v.files).some((f) => f.state === 'pending'), JSON.stringify(patchStateBefore))
+
+  const applied = await jsonOf(await call('/api/patches/apply', { method: 'POST' }))
+  check('patch apply reports success', applied.ok === true, JSON.stringify(applied).slice(0, 200))
+  check('patch apply reports it changed a file', (applied.versions ?? [])
+    .flatMap((v) => v.files).some((f) => f.state === 'patched'), JSON.stringify(applied).slice(0, 200))
+  const patchedText = readFileSync(fakeClient, 'utf8')
+  check('the ternary is gone from the bundle', !/isLoopback \? "host" : "memory"/.test(patchedText), patchedText.slice(0, 120))
+  check('the bundle carries the marker comment', patchedText.startsWith('/* dsh-console: settings host-mode patch */'),
+    patchedText.slice(0, 60))
+
+  const appliedAgain = await jsonOf(await call('/api/patches/apply', { method: 'POST' }))
+  check('re-applying is a no-op, not a double patch', (appliedAgain.versions ?? [])
+    .flatMap((v) => v.files).filter((f) => f.state === 'patched').length === 0,
+    JSON.stringify(appliedAgain).slice(0, 200))
+
   /* --- unknown endpoints ------------------------------------------------ */
   const bogus = await call('/api/does-not-exist')
   check('unknown endpoint is 404', bogus.status === 404, `got ${bogus.status}`)

@@ -31,6 +31,7 @@ const SYNTAX_ONLY = new Set([
   'ui/assets/views/access.js',
   'ui/assets/views/logs.js',
   'ui/assets/views/overview.js',
+  'ui/assets/views/patches.js',
   'ui/assets/views/plugins.js',
   'ui/assets/views/settings.js',
   'ui/assets/views/shortcuts.js',
@@ -314,7 +315,12 @@ const pythonBin = pythonCandidates.find((bin) => {
     // Windows). That is an environment limit, not a missing interpreter, and it
     // must not turn the gate red — nor silently pass as "checked and fine".
     const message = String(error.stderr ?? error.message)
-    if (!/EBUSY|ENOENT|EPERM|EACCES/.test(message)) throw error
+    // A missing interpreter must never abort the gate: keep looking. Windows
+    // returns 9009 ("not recognised as an internal or external command") for a
+    // stub like the MicrosoftApps python3 shim, which is an absent interpreter,
+    // not a broken one. Previously that rethrow killed the whole gate, so a
+    // developer without python could not run `npm run check` at all.
+    if (!/EBUSY|ENOENT|EPERM|EACCES/.test(message) && error.status !== 9009) throw error
     return false
   }
 })
