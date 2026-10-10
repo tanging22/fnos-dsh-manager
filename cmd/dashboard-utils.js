@@ -21,7 +21,7 @@ import { dirname, delimiter, join, resolve } from 'node:path'
  * Conflating the two is the classic way to delete the wrong tree, so they are
  * kept separate here and every consumer names which one it means.
  */
-export const CONSOLE_APP_NAME = process.env.TRIM_APPNAME || 'dsh-console'
+export const CONSOLE_APP_NAME = process.env.TRIM_APPNAME || 'fnos-dsh-manager'
 export const CONSOLE_APP_DIR = process.env.TRIM_APPDEST || `/var/apps/${CONSOLE_APP_NAME}`
 
 /** The supervised dsh suite's name; override when the suite has another name. */

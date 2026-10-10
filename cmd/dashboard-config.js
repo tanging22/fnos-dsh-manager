@@ -152,7 +152,7 @@ export function loadConfig() {
   // Keep the last failure reachable for runDiagnostics() without re-parsing.
   configCache.__parseError = parseError
   if (parseError) {
-    console.warn(`[dsh-console] ${CONFIG_PATH} is unreadable (${parseError}); using defaults`)
+    console.warn(`[fnos-dsh-manager] ${CONFIG_PATH} is unreadable (${parseError}); using defaults`)
   }
   return configCache
 }

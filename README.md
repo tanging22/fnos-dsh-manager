@@ -1,4 +1,4 @@
-# DSH 控制台（fnos-dsh-manager）
+# DSH 管理器（fnos-dsh-manager）
 
 给 **fnOS（飞牛 NAS）** 用的 DeepSeek Harness（DSH）管理面板套件。
 
@@ -11,10 +11,10 @@
 DSH 本体是一个 node 服务。这个套件**不内置 DSH**，而是在后台帮你从 npm 下载、安装、切换版本。套件自身带一个轻量的管理面板 + 反向代理：
 
 ```
-浏览器 ──▶ fnOS 统一网关(/app/dsh-console) 或  直接端口
+浏览器 ──▶ fnOS 统一网关(/app/fnos-dsh-manager) 或  直接端口
               │
               ▼
-        DSH 控制台面板（本套件，端口 28001）
+        DSH 管理器面板（本套件，端口 28001）
          ├── 管理界面（状态/日志/版本/访问 IP/快捷入口）
          └── 反向代理 ──▶ 本机的 DSH 实例（端口 28000）
 ```
@@ -79,7 +79,7 @@ v1.0.18 起，进程监督层整体对齐了 Go 版参考实现（`deepseek.harn
 装完后：
 
 - 直接访问：`http://<NAS-IP>:28001/`
-- 经统一网关：`http://<NAS>/app/dsh-console/`
+- 经统一网关：`http://<NAS>/app/fnos-dsh-manager/`
 
 首次登录用向导里设置的 API Key（或随机生成的密码）。
 
@@ -87,7 +87,7 @@ v1.0.18 起，进程监督层整体对齐了 Go 版参考实现（`deepseek.harn
 
 ## 数据文件
 
-运行时数据都在套件的数据目录（`@appdata/dsh-console/`）下：
+运行时数据都在套件的数据目录（`@appdata/fnos-dsh-manager/`）下：
 
 - `console-config.json` —— 面板配置
 - `.credentials.yaml` —— 登录凭据（`chmod 600`）

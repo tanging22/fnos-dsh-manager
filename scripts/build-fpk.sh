@@ -16,7 +16,7 @@ set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-STAGE="${WORK}/dsh-console"
+STAGE="${WORK}/fnos-dsh-manager"
 TMPDIR="${WORK}/tmp"
 
 trap 'rm -rf "${WORK}"' EXIT
@@ -32,7 +32,7 @@ if [ -z "${VERSION}" ]; then
     exit 1
 fi
 
-echo "packing dsh-console ${VERSION}"
+echo "packing fnos-dsh-manager ${VERSION}"
 
 mkdir -p "${STAGE}"
 
@@ -102,17 +102,17 @@ case "${ARCH}" in
 esac
 
 # fnpack build runs in the staged directory and emits *.fpk in that same
-# working directory ("The output file dsh-console.fpk can be found in the
+# working directory ("The output file fnos-dsh-manager.fpk can be found in the
 # working directory"), NOT in $WORK. Collect it from $STAGE.
 ( cd "${STAGE}" && "${PACKER}" build )
 for candidate in "${STAGE}"/*.fpk; do
     [ -e "${candidate}" ] || continue
-    target="${OUT}/dsh-console-${VERSION}-${ARCH}.fpk"
+    target="${OUT}/fnos-dsh-manager-${VERSION}-${ARCH}.fpk"
     mv "${candidate}" "${target}"
     echo "wrote ${target}"
 done
 
-if [ -z "$(ls "${OUT}"/dsh-console-"${VERSION}"-*.fpk 2>/dev/null || true)" ]; then
+if [ -z "$(ls "${OUT}"/fnos-dsh-manager-"${VERSION}"-*.fpk 2>/dev/null || true)" ]; then
     echo "error: fnpack build produced no .fpk" >&2
     exit 1
 fi

@@ -33,7 +33,14 @@ export async function render(host, ctx) {
   const running = status.running
   const healthy = status.healthy
   const mode = status.mode || 'auto'
-  const version = status.version || status.installedVersion || '-'
+  // Two DIFFERENT versions, and conflating them is what made this confusing:
+  //   dshVersion    — the DeepSeek Harness build actually running (npm package)
+  //   panelVersion — this fnOS suite (its own manifest), i.e. the manager
+  // The header sits next to the app name, so it shows the MANAGER's version —
+  // that is the thing the user installs and updates from 应用中心. The dsh build
+  // belongs next to the service it belongs to, in the status card below.
+  const panelVersion = status.panel?.version ?? '-'
+  const dshVersion = status.version || status.installedVersion || '-'
   const phase = status.phase || status.state?.status || (running ? 'running' : 'stopped')
 
   // 状态指示灯（对齐五态状态机）。
@@ -76,7 +83,7 @@ export async function render(host, ctx) {
       <div class="hero-top">
         <div class="hero-title">
           <span class="app-name">${esc(appName)}</span>
-          <span class="app-version">版本: ${esc(version)}</span>
+          <span class="app-version">管理器 v${esc(panelVersion)}</span>
         </div>
         <div class="hero-action">
           <span class="status-lamp ${lamp.cls}" role="status" aria-label="dsh 状态: ${lamp.label}">
@@ -109,6 +116,14 @@ export async function render(host, ctx) {
           <span class="metric-label">内存占用</span>
           ${memMetric}
         </div>
+      </div>
+
+      <!-- Which dsh build is running. The header shows the MANAGER's version,
+           so the service's own version needs a home of its own here; otherwise
+           upgrading dsh from the Versions tab looks like it changed nothing. -->
+      <div class="hero-footnote">
+        DeepSeek Harness <code>${esc(dshVersion)}</code>
+        ${status.port ? ` · 端口 <code>${esc(status.port)}</code>` : ''}
       </div>
 
       <div class="hero-divider"></div>

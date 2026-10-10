@@ -78,7 +78,7 @@ function logState(oldStatus, status, msg) {
   // 借用 process.js 的 appendLog 会引入循环依赖；这里直接写控制台即可。
   // 面板启动/停止的日志已由 process.js 的 appendLog 覆盖，状态跃迁仅作调试辅助。
   if (process.env.DSH_DEBUG_STATE) {
-    console.log(`[dsh-console] [状态] ${oldStatus} → ${status}${msg ? `: ${msg}` : ''}`)
+    console.log(`[fnos-dsh-manager] [状态] ${oldStatus} → ${status}${msg ? `: ${msg}` : ''}`)
   }
 }
 

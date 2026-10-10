@@ -29,7 +29,7 @@ const PANEL_PORT = 29001
 const STUB_PORT = 29000
 const PASSWORD = 'smoke-test-key'
 
-const sandbox = mkdtempSync(join(tmpdir(), 'dsh-console-smoke-'))
+const sandbox = mkdtempSync(join(tmpdir(), 'fnos-dsh-manager-smoke-'))
 const dataDir = join(sandbox, 'data')
 const homeDir = join(dataDir, 'dsh_home')
 mkdirSync(join(homeDir, 'profiles', 'web'), { recursive: true })
@@ -43,12 +43,31 @@ function check(name, condition, detail) {
   console.log(`${condition ? 'ok  ' : 'FAIL'}  ${name}${condition || !detail ? '' : ` — ${detail}`}`)
 }
 
-/** The dsh the panel proxies to; records that it was reached. */
+/** The dsh the panel proxies to; records that it was reached.
+ *
+ * `/html*` answers with REAL HTML, because the proxy's HTML path (CSP strip +
+ * `__DSH_TRANSPORT__` shim + manifest `crossorigin` injection) is where a bug
+ * breaks every page the panel serves. The stub replied `text/plain`
+ * unconditionally, so that entire path had no coverage — which is how
+ * `injectManifestCredentials` could call `.replace()` on a Buffer and throw an
+ * uncaught exception on every HTML response while the suite stayed green.
+ */
 let stubHits = 0
 const stub = createServer((request, response) => {
   stubHits += 1
+  const url = request.url ?? '/'
+  if (url.startsWith('/html')) {
+    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    response.end(`<!doctype html><html><head>
+<title>dsh</title>
+<link rel="manifest" href="/manifest.webmanifest">
+</head><body><h1>你好 dsh</h1>
+<div data-slot="settings.action">open config</div>
+</body></html>`)
+    return
+  }
   response.writeHead(200, { 'content-type': 'text/plain' })
-  response.end(`stub:${request.url}`)
+  response.end(`stub:${url}`)
 })
 
 const panelEnv = {
@@ -57,7 +76,7 @@ const panelEnv = {
   DSH_HOME: homeDir,
   CONSOLE_PORT: String(PANEL_PORT),
   DSH_PORT: String(STUB_PORT),
-  TRIM_APPNAME: 'dsh-console',
+  TRIM_APPNAME: 'fnos-dsh-manager',
   TRIM_APPDEST: join(sandbox, 'app'),
   TRIM_PKGVAR: dataDir,
   MANAGED_APP_DIR: join(sandbox, 'app'),
@@ -228,6 +247,37 @@ try {
   check('proxy upstream actually served it', (await proxied.text()).includes('stub:/hello'), 'stub did not see the request')
   check('proxy reached the stub exactly once', stubHits === 1, `stubHits=${stubHits}`)
 
+  /* --- proxy serves REAL HTML through the injection path ------------------
+   *
+   * `injectManifestCredentials` called `.replace()` on a Buffer (the output of
+   * `injectDshHtml`), so every HTML response threw `TypeError: body.replace is
+   * not a function` inside a stream 'end' handler. Being unhandled, that became
+   * an uncaughtException and the request produced no response at all — the
+   * panel's own `uncaughtException` guard logged it and kept the process alive,
+   * but the user's page was dead. Nothing caught it because the stub only ever
+   * returned text/plain.
+   *
+   * These assertions therefore matter twice over: they pin the HTML path, and
+   * the "panel still alive" one after them pins that a future throw there is a
+   * degraded page rather than a dead proxy.
+   */
+  const htmlProxy = await call('/p/html', { key: '' })
+  const injectedHtml = await htmlProxy.text()
+  check('proxy serves an HTML page', htmlProxy.status === 200, `got ${htmlProxy.status}`)
+  check('proxy injects the manifest crossorigin attribute',
+    /<link[^>]*crossorigin="use-credentials"[^>]*rel="manifest"|rel="manifest"[^>]*crossorigin/.test(injectedHtml)
+    || (injectedHtml.includes('crossorigin="use-credentials"') && injectedHtml.includes('rel="manifest"')),
+    'manifest link was not given crossorigin')
+  check('proxy injects the transport privilege shim',
+    injectedHtml.includes('__DSH_TRANSPORT__') && injectedHtml.includes('ownsHost'), 'shim missing')
+  check('proxy preserves the upstream HTML intact',
+    injectedHtml.includes('你好 dsh') && injectedHtml.includes('settings.action'),
+    'upstream body was corrupted (UTF-8 or byte offsets)')
+  check('proxy does not corrupt non-ASCII HTML',
+    injectedHtml.includes('你好'), 'multi-byte characters were mangled by the re-encode')
+  check('the panel survives proxying HTML',
+    (await call('/api/status')).status === 200, 'panel died proxying HTML')
+
   /* Records are queued and flushed on a timer (see dashboard-access.js), so a
      read taken immediately after the request can still be empty. Poll instead
      of asserting instantaneously — that is the real contract. */
@@ -240,8 +290,12 @@ try {
   )
   check('proxy recorded the visit', after !== null,
     `${before.stats?.lines} -> ${after?.stats?.lines ?? 'unchanged'}`)
-  const newest = after?.entries?.[0]
-  check('recorded entry carries method and path', newest?.method === 'GET' && newest?.path === '/hello', JSON.stringify(newest))
+  /* Order-independent: the HTML-injection assertions above make their own proxied
+     request, so `/html` may be the newest entry. Look for OUR request by path
+     rather than assuming position 0. */
+  const entries = after?.entries ?? []
+  const hello = entries.find((entry) => entry.path === '/hello')
+  check('recorded entry carries method and path', hello?.method === 'GET', JSON.stringify(entries.slice(0, 3)))
 
   /* --- diagnostics and settings ----------------------------------------- */
   const diagnostics = await jsonOf(await call('/api/diagnostics'))
@@ -287,6 +341,28 @@ try {
   const htmlBody = await html.text()
   check('UI uses relative asset paths (gateway prefix safe)',
     htmlBody.includes('assets/app.js') && !htmlBody.includes('"/assets/'), 'absolute /assets/ path found')
+
+  /* The shell must NOT carry `hidden`.
+   *
+   * It used to, and nothing ever removed it. That is visually inert (`.shell
+   * { display: flex }` outranks the UA's `[hidden] { display: none }`), so the
+   * page looked fine — which is why it survived review. But `element.hidden`
+   * stayed `true`, and both live-update paths in app.js test it, so the 15s poll
+   * and every WebSocket push were discarded. Symptom: "实时刷新无效，要手动刷新".
+   *
+   * Asserted on the served HTML because that is what the browser parses.
+   */
+  const shellTag = /<div[^>]*\bid="app"[^>]*>/.exec(htmlBody)?.[0] ?? ''
+  check('the app shell is not left hidden', !/\shidden[\s>]/.test(shellTag),
+    `#app still carries the hidden attribute: ${shellTag}`)
+
+  // And the JS must not gate updates on that attribute either.
+  const appJsText = await (await fetch(`${base}/assets/app.js`)).text()
+  check('live updates do not depend on a hidden attribute',
+    !/app\.hidden|\bapp\s*\.\s*hidden\b/.test(appJsText),
+    'app.js still reads app.hidden — live updates would be silently dropped')
+  check('live updates use the real visibility signal',
+    appJsText.includes('visibilityState'), 'app.js does not consult document.visibilityState')
   const script = await fetch(`${base}/assets/app.js`)
   check('the UI bundle is served', script.status === 200, `got ${script.status}`)
   const traversal = await fetch(`${base}/assets/../../cmd/dashboard.js`)
@@ -384,7 +460,7 @@ try {
    * precisely why the original failure was so confusing: the settings had to
    * survive a panel restart to come back, and nothing said so.
    */
-  const commentProbe = mkdtempSync(join(tmpdir(), 'dsh-console-cfg-'))
+  const commentProbe = mkdtempSync(join(tmpdir(), 'fnos-dsh-manager-cfg-'))
   const commentDir = join(commentProbe, 'data')
   mkdirSync(commentDir, { recursive: true })
   writeFileSync(join(commentDir, 'console-config.json'),

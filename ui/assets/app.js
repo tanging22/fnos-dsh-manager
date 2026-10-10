@@ -24,6 +24,23 @@ const pill = document.getElementById('status-pill')
 const tabs = Array.from(document.querySelectorAll('.menu-item'))
 const pageTitle = document.getElementById('page-title')
 
+/**
+ * Should live updates repaint right now?
+ *
+ * The only case that must suppress work is the panel sitting in a background
+ * tab: painting then is wasted work nobody sees. Deliberately NOT keyed on the
+ * `hidden` HTML attribute — the shell carries none, and when it did, every
+ * update path in this file silently no-opped because nothing ever removed it.
+ * `document.visibilityState` is the real signal and cannot be left stale by a
+ * forgotten attribute.
+ */
+function isPanelVisible() {
+  if (typeof document !== 'undefined' && document.visibilityState) {
+    return document.visibilityState === 'visible'
+  }
+  return true
+}
+
 // 侧栏折叠：点击靠边（收起）→ 再点展开。持久化到 localStorage。
 const sider = document.getElementById('sider')
 const siderToggle = document.getElementById('sider-toggle')
@@ -122,17 +139,36 @@ for (const tab of tabs) {
   })
 }
 
+/**
+ * Paint the shell and start the live-update machinery.
+ *
+ * `boot()` is fire-and-forget, so an unhandled rejection here would leave the
+ * page blank with only a console message — which is what "白屏无内容" looks like
+ * from the user's side. Catch it, and put the reason on screen where it can be
+ * acted on. A failure inside `renderTab` is already handled per-tab; this is the
+ * net for anything that escapes that (a missing #view, a broken module import).
+ */
 async function boot() {
-  await renderTab()
+  try {
+    await renderTab()
+  } catch (error) {
+    const message = error?.message ?? String(error)
+    if (view) {
+      view.innerHTML = `<div class="card"><h3>控制台加载失败</h3>
+        <p class="empty">${esc(message)}</p>
+        <p class="muted">面板接口若不可用，请确认服务已启动；也可以尝试手动刷新。</p></div>`
+    }
+    console.error('[fnos-dsh-manager] boot failed:', error)
+  }
 }
 
-document.getElementById('refresh').addEventListener('click', () => {
+document.getElementById('refresh')?.addEventListener('click', () => {
   renderTab()
   toast('已刷新')
 })
 
 setInterval(() => {
-  if (state.tab === 'overview' && !app.hidden) renderTab()
+  if (state.tab === 'overview' && isPanelVisible()) renderTab()
 }, 15000)
 
 // Real-time push channel: replaces the 15s poll with server-driven updates.
@@ -140,7 +176,7 @@ setInterval(() => {
 // refreshes the header pill. The interval above stays as a safety net for when
 // the gateway strips WS upgrades (then push silently no-ops and poll carries).
 const closeWs = ws((event) => {
-  if (app.hidden) return
+  if (!isPanelVisible()) return
   if (event.type === 'status') {
     applyPill(event)
     if (state.tab === 'overview') renderTab()

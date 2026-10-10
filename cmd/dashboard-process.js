@@ -20,6 +20,7 @@
 
 import { spawn, execFileSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs'
+import { createConnection } from 'node:net'
 import { dirname, join } from 'node:path'
 import {
   activeDshHome,
@@ -34,7 +35,6 @@ import {
   effectiveMode,
   managedAppDir,
   managedPort,
-  trustedHosts,
   applyLanBinding,
   webserverHost,
   manifestInfo,
@@ -365,6 +365,45 @@ function appendLog(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Startup failure reporting
+// ---------------------------------------------------------------------------
+
+/** Rolling tail of dsh's stderr, kept only to explain a failed boot. */
+let startupStderrTail = ''
+let lastLaunchError = ''
+
+/**
+ * Accumulate dsh's stderr and pull out the single most useful line.
+ *
+ * dsh's failure output is chatty: a stack trace, a config dump, a "run
+ * --dump-config-schema" hint. The line that names the actual problem is
+ * whatever follows the last `Error:`/`WARNING:` marker, so prefer that and fall
+ * back to the last non-empty line. Everything is still written to the log file;
+ * this exists purely so the UI can say something better than "已停止".
+ */
+function rememberStartupStderr(chunk) {
+  const text = String(chunk ?? '')
+  startupStderrTail = (startupStderrTail + text).slice(-4096)
+}
+
+function lastStartupStderr() {
+  const lines = startupStderrTail
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  if (!lines.length) return ''
+  const marked = [...lines].reverse().find((line) => /error|错误|失败|unknown|invalid|unexpected|not found|EACCES|ENOENT/i.test(line))
+  const picked = (marked ?? lines[lines.length - 1])
+  return picked.length > 200 ? `${picked.slice(0, 200)}…` : picked
+}
+
+/** Clear the captured stderr; called just before a fresh launch. */
+function resetStartupStderr() {
+  startupStderrTail = ''
+  lastLaunchError = ''
+}
+
+// ---------------------------------------------------------------------------
 // Run identity (the uid/gid dsh executes as)
 // ---------------------------------------------------------------------------
 
@@ -456,7 +495,7 @@ async function preStartSelfHeal(home, port) {
       if (!existsSync(file)) continue
       try {
         if (statSync(file).uid === 0) {
-          await runWithTimeout('chown', [`${process.env.USER || 'dsh-console'}:${process.env.USER || 'dsh-console'}`, file], 3000)
+          await runWithTimeout('chown', [`${process.env.USER || 'fnos-dsh-manager'}:${process.env.USER || 'fnos-dsh-manager'}`, file], 3000)
           notes.push(`chowned root-owned ${name}`)
         }
       } catch {}
@@ -517,7 +556,7 @@ async function preStartSelfHeal(home, port) {
   //    这里只需清掉上次启动遗留的 token，避免旧 token 污染新进程的会话。
   SetCurrentLaunchToken('')
 
-  if (notes.length) appendLog(`[dsh-console] self-heal: ${notes.join('; ')}\n`)
+  if (notes.length) appendLog(`[fnos-dsh-manager] self-heal: ${notes.join('; ')}\n`)
   return notes
 }
 
@@ -526,18 +565,37 @@ async function preStartSelfHeal(home, port) {
 // ---------------------------------------------------------------------------
 
 /**
- * dsh's web flag family. The CLI takes no `--host` at all, and the address it
- * binds comes from `${DSH_HOME}/profiles/web/cordis.patch.yml` — see
- * writeWebserverPatch(). Note this means dsh answers on exactly ONE address,
- * so anything dialling it (this panel's proxy included) has to use the same
- * host the patch pinned; see webserverHost().
+ * dsh's launch arguments.
+ *
+ * Verified against the real CLI (`@deepseek-ai/dsh` 0.2.0-rc.2, `lib/bin.js`):
+ *
+ *  - **`web` is not a subcommand.** `parseDshArgs` treats any first argument
+ *    that is neither an option nor `plugin` as a profile name and rewrites
+ *    `["web", ...rest]` into `["--profile", "web", ...rest]`. So `dsh web --port N`
+ *    is exactly `dsh --profile web --port N`, and `--port` is forwarded to the
+ *    profile's app via the positional `[args...]` sink.
+ *  - **The CLI itself defines only six options**: `--profile`, `--patch`,
+ *    `--from-default-profile`, `--dump-config`, `--dump-config-schema`,
+ *    `--dump-default-config`. There is **no `--trusted-host`**, no `--no-open`,
+ *    no `--host`.
+ *
+ * That last point matters: this function used to append
+ * `--trusted-host <h1> <h2> ... <hN>`. Because commander runs with
+ * `allowUnknownOption()` and a positional `[args...]`, the flag *and every host
+ * after it* fell through into the profile app's argv. The web profile's app
+ * does not understand them, so dsh came up either failing validation or booting
+ * with a mangled command line — which is the "dsh 启动但打不开 web" symptom.
+ * The trusted-host list is not a CLI concern at all: dsh reads it from
+ * `trusted_hosts.conf` in its home (see writeTrustedHosts), so nothing needs to
+ * be passed here.
+ *
+ * `--no-open` is what the mature Go reference passes
+ * (`deepseek.harness.fnos/harness.go`: `dshCliCmd("web", "--port", port, "--no-open")`)
+ * to stop dsh trying to launch a desktop browser on a headless NAS. It arrives
+ * in the same `[args...]` sink, so it is appended last and is safe to pass.
  */
 function buildArgs(port) {
-  const args = ['web', '--port', String(port)]
-  const hosts = [...lanAddresses(), 'localhost', '127.0.0.1', 'fnos.net', '5ddd.com', ...trustedHosts()]
-  const unique = [...new Set(hosts.filter(Boolean))]
-  if (unique.length) args.push('--trusted-host', ...unique)
-  return args
+  return ['web', '--port', String(port), '--no-open']
 }
 
 // ---------------------------------------------------------------------------
@@ -561,9 +619,28 @@ export async function startDsh() {
   mkdirSync(home, { recursive: true })
   // A fresh process is about to claim this port.
   invalidatePortScan()
+  // The previous attempt's stderr must not be blamed on this one.
+  resetStartupStderr()
 
   // 状态机：进入启动中。
   SetStatus(StatusStarting, '正在启动服务…')
+
+  // The `webserver` block must be on disk BEFORE dsh boots, because dsh reads it
+  // while assembling the profile and ignores later edits to host/port. It used to
+  // be written only by the /api/service routes, so any other path into this
+  // function — the panel's own "resume last state" autostart, or a start
+  // triggered from anywhere else — launched dsh against a stale or absent patch.
+  // When that happened dsh fell back to its own built-in default, which binds
+  // loopback on port 3080, while the panel then polled 28000 forever and the UI
+  // showed "启动中" that never became "运行中". Write it here so every start path
+  // is covered by construction.
+  try {
+    const binding = applyLanBinding()
+    if (!binding.ok) appendLog(`[fnos-dsh-manager] lan binding skipped: ${binding.error}\n`)
+    else appendLog(`[fnos-dsh-manager] lan binding: host=${binding.host} lan=${binding.lan}\n`)
+  } catch (error) {
+    appendLog(`[fnos-dsh-manager] lan binding failed: ${error?.message ?? error}\n`)
+  }
 
   // Startup self-heal before spawning (best-effort, never blocks).
   try { await preStartSelfHeal(home, port) } catch {}
@@ -595,12 +672,44 @@ export async function startDsh() {
     // dsh runs AS the panel (no setuid) — the panel lacks CAP_SETUID, so any
     // `uid`/`gid` here fails with `spawn EPERM`. This matches the Go reference,
     // whose `SysProcAttr` only sets `Setpgid` and never drops privileges.
-    // stdout 走 pipe：既 tee 回日志文件，又实时捕获 `?token=`（会话代持）。
-    const spawnOpts = { env, cwd: home, detached: true, stdio: ['ignore', 'pipe', fd] }
+    //
+    // stderr goes through a PIPE, not straight to the log file. dsh reports a
+    // bad flag, a schema mismatch or a missing plugin on stderr and then exits,
+    // so with `stdio: ['ignore','pipe',fd]` the panel could see the process die
+    // but not WHY — the UI said only "已停止" and the reason was buried in a log
+    // file nobody opens. Now the tail of stderr is captured and surfaced as the
+    // status message, which is what turns "dsh 启动但打不开 web" into an
+    // actionable message. It is still tee'd to the same file, unchanged.
+    const spawnOpts = { env, cwd: home, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }
     const child = spawn(launch.bin, [...launch.args, ...buildArgs(port)], spawnOpts)
     child.stdout.on('data', (chunk) => {
       try { writeSync(fd, chunk) } catch { /* log fd closed is fine */ }
       CaptureLaunchToken(chunk)
+    })
+    child.stderr.on('data', (chunk) => {
+      try { writeSync(fd, chunk) } catch { /* log fd closed is fine */ }
+      rememberStartupStderr(chunk)
+    })
+    child.on('error', (error) => {
+      appendLog(`[fnos-dsh-manager] child error: ${error?.message ?? error}\n`)
+      lastLaunchError = error?.message ?? String(error)
+    })
+    // A dsh that exits during startup almost always printed why on stderr, and
+    // `watchForReady` would otherwise keep polling a dead pid until the 300s
+    // timeout. Fail fast with the real reason instead.
+    child.on('exit', (code, signal) => {
+      const detail = lastLaunchError || lastStartupStderr()
+      appendLog(`[fnos-dsh-manager] dsh exited code=${code} signal=${signal}${detail ? `: ${detail}` : ''}\n`)
+      if (managed.stopRequested) return
+      if (currentPid() !== child.pid) return
+      managed.pid = null
+      managed.adoptedPid = null
+      managed.failCount = 0
+      removePidFileIfMatches(child.pid)
+      SetStatus(StatusStopped, detail
+        ? `dsh 启动即退出（code=${code}）：${detail}`
+        : `dsh 启动即退出（code=${code}${signal ? `, signal=${signal}` : ''}），详见运行日志`)
+      SetLastRunState(StatusStopped)
     })
     child.unref()
     // Record supervised state so the watchdog and stop both target the group.
@@ -616,7 +725,7 @@ export async function startDsh() {
 
     return { ok: true, pid: child.pid, already: false }
   } catch (error) {
-    appendLog(`[dsh-console] spawn failed: ${error?.message ?? error}\n`)
+    appendLog(`[fnos-dsh-manager] spawn failed: ${error?.message ?? error}\n`)
     SetStatus(StatusStopped, `启动失败: ${error?.message ?? error}`)
     return { ok: false, error: 'spawn-failed' }
   }
@@ -640,13 +749,13 @@ function watchForReady(pid, port) {
       if (currentPid() === pid && !managed.stopRequested) {
         SetStatus(StatusRunning, '')
         SetLastRunState(StatusRunning)
-        appendLog(`[dsh-console] ready: pid ${pid} responding on port ${port}\n`)
+        appendLog(`[fnos-dsh-manager] ready: pid ${pid} responding on port ${port}\n`)
       }
       return
     }
 
     if (Date.now() - startedAt >= timeoutMs) {
-      appendLog(`[dsh-console] ready timeout (${timeoutMs / 1000}s) on port ${port}\n`)
+      appendLog(`[fnos-dsh-manager] ready timeout (${timeoutMs / 1000}s) on port ${port}\n`)
       if (currentPid() === pid && !managed.stopRequested) {
         SetStatus(StatusStopped, `Web 就绪探测超时 (端口 ${port} 未响应)`)
       }
@@ -673,7 +782,7 @@ export async function stopDsh() {
   const pid = currentPid() || readPid()
 
   if (pid && isAlive(pid)) {
-    appendLog(`[dsh-console] stop: SIGTERM group ${pid}\n`)
+    appendLog(`[fnos-dsh-manager] stop: SIGTERM group ${pid}\n`)
     await killProcessGroup(pid)
     await killProcessTree(pid)
     removePidFileIfMatches(pid)
@@ -683,10 +792,10 @@ export async function stopDsh() {
   for (const p of findPidsOnPort(port)) {
     if (!isAlive(p)) continue
     if (!isDshProcess(p)) {
-      appendLog(`[dsh-console] port ${port} held by foreign pid ${p}; left alone\n`)
+      appendLog(`[fnos-dsh-manager] port ${port} held by foreign pid ${p}; left alone\n`)
       continue
     }
-    appendLog(`[dsh-console] stop: kill straggler pid ${p} on port ${port}\n`)
+    appendLog(`[fnos-dsh-manager] stop: kill straggler pid ${p} on port ${port}\n`)
     await killProcessTree(p)
   }
 
@@ -718,8 +827,18 @@ export async function stopDsh() {
  * cache the panel keeps answering immediately, and `watchForReady` still polls
  * often enough to notice a start.
  *
- * A `force` flag exists for the call sites that must not read a stale verdict
- * (the stop/start sequences and the restart wait loop).
+ * Only a POSITIVE verdict is cached. A negative says nothing reliable about
+ * the next millisecond — dsh is mid-boot, or the probe simply lost a race — and
+ * serving a stale "not reachable" made the UI flip-flop between 运行中 and
+ * 启动中 for a service that was up and answering (observed: healthy=true at
+ * t+1s, false at t+3s, true at t+7s while a direct request returned 200
+ * throughout). Caching only success keeps the win that matters — a running dsh
+ * costs one probe per 1.5s no matter how many status calls arrive — while a
+ * stopped/unreachable dsh is re-probed, which is exactly when the answer is
+ * cheap (connection refused returns immediately) and the freshness matters.
+ *
+ * A `force` flag exists for the call sites that must not read a cached verdict
+ * at all (the stop/start sequences and the restart wait loop).
  */
 const HEALTH_TTL_MS = 1500
 const healthCache = new Map() // port -> { at, result }
@@ -731,39 +850,72 @@ export function invalidateHealth() {
 async function probeHealth(port, { force = false } = {}) {
   if (!force) {
     const hit = healthCache.get(port)
-    if (hit && Date.now() - hit.at < HEALTH_TTL_MS) return hit.result
+    if (hit?.result?.reachable && Date.now() - hit.at < HEALTH_TTL_MS) return hit.result
   }
   const result = await probeHealthUncached(port)
-  healthCache.set(port, { at: Date.now(), result })
+  if (result.reachable) healthCache.set(port, { at: Date.now(), result })
+  else healthCache.delete(port)
   return result
 }
 
 async function probeHealthUncached(port) {
   const bound = webserverHost()
-  const targets = [...new Set([bound, '127.0.0.1', ...lanAddresses().slice(0, 1)])].filter(Boolean)
+  // Loopback first, always. dsh binds exactly ONE address, and the panel reaches
+  // it over loopback in every supported deployment; a target derived from a
+  // possibly-stale patch is only a fallback. The mature reference hard-codes
+  // 127.0.0.1 for exactly this reason (`waitAndActivateReverseProxy` probes
+  // `http://127.0.0.1:<port>` and TCP-dials the same).
+  const targets = [...new Set(['127.0.0.1', bound, ...lanAddresses().slice(0, 1)])].filter(Boolean)
   for (const host of targets) {
-    const controller = new AbortController()
-    // A single unreachable target must not eat the whole budget: 3s x 3 = 9s.
-    const timer = setTimeout(() => controller.abort(), HEALTH_PROBE_TIMEOUT_MS)
-    try {
-      const response = await fetch(`http://${host}:${port}/`, {
-        redirect: 'manual',
-        signal: controller.signal,
-      })
-      // Drain so the socket is released back to the pool instead of lingering.
-      await response.body?.cancel?.().catch(() => {})
-      return { reachable: true, status: response.status }
-    } catch {
-      // try next target
-    } finally {
-      clearTimeout(timer)
-    }
+    if (await probeHttpOnce(host, port)) return { reachable: true, status: 200 }
+    // TCP fallback: dsh can hold the port open while an HTTP request still
+    // fails — it has bound but not finished mounting, or it is slow on the very
+    // first hit. "The port is open" is enough to call it up and let the caller
+    // surface a genuine HTTP error, instead of looping until the 300s timeout
+    // and reporting a misleading "启动失败" (the reference does the same).
+    if (await probeTcpOnce(host, port)) return { reachable: true, status: 0, tcpOnly: true }
   }
   return { reachable: false, status: 0 }
 }
 
-/** Per-target abort budget for one health probe. */
+/** One HTTP GET against a candidate host, with a hard deadline. */
+async function probeHttpOnce(host, port) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), HEALTH_PROBE_TIMEOUT_MS)
+  try {
+    const response = await fetch(`http://${host}:${port}/`, {
+      redirect: 'manual',
+      signal: controller.signal,
+    })
+    // Release the socket instead of leaving it for the GC.
+    try { await response.body?.cancel() } catch { /* already consumed */ }
+    return true
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** TCP-connect fallback so "bound but not serving yet" still counts as up. */
+function probeTcpOnce(host, port) {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host, port })
+    const finish = (ok) => {
+      clearTimeout(timer)
+      try { socket.destroy() } catch { /* ignore */ }
+      resolve(ok)
+    }
+    const timer = setTimeout(() => finish(false), HEALTH_TCP_TIMEOUT_MS)
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+  })
+}
+
+/** Per-target abort budget for one HTTP health probe. */
 const HEALTH_PROBE_TIMEOUT_MS = 1500
+/** Per-target budget for the TCP fallback connect. */
+const HEALTH_TCP_TIMEOUT_MS = 1000
 
 /**
  * Stop and relaunch dsh with a freshly written patch, then wait for the port.
@@ -819,7 +971,7 @@ function inspectAndHeal() {
   if (adopted > 0) {
     managed.failCount = 0
     if (adopted !== pid) {
-      appendLog(`[dsh-console] watchdog: adopted pid ${adopted} on port ${port}\n`)
+      appendLog(`[fnos-dsh-manager] watchdog: adopted pid ${adopted} on port ${port}\n`)
       managed.adoptedPid = adopted
       writePid(adopted)
     }
@@ -831,7 +983,7 @@ function inspectAndHeal() {
   if (managed.failCount <= 3) return
 
   // Confirmed dead with no successor: clear stale state.
-  appendLog(`[dsh-console] watchdog: pid ${pid} dead and port ${port} unresponsive; clearing\n`)
+  appendLog(`[fnos-dsh-manager] watchdog: pid ${pid} dead and port ${port} unresponsive; clearing\n`)
   removePidFileIfMatches(pid)
   managed.pid = null
   managed.adoptedPid = null
@@ -840,7 +992,10 @@ function inspectAndHeal() {
   SetCurrentLaunchToken('')
   // 状态机对齐：进程确实没了，别再让 UI 显示 running。
   if (GetStatus() !== StatusStopped) {
-    SetStatus(StatusStopped, '进程意外退出')
+    // Prefer dsh's own last word (captured from stderr) over a generic message —
+    // a bare "进程意外退出" gives the operator nothing to act on.
+    const detail = lastStartupStderr()
+    SetStatus(StatusStopped, detail ? `dsh 已退出：${detail}` : 'dsh 进程意外退出（详见运行日志）')
     SetLastRunState(StatusStopped)
   }
 }

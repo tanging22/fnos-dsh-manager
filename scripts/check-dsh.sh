@@ -11,7 +11,7 @@
 # 每个检查项输出 [PASS]/[WARN]/[FAIL]/[SKIP], 结尾给汇总与退出码(0=全过, 1=有 FAIL).
 set -u
 
-APP_NAME="dsh-console"
+APP_NAME="fnos-dsh-manager"
 FIX_MODE=0
 [ "${1:-}" = "--fix" ] && FIX_MODE=1
 

@@ -1,5 +1,114 @@
 # Changelog
 
+## v1.0.27 — 2026-10-10
+
+**改名 `fnos-dsh-manager`，并修复「实时刷新无效」与首页版本号显示。**
+
+### 改名
+
+- **套件改名为 `fnos-dsh-manager`**（含 `appname`，即安装路径、网关前缀、数据目录
+  一并改变）。`manifest` / `package.json` / `ui/config` / `app/ui/config` / 桌面图标
+  入口 / 代码内日志前缀全部同步；显示名改为「DSH 管理器」。
+- **旧数据自动迁移**：改名会让 fnOS 启用新的 `@appdata/fnos-dsh-manager` 目录，
+  原本存在于 `@appdata/dsh-console` 的配置、已下载的 dsh 版本、凭据（600 权限）、
+  工作区会看起来「消失」。`install_callback` 现在会检测旧目录，
+  **仅在新目录为空时**用 `cp -an` 搬过来（`-n` 不覆盖），并保留权限。
+  新目录已有内容则完全不搬，避免把用户在改名后新配的设置覆盖回旧值。
+  重复安装安全。凭据的 600 权限是 dsh 启动的硬性要求，所以权限必须一起搬。
+
+### 修复
+
+- **实时刷新无效、要手动刷新（P1）**：`index.html` 的 `#app` 一直带 `hidden`
+  属性，而**没有任何代码移除它**。这个属性在视觉上是空操作
+  （`.shell { display: flex }` 的优先级高于 UA 的 `[hidden] { display: none }`），
+  所以页面看起来完全正常——这也正是它一直没被发现的原因。但 JS 读
+  `element.hidden` 恒为 `true`，而两条实时更新路径都判断了它：
+  15秒轮询的 `if (... && !app.hidden) renderTab()` 永远不成立，
+  WebSocket 处理器的 `if (app.hidden) return` 第一行就返回，
+  **所有推送事件被静默丢弃**。只有手动点「刷新」才有效，因为它直接调`renderTab()`。
+  现移除该属性，并把判断改为真实的 `document.visibilityState`
+  ——只有标签页切到后台才停止重绘。后者不可能像 HTML 属性一样被遗忘。
+
+- **`boot()` 失败会白屏**：`boot()` 是即发即忘的，首屏渲染一旦抛错就是
+  unhandled rejection，页面只剩空白、控制台里一条错误——正是「白屏无内容」。
+  现在捕获它并把原因显示在页面上；`#refresh` 的事件绑定也改为可选链，
+  元素缺失不再连带整个模块失败。
+
+- **首页版本号同步**：顶部标题旁原先显示的是 **dsh 本体版本**，
+  与「管理器版本」混淆。现标题旁显示**管理器版本**（`v<面板版本>`），
+  并在状态卡新增一行显示**正在运行的 DeepSeek Harness 版本 + 端口**——
+  这样从「版本」页升级 dsh 后能立刻看出变化。
+
+### 测试
+
+- `smoke.mjs` 54 → **57 项**：断言 `#app` 不带 `hidden`、`app.js` 不再读
+  `app.hidden`、且确实使用 `visibilityState`。已验证把 `hidden` 加回去会被当场拦下。
+
+## v1.0.26 — 2026-10-10
+
+**修「dsh 启动成功但打不开后端 web」。** 根因有四处，都不是表面症状。
+
+### 根因
+
+- **传给 dsh 的参数里有它不认识的 `--trusted-host`（主因）**
+  `buildArgs()` 之前会追加 `--trusted-host <h1> <h2> ... <hN>`。核对
+  `@deepseek-ai/dsh` 0.2.0-rc.2 的真实CLI（`lib/bin.js`）后确认：dsh 只有六个
+  option（`--profile` / `--patch` / `--from-default-profile` / `--dump-config` /
+  `--dump-config-schema` / `--dump-default-config`），**根本没有 `--trusted-host`**。
+  而 `parseDshArgs` 走commander 的 `allowUnknownOption()` + 位置参数 `[args...]`，
+  于是这个 flag **连同它后面所有主机名**一起掉进 profile app 的 argv。
+  web profile 并不认识这些参数，dsh 要么校验失败、要么带着一条被污染的命令行启动，
+  结果就是「进程起来了但 web 打不开」。参考实现
+  `yuexps/deepseek.harness.fnos` 的 `harness.go:453` 只传
+  `web --port N --no-open`，没有任何 host 参数——受信主机本来就走
+  `${DSH_HOME}/trusted_hosts.conf` 这条文件路径，不需要也不能靠命令行传。
+
+- **少传 `--no-open`**：参考实现传了它。无头的 NAS 上 dsh 会尝试拉起浏览器；
+  该flag 同样落在 `[args...]` 里，属于 profile app 认识的参数。现已补上。
+
+- **启动前没写 `webserver` patch**：`applyLanBinding()`原先只在
+  `/api/service/*` 路由里调用。面板自己的「按上次状态自启」等路径绕过了它，
+  于是 dsh 可能带着过期的/缺失的 patch 启动——一旦如此，dsh 会退回自己的内置
+  默认值（回环 + 3080），而面板一直去探测 28000，UI 就永远停在「启动中」。
+  现在 `startDsh()` 自己在 spawn 前写一次，所有启动路径都被覆盖。
+
+- **HTML 反代注入把 Buffer 当字符串用（这条让页面全白/报错）**
+  `injectManifestCredentials()` 对 `injectDshHtml()` 的返回值直接调`.replace()`，
+  而后者返回的是 **Buffer**——Buffer 没有 `.replace`。这在响应流的 `end`
+  处理器里抛 `TypeError`，属于 uncaughtException，于是**每一个经面板反代的
+  HTML 页面都直接失败**（面板靠上一轮加的进程级兜底才没有整体崩溃）。
+  现按 UTF-8 文本处理再重新编码；没有 manifest 标签时**原样返回原 Buffer**，
+  避免无谓的重新编码破坏非法 UTF-8 字节。注入是便利性补丁（特权声明 + 隐藏按钮），
+  不是正确性前提，所以外层再包一层try/catch——失败时降级为「原样转发页面」。
+
+### 诊断能力
+
+- **dsh 启动失败的真实原因现在直接显示在面板上**：原先 dsh 的 stderr 直接写进
+  日志文件，坏 flag / schema 不匹配 / 插件缺失这些原因只有翻日志才看得见，
+  而 UI 只会显示「已停止」。现在 stderr 走 pipe（仍然原样tee 进同一个日志文件），
+  提取关键行写进状态机 `lastMessage`，并在 `child.on('exit')` 里**快速失败**，
+  不再拿一个死进程去轮询满 300 秒。实测输出示例：
+  `dsh 启动即退出（code=1）：error: unknown option '--trusted-host'`。
+
+- **就绪探测加固**：回环优先（`127.0.0.1` 恒为首选目标，参考实现同样硬编码回环），
+  并加入 TCP 兜底——dsh 端口已监听但 HTTP 还没起来时也算「已就绪」，
+  交由上层如实报出 HTTP 错误，而不是空转到 300s 超时后误报「启动失败」。
+
+- **健康状态不再抖动**：此前缓存了失败的探测结果，导致一个正常服务的
+  `healthy` 在 true/false 之间反复跳（实测 t+1s true、t+3s false、t+7s true，
+  而直连一直是 200），UI 上表现为「运行中」与「启动中」闪烁。现在**只缓存成功**：
+  正常服务仍享受 1.5s 一次的探测节流，而「未就绪」会重新探测——那恰恰是
+  连接立即被拒、代价极低且答案最新鲜的时候。
+
+### 测试
+
+- **`smoke.mjs` 48 → 54 项**：stub 现在会返回**真正的 HTML**（含中文、manifest
+  link、`data-slot`）。此前 stub 一律返回 `text/plain`，导致整条 HTML 注入路径
+  **零覆盖**——这正是 Buffer bug 能一路发布的原因。新增断言覆盖：HTML 页面可
+  服务、manifest 被注入 crossorigin、`__DSH_TRANSPORT__` shim 就位、上游正文
+  与多字节中文未被破坏、面板在反代 HTML 后仍存活。已验证：把Buffer bug 注回去，
+  测试立刻掉到 52/54 并指认具体失败项。
+
 ## v1.0.25 — 2026-10-10
 
 健壮性与性能修复版。修掉一个「打开面板即崩溃」的致命缺陷、一个配置静默失效的缺陷，

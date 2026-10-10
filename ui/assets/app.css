@@ -349,6 +349,23 @@ html, body {
   margin: 12px 0;
 }
 
+/* 状态卡底部一行：正在运行的 dsh 版本 + 端口。标题栏显示的是管理器版本，
+   所以服务的版本号需要一个自己的位置，否则从版本页升级 dsh 后看不出变化。 */
+.hero-footnote {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.hero-footnote code {
+  /* 用与文件里其它 code 元素相同的显式字体栈，不依赖未定义的 --mono 变量。 */
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text);
+}
+
 /* 5 列指标网格（运行状态/PID/CPU/内存/运行时间，对齐 Go 版 grid-cols-5） */
 .metric-grid {
   display: grid;

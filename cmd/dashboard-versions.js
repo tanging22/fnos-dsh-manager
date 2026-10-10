@@ -114,7 +114,7 @@ export async function installVersion(version, { onProgress } = {}) {
   const packagePath = join(dir, 'package.json')
   if (!fileExists(packagePath)) {
     writeFileSync(packagePath, `${JSON.stringify({
-      name: 'dsh-console-version',
+      name: 'fnos-dsh-manager-version',
       private: true,
       version: '1.0.0',
       dependencies: { [DSH_PACKAGE]: version },

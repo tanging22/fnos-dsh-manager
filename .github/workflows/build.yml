@@ -46,7 +46,7 @@ jobs:
       - name: Upload fpk artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-console-fpk
+          name: fnos-dsh-manager-fpk
           path: dist/*.fpk
           if-no-files-found: error
 

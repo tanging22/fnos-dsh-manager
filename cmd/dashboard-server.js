@@ -875,16 +875,36 @@ function stripLoopbackLocation(loc) {
   return loc
 }
 
-/** Inject `crossorigin="use-credentials"` into `<link rel="manifest">` so the
- *  gateway auth cookie rides the manifest request (Go `rewriteFnGatewayHtml` step 1). */
+/**
+ * Inject `crossorigin="use-credentials"` into `<link rel="manifest">` so the
+ * gateway auth cookie rides the manifest request (Go `rewriteFnGatewayHtml` step 1).
+ *
+ * Accepts a Buffer or a string and always returns a Buffer, matching the
+ * `injectHtmlHead` step that runs next. It used to call `.replace()` on whatever
+ * it was handed, but the caller passes the output of {@link injectDshHtml},
+ * which is a Buffer — so `body.replace is not a function` threw on *every* HTML
+ * response and, being unhandled inside the response 'end' handler, surfaced as
+ * an uncaughtException and killed the proxy for that request. A Buffer has no
+ * `.replace`, and no `.toString()` with a UTF-8 argument would either: multi-byte
+ * characters would be mangled and the byte offsets of the injected shim would
+ * not match, so the HTML must be edited as text and re-encoded.
+ */
 function injectManifestCredentials(body) {
+  const isBuffer = Buffer.isBuffer(body)
+  const text = isBuffer ? body.toString('utf8') : String(body ?? '')
   const re = /<link\b[^>]*\brel=["']manifest["'][^>]*>/gi
-  return body.replace(re, (match) => {
+  // Nothing to do → hand back the ORIGINAL buffer. Re-encoding a document that
+  // had no manifest link would replace any byte sequence that is not valid UTF-8
+  // with U+FFFD for no benefit.
+  re.lastIndex = 0
+  if (!re.test(text)) return isBuffer ? body : Buffer.from(text, 'utf8')
+  const out = text.replace(re, (match) => {
     if (!/crossorigin/i.test(match)) {
       return match.replace(/<link/i, '<link crossorigin="use-credentials"')
     }
     return match
   })
+  return Buffer.from(out, 'utf8')
 }
 
 async function proxyToDsh(request, response, { pathPrefix }) {
@@ -970,8 +990,22 @@ async function proxyToDsh(request, response, { pathPrefix }) {
         upstreamResponse.on('end', () => {
           // 对齐 Go 版 rewriteFnGatewayHtml：先给 manifest 注入 crossorigin
           // （网关鉴权 Cookie 携带），再注入特权声明 + 样式隐藏补丁。
+          //
+          // This runs inside a stream 'end' handler, where a throw is an
+          // uncaughtException — and it did throw, on a Buffer-vs-string type
+          // mismatch in injectManifestCredentials, which broke every HTML page
+          // the panel proxied. Injection is a convenience (a privilege hint and
+          // a hidden button), not a correctness requirement, so a failure here
+          // must degrade to "serve the page unmodified" instead of dropping the
+          // request.
           const raw = Buffer.concat(chunks)
-          let body = injectDshHtml(injectManifestCredentials(raw), DSH_HTML_SHIM)
+          let body = raw
+          try {
+            body = injectDshHtml(injectManifestCredentials(raw), DSH_HTML_SHIM)
+          } catch (error) {
+            body = raw
+            console.log(`[proxy] html injection skipped: ${error?.message ?? error}`)
+          }
           delete out['content-security-policy']
           delete out['content-security-policy-report-only']
           out['cache-control'] = 'no-store, no-cache, must-revalidate, max-age=0'

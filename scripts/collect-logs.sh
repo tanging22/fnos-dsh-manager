@@ -1,10 +1,10 @@
 #!/bin/bash
-# collect-logs.sh — dsh-console 排错信息采集
+# collect-logs.sh — fnos-dsh-manager 排错信息采集
 # 在 NAS 上跑(ssh 或 fnOS 终端), 把内嵌页 Bad Gateway 相关的关键信息打包成一份,
 # 发给本小姐分析. 只读不写, 不改动任何运行状态.
 set -u
 
-APP_NAME="dsh-console"
+APP_NAME="fnos-dsh-manager"
 OUT="/tmp/${APP_NAME}-diagnose.txt"
 : > "${OUT}"
 
@@ -36,7 +36,7 @@ hdr "port 28001"
 
 # 5. 进程状态
 hdr "processes"
-ps aux | grep -E 'dashboard\.js|proxy\.py|dsh-console' | grep -v grep >> "${OUT}" 2>&1
+ps aux | grep -E 'dashboard\.js|proxy\.py|fnos-dsh-manager' | grep -v grep >> "${OUT}" 2>&1
 say "--- 完整 cmdline ---"
 for p in /proc/[0-9]*; do
     c=$(tr '\0' ' ' < "${p}/cmdline" 2>/dev/null || true)

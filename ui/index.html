@@ -5,18 +5,32 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!--
   Asset URLs are relative on purpose. fnOS serves this app through its unified
-  gateway at /app/dsh-console/, where an absolute /assets/... would escape the
+  gateway at /app/fnos-dsh-manager/, where an absolute /assets/... would escape the
   prefix and 404. Relative URLs resolve correctly both behind that prefix and
   when the panel is opened directly on :28001. See dom.js for the same rule
   applied to API calls.
 -->
 <meta name="robots" content="noindex, nofollow">
-<title>DSH 控制台</title>
+<title>DSH 管理器</title>
 <link rel="icon" href="assets/icon.png" type="image/png">
 <link rel="stylesheet" href="assets/app.css">
 </head>
 <body>
-<div id="app" class="shell" hidden>
+<!--
+  No `hidden` attribute here.
+
+  It used to carry `hidden`, on the assumption that app.js would remove it after
+  the first successful render — nothing ever did. That attribute is inert
+  visually (`.shell { display: flex }` outranks the UA's `[hidden]` rule) so the
+  page *looked* fine, which is exactly why it survived: but `element.hidden`
+  stayed `true` in JS, and both live-update paths test it —
+  `if (state.tab === 'overview' && !app.hidden) renderTab()` and
+  `if (app.hidden) return` at the top of the WebSocket handler. So the 15s poll
+  and every pushed event were silently discarded, and the only thing that
+  updated the page was clicking 刷新 (which calls renderTab() directly).
+  That is the "实时刷新无效，要手动刷新" symptom, reproduced exactly.
+-->
+<div id="app" class="shell">
   <!-- 左侧边栏：品牌卡 + 主导航 + 底部分隔 + 设置菜单（对齐 Go 版 App.vue 的 NLayoutSider） -->
   <aside class="sider" id="sider">
     <button id="sider-toggle" class="sider-toggle" type="button" title="折叠/展开侧栏" aria-label="折叠或展开侧栏">

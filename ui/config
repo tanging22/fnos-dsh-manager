@@ -1,25 +1,25 @@
 {
     ".url": {
-        "dsh-console.Application": {
-            "title": "DSH 控制台",
+        "fnos-dsh-manager.Application": {
+            "title": "DSH 管理器",
             "icon": "images/icon_{0}.png",
             "type": "iframe",
             "microApp": true,
             "protocol": "",
             "gatewaySocket": "app.sock",
-            "gatewayPrefix": "/app/dsh-console",
-            "url": "/app/dsh-console/",
+            "gatewayPrefix": "/app/fnos-dsh-manager",
+            "url": "/app/fnos-dsh-manager/",
             "allUsers": true
         },
-        "dsh-console.dsh": {
+        "fnos-dsh-manager.dsh": {
             "title": "DeepSeek harness web",
             "icon": "images/web_icon_{0}.png",
             "type": "iframe",
             "microApp": true,
             "protocol": "",
             "gatewaySocket": "app.sock",
-            "gatewayPrefix": "/app/dsh-console",
-            "url": "/app/dsh-console/p/",
+            "gatewayPrefix": "/app/fnos-dsh-manager",
+            "url": "/app/fnos-dsh-manager/p/",
             "allUsers": true
         }
     }

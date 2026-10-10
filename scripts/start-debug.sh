@@ -1,9 +1,9 @@
 #!/bin/bash
-# start-debug.sh — 手动启动 dsh-console 面板并抓取诊断信息
+# start-debug.sh — 手动启动 fnos-dsh-manager 面板并抓取诊断信息
 # 用法: 在 NAS 上以 root 运行:  bash start-debug.sh
 set -u
 
-APP=/var/apps/dsh-console
+APP=/var/apps/fnos-dsh-manager
 MAIN="${APP}/cmd/main"
 
 echo "===== start-debug $(date '+%F %T') ====="
@@ -50,7 +50,7 @@ ps aux 2>/dev/null | grep -E 'dashboard\.js|proxy\.py' | grep -v grep || echo "n
 
 echo
 echo "--- 6. 日志尾部 ---"
-for f in /vol1/@appdata/dsh-console/console.log /vol1/@appdata/dsh-console/proxy.log; do
+for f in /vol1/@appdata/fnos-dsh-manager/console.log /vol1/@appdata/fnos-dsh-manager/proxy.log; do
     echo "== ${f} =="
     tail -30 "${f}" 2>&1 || echo "(不存在)"
 done
