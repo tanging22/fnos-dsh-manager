@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.31 - 2026-10-10
+
+### 修复
+
+- 面板反代回给浏览器的 101 握手不再重复发送 `Connection`/`Upgrade`。上游 Node 返回的头是小写，反代又补了一份大写，同名头出现两次；浏览器据此判定握手非法、丢弃 socket 并循环重试 `connection lost, retry #1..#4`。服务端口志全程记录 101，因此该故障此前完全不可见。现在按头名去重写出，且仅在上游缺失时才补。
+- 影响 1.0.29/1.0.30 的全部入口：局域网直连 `:28000`、面板 `/p/` 反代，以及经 fnOS 网关 `5666` 的 `app/fnos-dsh-manager/p/`。
+
+### 验证
+
+- smoke 新增 WS 反代覆盖：stub 的 upgrade handler 刻意用小写头（Node 的真实行为），断言握手成功、`connection`/`upgrade`/`sec-websocket-protocol` 各只出现一次、accept key 与子协议原样保留、隧道能带回上游帧、上游拒绝升级时不得伪装成 101。
 ## v1.0.30 — 2026-10-10
 
 ### 新增

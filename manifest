@@ -1,8 +1,8 @@
 appname=fnos-dsh-manager
-version=1.0.30
+version=1.0.31
 display_name=DSH 管理器
 desc=DeepSeek Harness 的 fnOS 管理面板：查看运行状态与实时日志、在线安装并切换 dsh 版本、记录最近访问来源 IP、提供快捷入口。本套件不内置 dsh 本体，版本由面板按需从 npm 下载，因此升级 dsh 不需要重装套件。
-changelog=1.0.30 新增「补丁」面板：把 dsh settings 插件的 host-mode 判定（$host.isLoopback ? "host" : "memory"）强制改为 host，解决局域网访问时插件/模型设置整页空白。修复 dsh web「断开连接」：面板反代补上 WebSocket 通路（remote.mux 此前必 404 或被静默关闭）；dsh 的 webserver 覆盖彻底移除，dsh 恒定只听原生 127.0.0.1:3080，换版本零配置迁移；局域网直连入口移到 :28000，自动注入当次启动 token，内网免 token 直达；面板 :28001 不变。
+changelog=1.0.31 修复 101 握手重复 Connection/Upgrade 导致浏览器判定握手非法、丢弃 socket 并循环重试 connection lost 的问题（影响 1.0.29/1.0.30 全部入口：局域网直连 :28000、面板 /p/ 反代、fnOS 网关 5666 的 app/fnos-dsh-manager/p/）；头名按大小写不敏感去重写出，仅在上游缺失时补 Connection/Upgrade；新增 WS 反代 smoke 覆盖。
 platform=all
 source=thirdparty
 maintainer=tanging22
