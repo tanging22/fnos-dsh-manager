@@ -1,5 +1,74 @@
 # Changelog
 
+## v1.0.28 — 2026-10-10
+
+按用户实机反馈修复四个问题：**首屏白屏十几秒**、**面板版本显示 v0.0.0**、
+**dsh web 页面频繁重连**、**终端无法运行**。
+
+### 修复
+
+- **首屏白屏：首帧没有任何内容（P1）**
+  `#view` 在 `index.html` 里是**完全空的**。而 `app.js` 是 module（天然 defer），
+  首屏渲染还要 `await /api/status`，所以从浏览器画出外壳到内容出现之间存在一段
+ 真空期——经 fnOS 网关时被拉长到肉眼可见的程度，观感就是「白屏十几秒」。
+  现在占位内容直接写进 `index.html`：**第一帧就有东西可画，不依赖任何脚本**，
+  `boot()` 完成后整体替换。骨架屏颜色全部取自现有主题变量，
+  断点与 `.metric-grid` 的860px 对齐（避免切换时列数跳动），
+  并尊重 `prefers-reduced-motion`。
+
+- **面板版本显示 `v0.0.0`（P1）**
+  `manifestInfo().version` 读不到 manifest 时回落到 `'0.0.0'`，界面上就是一个
+  光秃秃的徽章，**没有任何报错**。根因是路径不一致：面板默认
+  `MANIFEST=/var/apps/{appname}/manifest`，但 fnOS 上`/var/apps/{appname}`
+  只是一个**软链**，manifest 实体在 `TRIM_APPDEST`
+  （`/vol{n}/@appcenter/{appname}`）下——而 `cmd/main` 传了 `TRIM_APPDEST`
+  却**从未 export `MANIFEST`**。已验证：默认路径 ENOENT → `{}` → `0.0.0`；
+  正确路径 → 解析出真实版本。
+  修法：`cmd/main` 显式传 `MANIFEST`；`readManifest` 读不到时**打印一次告警**
+  （含真实路径与 errno），下次再犯看一眼日志就知道。
+  关键教训：**smoke 测试也没传 `MANIFEST`**，所以这个问题在测试里根本测不出来，
+  现在补上了。
+
+- **dsh web 页面频繁重连（P1）**
+  `proxy.py` 里`socket.create_connection(BACKEND, timeout=30)` 设置的 socket
+  超时**会一直附着在这个 socket 上**，作用于之后所有的 `recv`/`send`。
+  而 `_relay()` 正是用 `recv()` 等下一帧的——WebSocket 空闲 30 秒完全正常
+  （面板 15s 轮询一次、或用户只是停在页面上）。于是每次空闲满 30 秒 `recv`
+  就抛 `socket.timeout`，被 `except: pass` 吞掉，紧接着 `finally` 的
+  `shutdown(SHUT_WR)` 把连接关掉。**前端表现为反复重连，日志里却什么都看不到**，
+  因为那个超时被当成了正常结束。
+  修法：`_relay()` 开头把两个 socket 都 `settimeout(None)` 切回阻塞模式。
+  协议保活交给心跳（面板每 30s ping），不该用读超时去代替。
+
+- **终端无法运行（P1）**
+  面板是被 `nohup` 拉起的守护进程，**没有控制终端**，所以 `TERM` 压根不存在。
+  node-pty 会把 `undefined` 传给终端初始化程序，terminfo 查找随之失败，
+  表现为终端一进去就异常。现显式设置 `TERM=xterm-256color`，
+  并补上参考实现同样设置的 `CI=true` 与 `DSH_AGENTS_HOME`。
+
+- **「打开文件夹」没有调用 fnOS 文件管理器**
+  原实现只查 `window.trimSdk || window.parent?.trimSdk`，而 fnOS 注入 SDK 的位置
+  随版本/嵌套深度而变，多一层 iframe 就找不到，于是**静默退化成复制路径**，
+  看起来像"点了没反应"。现在沿父窗口链上溯最多 6 层查找；
+  兜底分支的提示也改诚实了——原来在"没打开"之后紧跟一句"路径已复制"，
+  会让人以为两步都成功了。
+
+### 门禁
+
+- **`check.mjs` 新增 Python 与Shell 语法检查**：`cmd/proxy.py` 和
+  `cmd/*` 这些脚本属于交付物，但 `targets` 只收集 `.js/.mjs`——也就是说
+  **改`proxy.py` 完全不受任何检查**，语法错误只会在装机时表现为"桌面图标点不开"。
+  现在 `bash -n` 校验 8 个生命周期脚本、`py_compile` 校验 proxy.py；
+  解释器缺失或因环境限制无法 spawn 时**明确打印 SKIP 原因**，不静默放过。
+  （本机沙箱对非 node 程序 `spawnSync` 一律 `EBUSY`，已实测同一段 `py_compile`
+  在 bash 下能正确捕获 `SyntaxError`，逻辑本身有效，NAS 上会正常执行。）
+
+### 测试
+
+- `smoke.mjs` 57 → **59 项**：断言面板版本不是 `0.0.0`、且与随包 manifest 一致；
+  并给测试进程补上 `MANIFEST`（此前缺失，正是版本问题测不出来的原因）。
+  已验证：把 `MANIFEST` 去掉立刻 FAIL 57/59 并明确指出「manifest not read?」。
+
 ## v1.0.27 — 2026-10-10
 
 **改名 `fnos-dsh-manager`，并修复「实时刷新无效」与首页版本号显示。**

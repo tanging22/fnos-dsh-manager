@@ -53,6 +53,12 @@ fi
 [ -n "${CONSOLE_UI_DIR}" ] || CONSOLE_UI_DIR="${APP_DIR}/ui"
 
 CONSOLE_PORT="${CONSOLE_PORT:-${TRIM_SERVICE_PORT:-28001}}"
+# 面板读 manifest 的路径。必须显式传: 面板的默认值是
+# /var/apps/{appname}/manifest, 而 fnOS 的 /var/apps/{appname} 只是一个软链,
+# manifest 实体在 ${APP_DIR}(=TRIM_APPDEST=/vol{n}/@appcenter/{appname})下。
+# 不传的话 readManifest 读不到 -> 版本号在界面上显示成 "v0.0.0", 且毫无报错。
+MANIFEST_FILE="${APP_DIR}/manifest"
+[ -f "${MANIFEST_FILE}" ] || MANIFEST_FILE="${CMD_DIR}/../manifest"
 GATEWAY_PREFIX="/app/${APP_NAME}"
 # fnOS 统一网关固定转发到 /var/apps/{appname}/target/app.sock (gatewaySocket 只填
 # 文件名, 网关自己拼路径). 这里直接写软链形式, 与网关转发目标逐字一致:
@@ -167,6 +173,7 @@ start_panel() {
         TRIM_APPNAME="${APP_NAME}" \
         TRIM_APPDEST="${APP_DIR}" \
         TRIM_PKGVAR="${DATA_DIR}" \
+        MANIFEST="${MANIFEST_FILE}" \
         nohup "${NODE_BIN}" "${PANEL_JS}" >> "${PANEL_LOG}" 2>&1 &
         echo $! > "${PANEL_PID}"
         waited=0

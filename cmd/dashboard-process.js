@@ -666,6 +666,16 @@ export async function startDsh() {
     // 标记为远程无头环境：dsh 据此关闭本地桌面应用探测（Go 版 InitAppEnv），
     // 避免会话头部出现「在 Zed 中打开」等桌面分体按钮（适配文档问题 #6）。
     SSH_CONNECTION: '127.0.0.1 0 127.0.0.1 22',
+    // ── 终端（xterm.js / node-pty）所需 ──
+    // 面板是被 nohup 拉起的守护进程，没有控制终端，于是 TERM 压根不存在。
+    // node-pty 会把 undefined 传给终端初始化程序，xterm/pty 侧的
+    // terminfo 查找随之失败，表现就是「终端无法运行」或一进去就花屏/退出。
+    // 所以必须显式给一个真实存在的终端类型；xterm-256color 支持颜色与常用能力。
+    TERM: process.env.TERM || 'xterm-256color',
+    // dsh 的代理/子进程还需要这两个（Go 版 InitAppEnv 同样设置）。
+    // CI=true 让 dsh 不要尝试任何交互式 TTY 探测。
+    CI: 'true',
+    DSH_AGENTS_HOME: join(home, 'agents'),
   }
   try {
     const fd = openSync(DSH_LOG, 'a')

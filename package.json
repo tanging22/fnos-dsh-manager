@@ -1,6 +1,6 @@
 {
   "name": "fnos-dsh-manager",
-  "version": "1.0.27",
+  "version": "1.0.28",
   "private": true,
   "description": "DeepSeek Harness (dsh) 专属 fnOS 应用封装：管理后台（状态/日志/版本切换/访问 IP）+ 反代快捷入口",
   "type": "module",

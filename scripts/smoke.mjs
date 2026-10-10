@@ -81,6 +81,12 @@ const panelEnv = {
   TRIM_PKGVAR: dataDir,
   MANAGED_APP_DIR: join(sandbox, 'app'),
   CONSOLE_UI: join(ROOT, 'ui'),
+  // MANIFEST is what `cmd/main` exports on a real box so the panel can read its
+  // own version. The suite omitted it, which is precisely why the "panel reports
+  // v0.0.0" bug survived: without it the panel fell back to the non-existent
+  // /var/apps/{appname}/manifest and the version assertions had nothing to
+  // compare against. Mirroring production here keeps this harness honest.
+  MANIFEST: join(ROOT, 'manifest'),
 }
 
 const panel = spawn(process.execPath, [join(ROOT, 'cmd', 'dashboard.js')], {
@@ -381,6 +387,28 @@ try {
   check('every diagnostic has a valid status',
     diagChecks.every((c) => ['pass', 'warn', 'fail'].includes(c.status)),
     JSON.stringify(diagChecks.map((c) => c.status)))
+
+  /* --- the panel reports its OWN version, not a placeholder ---------------
+   *
+   * `manifestInfo().version` falls back to '0.0.0' when the manifest cannot be
+   * read, and the header showed a bare "v0.0.0" with no explanation. The cause
+   * was a path mismatch: the panel defaults MANIFEST to
+   * `/var/apps/{appname}/manifest`, but on fnOS that directory is only a
+   * symlink — the manifest itself lives under TRIM_APPDEST
+   * (`/vol{n}/@appcenter/{appname}`), which `cmd/main` passes but never exports
+   * as MANIFEST. Verified against the real layout:
+   *   default path -> readFileSync ENOENT -> {} -> "0.0.0"
+   *   TRIM_APPDEST path -> version parsed correctly
+   */
+  const versioned = await jsonOf(await call('/api/status'))
+  check('the panel reports a real version, not 0.0.0',
+    versioned.panel?.version && versioned.panel.version !== '0.0.0',
+    `panel.version=${JSON.stringify(versioned.panel?.version)} — manifest not read?`)
+  const manifestText = readFileSync(join(ROOT, 'manifest'), 'utf8')
+  const declared = /^version=(.+)$/m.exec(manifestText)?.[1]?.trim()
+  check('the reported version matches the shipped manifest',
+    declared && versioned.panel.version === declared,
+    `manifest says ${JSON.stringify(declared)}, API said ${JSON.stringify(versioned.panel.version)}`)
 
   /* --- WebSocket push channel --------------------------------------------
    *

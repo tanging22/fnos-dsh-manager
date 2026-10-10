@@ -1,8 +1,8 @@
 appname=fnos-dsh-manager
-version=1.0.27
+version=1.0.28
 display_name=DSH 管理器
 desc=DeepSeek Harness 的 fnOS 管理面板：查看运行状态与实时日志、在线安装并切换 dsh 版本、记录最近访问来源 IP、提供快捷入口。本套件不内置 dsh 本体，版本由面板按需从 npm 下载，因此升级 dsh 不需要重装套件。
-changelog=1.0.27 改名为 fnos-dsh-manager（含 appname，安装路径/网关前缀/数据目录随之改变，并自动迁移旧 dsh-console 数据目录）；修复 #app 长期带 hidden 属性导致 15秒轮询与 WebSocket 推送全部被丢弃（实时刷新无效、要手动刷新）；boot() 失败改为显示原因而非白屏；首页标题旁改显管理器版本，状态卡新增 dsh 版本与端口。
+changelog=1.0.28 首屏白屏：#view 原为空且首屏要等 /api/status，改为在 index.html 里内置骨架屏（第一帧即有内容）；面板版本显示 v0.0.0：MANIFEST 默认指向软链路径且 cmd/main 从未 export它，改为显式传真实路径并让 readManifest 失败时打印告警；dsh web 频繁重连：create_connection 的 30s socket 超时附着到 socket 上被 _relay 的 recv 继承，空闲即断，改为切回阻塞模式；终端无法运行：补 TERM/CI/DSH_AGENTS_HOME；打开文件夹：沿父窗口链找 SDK 并让兜底提示诚实；check.mjs 新增 Python/Shell 语法门禁；smoke 57→59 项并补上 MANIFEST。
 platform=all
 source=thirdparty
 maintainer=tanging22

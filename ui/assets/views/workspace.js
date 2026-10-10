@@ -10,16 +10,27 @@ import { api, esc, toast, bytes, localTime, timeAgo, url } from '../dom.js'
 
 /**
  * 调 fnOS 文件管理器打开一个目录。返回 true 表示已交给 SDK，false 表示不可用。
+ *
+ * SDK 只能从网关 iframe 的父窗口拿，所以要沿parent 链往上找 ——
+ * fnOS 在不同版本/不同嵌套深度下注入 `window.trimSdk` 的位置并不一致，
+ * 只查 `window.trimSdk || window.parent.trimSdk` 在多一层 iframe 时就找不到，
+ * 于是按钮静默退化成"复制路径"，看起来像"点了没反应"。
  */
 function openFileManager(path) {
-  const sdk = window.trimSdk || window.parent?.trimSdk
-  if (sdk && typeof sdk.openFileManager === 'function') {
-    try {
-      sdk.openFileManager(path)
-      return true
-    } catch {
-      return false
+  // 沿父窗口链找 SDK，最多上溯 5 层。
+  let scope = window
+  for (let depth = 0; scope && depth < 6; depth += 1) {
+    const sdk = scope.trimSdk
+    if (sdk && typeof sdk.openFileManager === 'function') {
+      try {
+        sdk.openFileManager(path)
+        return true
+      } catch {
+        // SDK 在但不工作，继续往外找下一个候选。
+      }
     }
+    if (scope.parent === scope) break
+    scope = scope.parent
   }
   return false
 }
@@ -36,9 +47,12 @@ export async function render(host, ctx) {
   const items = data.items ?? []
   const home = data.home ?? ''
 
-  const copy = (text) => () => {
+  /** 复制路径并给出提示。`quiet` 用于"打开文件夹"的兜底分支：
+ *  那里已经明确告诉用户文件管理器没打开，再弹一句"路径已复制"只会让人
+ *  以为两步都成功了。 */
+  const copy = (text, quiet = false) => () => {
     navigator.clipboard?.writeText(text).then(
-      () => toast('路径已复制', 'ok'),
+      () => { if (!quiet) toast('路径已复制', 'ok') },
       () => toast('复制失败，请手动选中', 'error'),
     )
   }
@@ -96,8 +110,11 @@ export async function render(host, ctx) {
       if (openFileManager(path)) {
         toast('已交给 fnOS 文件管理器打开', 'ok')
       } else {
-        // SDK 不可用（非网关环境/直连端口），回退到复制路径。
-        copy(path)()
+        // SDK 不可用（非网关环境/直连端口）。明确说清楚到底做了什么——
+        // 原来也提示"路径已复制"，但用的是 copy() 自己的文案，
+        // 在"没打开"之后紧跟一句"已复制"会让人以为两步都成功了。
+        copy(path, true)()
+        toast('文件管理器不可用，已复制路径（请手动粘贴到文件管理器）', 'error')
       }
     })
   })

@@ -48,7 +48,29 @@ def _recv_exact(sock, n):
 
 
 def _relay(sock_a, sock_b):
-    """WebSocket 升级后的双向原始字节透传."""
+    """WebSocket 升级后的双向原始字节透传.
+
+    两个 socket 都必须先切成**阻塞模式**。
+
+    `create_connection(..., timeout=30)` 设的超时会一直附着在这个 socket 上,
+    作用于之后所有的 recv/send。而下面 `recv()` 正是用来"等下一帧"的——
+    WebSocket 空闲 30 秒是完全正常的（面板 15s轮询一次、或用户只是停在页面上），
+    于是每次空闲满 30 秒 recv 就抛 socket.timeout，被 except 吞掉，然后 finally
+    的 shutdown(SHUT_WR) 把连接关掉。前端表现为页面反复重连，日志里却什么都看不到，
+    因为那个 timeout 被当成了正常结束。
+
+    升级完成后协议本身要靠心跳保活（面板每 30s 发 ping，浏览器自动回 pong），
+    这里不需要也不应该用读超时去代替它。
+    """
+
+    def to_blocking(sock):
+        try:
+            sock.settimeout(None)
+        except Exception:
+            pass
+
+    to_blocking(sock_a)
+    to_blocking(sock_b)
 
     def pump(src, dst):
         try:
@@ -60,6 +82,8 @@ def _relay(sock_a, sock_b):
         except Exception:
             pass
         finally:
+            # 半关闭写端，让对端知道"这边没有更多数据了"，
+            # 但仍然可以往这个方向发。只在真正结束时才做。
             try:
                 dst.shutdown(socket.SHUT_WR)
             except Exception:
@@ -69,6 +93,8 @@ def _relay(sock_a, sock_b):
     t2 = threading.Thread(target=pump, args=(sock_b, sock_a), daemon=True)
     t1.start()
     t2.start()
+    # 任一方向结束就整体收尾：dsh 侧的会话可能长时间无流量，
+    # 等两端都 EOF 会让连接白白挂着。
     t1.join()
     t2.join()
 

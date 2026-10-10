@@ -75,7 +75,30 @@
       </div>
     </header>
 
-    <main id="view" class="view"></main>
+    <!--
+  Placeholder content, replaced the moment boot() finishes its first render.
+
+  This used to be empty. Because app.js is a module (deferred by definition) and
+  the first render must await /api/status, there is a real gap between the browser
+  painting the shell and the content appearing — through the fnOS gateway that is
+  long enough to read as "白屏". A skeleton makes the wait look intentional
+  instead of broken, and it is part of the served HTML so it shows up on the very
+  first paint, before any script runs.
+-->
+<main id="view" class="view">
+  <div class="card skeleton-card" aria-hidden="true">
+    <div class="skel skel-title"></div>
+    <div class="skel-grid">
+      <div class="skel skel-box"></div>
+      <div class="skel skel-box"></div>
+      <div class="skel skel-box"></div>
+      <div class="skel skel-box"></div>
+      <div class="skel skel-box"></div>
+    </div>
+    <div class="skel skel-line"></div>
+    <div class="skel skel-line short"></div>
+  </div>
+</main>
 
     <footer class="footer muted">
       <span id="footer-left"></span>

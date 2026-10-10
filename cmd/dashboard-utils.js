@@ -282,7 +282,17 @@ export function compareVersions(a, b) {
   return 0
 }
 
-/** Read `key = value` / `key=value` / `key value` from an fnOS manifest. */
+/**
+ * Read `key = value` / `key=value` / `key value` from an fnOS manifest.
+ *
+ * A missing or unreadable manifest is reported as `{}`, but the reason is logged
+ * once. `manifestInfo()` turns an empty result into `version: '0.0.0'`, which the
+ * UI shows as a bare "v0.0.0" badge with no explanation — that is exactly how a
+ * wrong path here presents itself, and it cost real time to trace: the panel was
+ * launched with the correct TRIM_APPDEST while the manifest was being looked up
+ * under a different one, so nothing failed loudly and only the version badge was
+ * wrong. One line in the log is enough to make the next occurrence obvious.
+ */
 export function readManifest(path = MANIFEST) {
   const out = {}
   try {
@@ -293,9 +303,16 @@ export function readManifest(path = MANIFEST) {
       const match = /^([A-Za-z0-9_.-]+)\s*[=:]\s*(.*)$/.exec(trimmed)
       if (match) out[match[1]] = match[2].replace(/\s+$/, '')
     }
-  } catch {}
+  } catch (error) {
+    if (!readManifest.warned) {
+      readManifest.warned = true
+      console.warn(`[fnos-dsh-manager] cannot read manifest at ${path}: ${error?.message ?? error}`)
+    }
+    return {}
+  }
   return out
 }
+readManifest.warned = false
 
 export function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'"'"'`)}'`

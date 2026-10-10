@@ -14,6 +14,7 @@
 import { execFileSync } from 'node:child_process'
 import { readdirSync, readFileSync, existsSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -264,6 +265,75 @@ if (!existsSync(manifestPath)) {
       console.error(`ui/config is not valid JSON: ${error.message}`)
     }
   }
+}
+
+/* The gateway proxy and the fnOS lifecycle scripts are part of the shipped
+ * product but were outside `targets`, which only collects .js/.mjs. So edits to
+ * `cmd/proxy.py` or `cmd/main` got zero checking — a syntax error there would
+ * surface only as a dead desktop icon at install time. Compile them here instead,
+ * and skip (loudly) when the interpreter is absent rather than failing the gate.
+ */
+const pythonSources = ['cmd/proxy.py']
+const shellSources = ['cmd/main', 'cmd/install_callback', 'cmd/upgrade_init', 'cmd/upgrade_callback',
+  'cmd/config_init', 'cmd/config_callback', 'cmd/uninstall_init', 'cmd/uninstall_callback']
+
+for (const source of shellSources) {
+  if (!existsSync(join(ROOT, source))) continue
+  try {
+    execFileSync('bash', ['-n', join(ROOT, source)], { stdio: 'pipe' })
+  } catch (error) {
+    const stderr = String(error.stderr ?? error.message)
+    // Same Windows collision as the JS checks above: the spawn itself failed,
+    // so nothing was actually parsed and there is no syntax verdict to report.
+    if (/EBUSY|ENOENT|EPERM|EACCES/.test(stderr) && !/syntax error/i.test(stderr)) {
+      console.warn(`SKIP    ${source} (${stderr.split('\n')[0].trim()})`)
+      continue
+    }
+    failures += 1
+    console.error(`SHELL   ${source}`)
+    console.error(`        ${stderr.trim().split('\n')[0]}`)
+  }
+}
+
+/* Prefer an explicitly provided interpreter, then PATH, then the common
+ * absolute locations. A Python-based WorkBuddy runtime is not on PATH, and
+ * silently skipping the check is exactly how the proxy bug survived. */
+const pythonCandidates = [
+  process.env.PYTHON,
+  'python3',
+  'python',
+  '/usr/bin/python3',
+  'C:/Users/zhushichuan/.workbuddy/binaries/python/versions/3.13.12/python.exe',
+].filter(Boolean)
+const pythonBin = pythonCandidates.find((bin) => {
+  try {
+    execFileSync(bin, ['--version'], { stdio: 'pipe' })
+    return true
+  } catch (error) {
+    // This environment cannot spawn non-node binaries from Node (EBUSY on
+    // Windows). That is an environment limit, not a missing interpreter, and it
+    // must not turn the gate red — nor silently pass as "checked and fine".
+    const message = String(error.stderr ?? error.message)
+    if (!/EBUSY|ENOENT|EPERM|EACCES/.test(message)) throw error
+    return false
+  }
+})
+if (pythonBin) {
+  for (const source of pythonSources) {
+    const absolute = join(ROOT, source)
+    if (!existsSync(absolute)) continue
+    try {
+      // Compile to bytecode without writing a __pycache__ next to the source.
+      execFileSync(pythonBin, ['-c', `import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)`,
+        absolute, join(tmpdir(), 'fnos-dsh-manager-proxy.pyc')], { stdio: 'pipe' })
+    } catch (error) {
+      failures += 1
+      console.error(`PYTHON  ${source}`)
+      console.error(`        ${String(error.stderr ?? error.message).trim().split('\n').slice(0, 3).join('\n        ')}`)
+    }
+  }
+} else {
+  console.warn('SKIP    python syntax (no python3/python found; set PYTHON= to enable)')
 }
 
 console.log(`\n${targets.length} parsed, ${imported} imported, ${failures} failure(s)`)
