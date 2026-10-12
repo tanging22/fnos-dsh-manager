@@ -23,7 +23,6 @@ import {
   MANIFEST,
   activeDshHome,
   bestNodeBin,
-  lanAddresses,
   readManifest,
 } from './dashboard-utils.js'
 
@@ -70,7 +69,6 @@ export function trustedConfPath() {
   return homePath('trusted_hosts.conf')
 }
 export const VERSIONS_DIR = join(DATA_DIR, 'versions')
-export const LOGS_DIR = join(DATA_DIR, 'logs')
 export const CONSOLE_LOG = join(DATA_DIR, 'console.log')
 
 /** Upstream npm package this panel installs and switches between. */
@@ -121,7 +119,7 @@ let configCache = null
  * The installer used to write a commented `console-config.json`. That file is
  * not valid JSON, and `loadConfig()` caught the parse error and fell back to
  * DEFAULTS — so every setting the user chose at install time (LAN binding, npm
- * proxy, shortcuts) silently vanished with nothing in the log. Rather than keep
+ * proxy) silently vanished with nothing in the log. Rather than keep
  * forbidding comments at the writer, accept them here too: a hand-edited config
  * with a comment is a normal thing for an operator to leave behind, and losing
  * their settings to it is worse than tolerating the syntax.
@@ -459,9 +457,10 @@ export function dshLaunch() {
  * two prereleases compare identifier-by-identifier (numeric identifiers sort
  * below alphanumeric ones, which is what makes `alpha.N` < `rc.N` < release).
  *
- * Needed because dsh's own `webserver.host` schema changed mid-flight, so the
- * panel has to know which side of that line the active install sits on; see
- * supportsConcreteHost() and the note above webserverPatchPath().
+ * Needed for the version list and switching: dsh releases ship prereleases
+ * (alpha/rc) alongside releases, and a plain string compare would sort
+ * `0.2.1-rc.1` ABOVE `0.2.1`, making the newest build look like an upgrade to
+ * an older one.
  */
 export function compareVersions(a, b) {
   const parse = (value) => {
@@ -505,27 +504,6 @@ export function activeDshVersion() {
   const root = dshRoot()
   if (!root) return null
   return versionOfDir(root)
-}
-
-/**
- * Does this dsh accept a concrete NIC address as `webserver.host`?
- *
- * dsh 0.2.1-alpha.2 flipped the schema from
- *     `z.union([z.const("127.0.0.1"), z.const("0.0.0.0")])`
- * to a transform that REJECTS wildcard addresses and demands one literal IP.
- * The two schemas are disjoint, so a patch written for one crashes the other
- * at plugin activation ("2 required plugins did not activate").
- *
- * Unknown versions assume the OLD schema (the whole published history before
- * 0.2.1-alpha.2 uses it), which is the safe default.
- */
-export function supportsConcreteHost(version = activeDshVersion()) {
-  if (!version) return false
-  try {
-    return compareVersions(version, '0.2.1-alpha.2') >= 0
-  } catch {
-    return false
-  }
 }
 
 /** IPv4 port the managed dsh instance is expected to be serving. */
@@ -646,132 +624,22 @@ export function patchHostOf(text) {
 }
 
 /**
- * Concrete literal IP for dsh's `webserver.host`, never a wildcard.
- *
- *      config.lanBind      meaning
- *      ------------------  --------------------------------------------------
- *      `false`             loopback only; dsh gets no patch at all
- *      `''` / unset        auto: newest first non-internal IPv4, else loopback
- *      `'10.0.0.5'`        that NIC, as long as the box still owns the address
- *
- *  - **`lanBind` is tri-state and truthiness is a trap.** Older configs and the
- *    installer seed `lanBind: true`, and shell-driven environments ship it as a
- *    *string*: `preferredPatchHost()` therefore resolves `false`/`'false'` to
- *    loopback, `''`/unset/`'true'` to auto, and a concrete literal IP to that
- *    NIC if the box still owns it.
- *  - A pinned address that has since disappeared (NIC unplugged, DHCP moved,
- *    VLAN renumbered) silently degrades to auto rather than writing an IP that
- *    would later fail with `EADDRNOTAVAIL` — dsh validates the *schema* eagerly
- *    but only discovers a dead address at `listen()`.
- */
-/**
- * Whether the operator asked dsh to bind a LAN address directly.
- *
- * Only honoured on dsh builds whose schema accepts a concrete literal IP
- * (`>= 0.2.1-alpha.2`); on older builds a direct-bind request would be
- * downgraded to loopback here rather than crash startup with the disjoint
- * `$.host expected "127.0.0.1" | "0.0.0.0"` validation error.
- *
- * `lanBind` is tri-state: `false`/`'false'` = loopback, `''`/unset/`'true'` =
- * auto, a concrete literal IP = pin that NIC. Shell- and UI-driven configs
- * arrive as strings, so the string forms are honoured as the values they mean.
- */
-export function bindLanDirect(configured = loadConfig().lanBind) {
-  if (configured === false || configured === 'false') return false
-  // Direct binding is opt-in only, and only via a concrete NIC address. The
-  // bare `true`/`''`/unset forms all mean "stay on loopback" now, because
-  // there is no LAN value that every dsh release accepts; see the note above
-  // webserverPatchPath().
-  if (typeof configured === 'string' && configured.trim()) {
-    if (lanAddresses().includes(configured.trim())) return supportsConcreteHost()
-  }
-  return false
-}
-
-export function preferredPatchHost() {
-  const configured = loadConfig().lanBind
-  // Cheap AB test fixtures pass `lanBind` through the shell, where everything
-  // arrives as a string — so "false" has to be honoured as the boolean it means,
-  // not read as an address nobody owns.
-  if (configured === false || configured === 'false') return '127.0.0.1'
-  const lan = lanAddresses()
-
-  // dsh's `webserver.host` schema is DISJOINT across releases and there is no
-  // single LAN value that satisfies both sides:
-  //   <= 0.2.1-alpha.1 : z.union([z.const("127.0.0.1"), z.const("0.0.0.0")])
-  //   >= 0.2.1-alpha.2 : concrete IP literal; wildcards rejected outright
-  //
-  // Only 127.0.0.1 is accepted by EVERY published release, so the patch pins it
-  // unconditionally: dsh stays loopback-only and LAN clients reach it through
-  // this panel's reverse proxy (28001 `/p/` and the dedicated 28002 LAN port).
-  // bindLanDirect is retained so an operator can still opt into a direct bind on
-  // alpha.2-class builds only.
-  if (!bindLanDirect(configured)) return '127.0.0.1'
-
-  if (typeof configured === 'string' && configured.trim() && !['0.0.0.0', '::', 'true'].includes(configured.trim())) {
-    if (lan.includes(configured.trim())) return configured.trim()
-  }
-  return lan[0] || '127.0.0.1'
-}
-
-/**
  * The address dsh actually listens on, i.e. what anything dialling it must use.
  *
- * The written patch file wins because it is what a *running* dsh was launched
- * with; recomputing from the config would let the proxy dial loopback while dsh
- * sits bound to the LAN IP (it binds one address only, and stops answering
- * loopback the moment it does).
+ * dsh 永远只绑定自己的回环默认值：它各版本 `webserver.host` 的 schema 互不相交
+ * （<=0.2.1-alpha.1 只收 "127.0.0.1"|"0.0.0.0"，>=0.2.1-alpha.2 只收具体 IP
+ * 字面量并直接拒通配），向它的 profile 写任何 LAN 覆盖都会在换版本时变成必须
+ * 手工迁移的遗留物。所以面板不再写这个覆盖，局域网一律走面板自己的反代入口
+ * （:28001 的 `/p/` 与 :28000 直连口）。
  *
- * No patch means no override, and dsh's own default is loopback — so the
- * fallback here is loopback too. Falling back to *preferredPatchHost()* instead
- * would dial a LAN address nobody owns whenever the patch has been cleared (LAN
- * off) or dsh was launched outside this panel, which is exactly the
- * dsh-unreachable regression this function exists to prevent.
+ * 这里只读**历史版本可能留下**的 patch 文件：若那份遗留覆盖仍在，dsh 就是按
+ * 它启动的，必须照它去拨，否则会出现"面板拨回环、dsh 却绑在 LAN IP 上"的
+ * dsh-unreachable。没有 patch 就是没有覆盖，回环即正确答案。
  */
 export function webserverHost() {
   const written = patchHostOf(readWebserverPatch())
   if (written) return written
   return '127.0.0.1'
-}
-
-/**
- * Rewrite the whole `- id: webserver` block with `host`/`port`, creating the
- * file's first block when absent. Returns the resulting text so callers can log
- * what changed.
- *
- * Why whole-block rather than the old line surgery: an existing file written by
- * v1.0.2 is already invalid YAML (4-space `config:` under a 2-space dash), and
- * editing *that* keeps it invalid — the sequence item's mapping never realigns.
- * Replacing the block also makes the call idempotent, which matters because it
- * runs before every single start.
- */
-export function writeWebserverPatch({ host = preferredPatchHost(), port = managedPort() } = {}) {
-  const path = webserverPatchPath()
-  mkdirSync(dirname(path), { recursive: true })
-  const current = readWebserverPatch() ?? ''
-
-  const lines = current.split(/\r?\n/)
-  const kept = []
-  let skipping = false
-  for (const line of lines) {
-    if (/^- id:\s*webserver\s*$/.test(line)) { skipping = true; continue }
-    if (skipping && (/^\s*-\s/.test(line) || /^-\s/.test(line))) skipping = false
-    if (skipping) continue
-    kept.push(line)
-  }
-
-  // Sequence-item keys align with `id` above: `config:` at 2, its leaves at 4.
-  // PORT quoting matters: schema wants a number, and a string fails validation.
-  const block = [
-    '- id: webserver',
-    '  config:',
-    `    host: ${JSON.stringify(host)}`,
-    `    port: ${Number(port)}`,
-  ]
-  const body = kept.join('\n').replace(/\n+$/, '')
-  const text = `${body ? `${body}\n` : ''}${block.join('\n')}\n`
-  writeFileSync(path, text, 'utf8')
-  return text
 }
 
 /**

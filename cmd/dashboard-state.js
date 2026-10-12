@@ -82,13 +82,6 @@ function logState(oldStatus, status, msg) {
   }
 }
 
-export function SetTargetVersion(tv) {
-  if (state.targetVersion !== tv) {
-    state.targetVersion = tv
-    notify()
-  }
-}
-
 export function GetStatus() {
   return state.status
 }
@@ -116,11 +109,6 @@ export function SubscribeState(fn) {
   return () => {
     subscribers.delete(fn)
   }
-}
-
-/** 手动触发一次广播（状态未变但需刷新订阅者的场合，如端口探测完成）。 */
-export function Poke() {
-  notify()
 }
 
 // ---------------------------------------------------------------------------

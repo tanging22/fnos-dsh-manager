@@ -138,11 +138,6 @@ export function discoverNodeBins() {
   return value
 }
 
-/** Force the next discoverNodeBins() to re-scan (after installing nodejs). */
-export function invalidateNodeScan() {
-  nodeScanCache = { at: 0, value: [] }
-}
-
 /**
  * The best node to run dsh under: the newest version the box offers, or the
  * panel's own node when nothing else is found. dsh needs a recent Node (its
@@ -270,31 +265,6 @@ export function cleanLine(raw) {
   return String(raw ?? '').replace(ANSI, '').replace(/\r+$/, '')
 }
 
-/** `0.2.0-rc.2.5` sorts above `0.2.0-rc.2` and above `0.2.0-rc.2.4`. */
-export function compareVersions(a, b) {
-  const norm = (v) => String(v ?? '')
-    .replace(/^v/, '')
-    .split(/[.+-]/)
-    .filter(Boolean)
-  const ax = norm(a)
-  const bx = norm(b)
-  for (let i = 0; i < Math.max(ax.length, bx.length); i += 1) {
-    const x = ax[i]
-    const y = bx[i]
-    if (x === undefined) return -1
-    if (y === undefined) return 1
-    const nx = Number(x)
-    const ny = Number(y)
-    const numeric = Number.isFinite(nx) && Number.isFinite(ny)
-    if (numeric) {
-      if (nx !== ny) return nx < ny ? -1 : 1
-    } else if (x !== y) {
-      return x < y ? -1 : 1
-    }
-  }
-  return 0
-}
-
 /**
  * Read `key = value` / `key=value` / `key value` from an fnOS manifest.
  *
@@ -326,10 +296,6 @@ export function readManifest(path = MANIFEST) {
   return out
 }
 readManifest.warned = false
-
-export function shellQuote(value) {
-  return `'${String(value).replace(/'/g, `'"'"'`)}'`
-}
 
 /**
  * Run a command without a shell: no quoting traps and no shell-startup cost.
@@ -518,11 +484,6 @@ export function lanAddresses() {
   return lanCache.value
 }
 
-/** Force the next lanAddresses() to re-read the interfaces. */
-export function invalidateLanCache() {
-  lanCache = { at: 0, value: [] }
-}
-
 /** Lower sorts first: real hardware ahead of virtual/tunnel adapters. */
 function nicRank(entry) {
   const mac = (entry.mac || '').toLowerCase()
@@ -550,11 +511,6 @@ function maskPrefix(netmask) {
 
 export function localHost() {
   return hostname()
-}
-
-/** Join a base URL and a path without producing a double slash. */
-export function joinUrl(base, path) {
-  return `${String(base).replace(/\/+$/, '')}/${String(path).replace(/^\/+/, '')}`
 }
 
 export { dirname, existsSync, readFileSync, resolve }

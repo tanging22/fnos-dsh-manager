@@ -105,21 +105,22 @@ export function localTime(iso) {
   return Number.isFinite(date.getTime()) ? date.toLocaleString() : String(iso)
 }
 
-/** Escape a value that will appear inside an HTML attribute. */
-export function attr(value) {
-  return esc(value)
-}
-
 /**
  * Open a reconnecting WebSocket to the panel's `/ws` push channel and hand
  * parsed JSON events to `onEvent`. Returns a close() that tears it down.
  * Falls back silently when WS is unavailable (older fnOS gateway) — the
  * existing poll keeps the UI correct in that case.
+ *
+ * `onState(connected)` fires on every open/close. Callers need it because the
+ * server pushes `usage` every second: while the push channel is live, an HTTP
+ * poll of the same numbers is duplicate traffic, and the poll must resume the
+ * moment the channel drops. See overview.js's usage timer.
  */
-export function ws(onEvent) {
+export function ws(onEvent, onState) {
   let socket = null
   let closed = false
   let timer = null
+  const report = (connected) => { try { onState?.(connected) } catch { /* ignore */ } }
 
   const connect = () => {
     if (closed) return
@@ -130,10 +131,12 @@ export function ws(onEvent) {
     } catch {
       return
     }
+    socket.onopen = () => report(true)
     socket.onmessage = (event) => {
       try { onEvent(JSON.parse(event.data)) } catch { /* ignore malformed frame */ }
     }
     socket.onclose = () => {
+      report(false)
       if (closed) return
       timer = setTimeout(connect, 2000)
     }
@@ -155,8 +158,3 @@ export function on(target, event, handler) {
   return () => target.removeEventListener(event, handler)
 }
 
-/** True when the panel is being reached through something other than loopback. */
-export function isRemote() {
-  const host = window.location.hostname
-  return host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]'
-}

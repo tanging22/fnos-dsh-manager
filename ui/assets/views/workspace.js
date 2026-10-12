@@ -1,76 +1,60 @@
 /**
  * 工作区：列出 dsh 的工作区（标题/路径/会话数/时间），支持「打开文件夹」（调 fnOS
- * 文件管理器 SDK）、复制路径与只读浏览目录。对齐 Go 版 Workspace.vue。
+ * 文件管理器）、复制路径与只读浏览目录。对齐 Go 版 Workspace.vue。
  *
- * 「打开文件夹」走 fnOS 网关注入的 `trimSdk.openFileManager(path)`（Go 版同款），
- * 非网关环境（如直连 :28001）或 SDK 缺失时回退到复制路径。
+ * 「打开文件夹」就一行：宿主注入的全局 SDK 调 `openFileManager(path)`。
+ * 见下面 openFileManager() 的说明。
  */
 
 import { api, esc, toast, bytes, localTime, timeAgo, url } from '../dom.js'
 
-/**
- * 调 fnOS 文件管理器打开一个目录。SDK 只能从网关 iframe 的父窗口拿，所以沿
- * parent 链往上找 —— fnOS 在不同版本/不同嵌套深度下注入 `window.trimSdk` 的
- * 位置并不一致，只查 `window.trimSdk || window.parent.trimSdk` 在多一层 iframe
- * 时就找不到。
- *
- * 返回 `{ ok, reason }`。旧签名只回 true/false，"打不开"和"为什么打不开"混成
- * 一个结果，用户只能看到一句笼统的"不可用"。区分出原因才有可操作的建议：
- *
- *   not-embedded  面板不是嵌在 fnOS 里打开的（直连 :28001/:28000 端口）。
- *                 网关没参与，自然没人注入 trimSdk —— 这是最常见的情形。
- *   cross-origin  嵌在 iframe 里，但父窗口跨域，读 `parent.trimSdk` 直接抛
- *                 SecurityError（浏览器不允许跨源读属性）。面板与网关不同端口
- *                 时必踩，且旧实现把异常吞掉后继续上溯，看起来像"没找到 SDK"。
- *   sdk-missing   能访问父窗口，但整条链上都没有 trimSdk（该版本 fnOS 未注入，
- *                 或页面是独立标签页打开的）。
- *   sdk-threw     SDK 在、调用却抛错（典型是路径不在文件管理器可见的目录树里，
- *                 例如套件私有数据目录下的工作区）。
- */
-function openFileManager(path) {
-  let scope = window
-  let embedded = false
-  let sawCrossOrigin = false
-  let lastError = ''
-  for (let depth = 0; scope && depth < 6; depth += 1) {
-    let sdk = null
-    try {
-      sdk = scope.trimSdk
-      if (window.top !== window.self) embedded = true
-    } catch {
-      // 跨域父窗口：读属性即 SecurityError，连 `sdk` 都拿不到。
-      sawCrossOrigin = true
-      embedded = true
-    }
-    if (sdk && typeof sdk.openFileManager === 'function') {
-      try {
-        sdk.openFileManager(path)
-        return { ok: true, reason: '' }
-      } catch (error) {
-        lastError = error?.message ?? String(error)
-      }
-    }
-    if (scope.parent === scope) break
-    scope = scope.parent
-  }
-  if (lastError) return { ok: false, reason: `sdk-threw: ${lastError}` }
-  if (!embedded) return { ok: false, reason: 'not-embedded' }
-  if (sawCrossOrigin) return { ok: false, reason: 'cross-origin' }
-  return { ok: false, reason: 'sdk-missing' }
+/** 宿主（fnOS 应用中心）挂到页面 window 上的能力对象。取不到就是没在宿主里。 */
+function hostSdk() {
+  return window.trimSdk || window.fnSdk || window.sdk || null
 }
 
-/** 把打不开的原因翻成人能执行的下一步。 */
+/** 给任意 Promise 套硬超时：宿主不回应时不让按钮一直转圈。 */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label}超时（${ms}ms）`)), ms)
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error) => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+/**
+ * 调 fnOS 文件管理器打开一个目录：
+ *
+ *   const sdk = window.trimSdk || window.fnSdk || window.sdk
+ *   await sdk.openFileManager(path)
+ *
+ * 两个必须守住的点是过去"点了没反应"的病根：
+ *   1. 必须 await。SDK 方法返回 Promise；旧代码调完立刻 return true，失败只变成
+ *      控制台里一条 unhandled rejection，UI 却弹「已交给文件管理器打开」——
+ *      提示成功、什么都没发生。
+ *   2. 拿到的是不是真能用的对象要判断，不是 const 出来就直接用。
+ */
+async function openFileManager(path) {
+  const sdk = hostSdk()
+  if (!sdk) return { ok: false, reason: 'no-sdk' }
+  if (typeof sdk.openFileManager !== 'function') return { ok: false, reason: 'no-method' }
+  try {
+    await withTimeout(sdk.openFileManager(path), 8000, '文件管理器')
+    return { ok: true, reason: '' }
+  } catch (error) {
+    const message = String(error?.message ?? error)
+    return { ok: false, reason: /超时/.test(message) ? 'timeout' : `rejected: ${message}` }
+  }
+}
+
+/** 打不开时告诉用户下一步该做什么。 */
 function fileManagerHint(reason) {
-  if (reason === 'not-embedded') {
-    return '当前不是从 fnOS 应用中心里打开的面板（直连面板端口），网关不会注入文件管理器 SDK。请从 fnOS 应用中心进入本套件再点。'
-  }
-  if (reason === 'cross-origin') {
-    return '面板与网关不同源，浏览器禁止跨 iframe 调用文件管理器。请从 fnOS 应用中心进入本套件再点。'
-  }
-  if (reason.startsWith('sdk-threw')) {
-    return '文件管理器拒绝了这个路径：多半是工作区在套件私有数据目录里，不在文件管理器可见的共享目录树内。'
-  }
-  return '当前环境没有 fnOS 文件管理器 SDK 可用。请从 fnOS 应用中心进入本套件再点。'
+  if (reason === 'no-sdk') return '当前页面没有宿主 SDK（window.trimSdk / fnSdk / sdk 都拿不到）。请从 fnOS 应用中心进入本套件，URL 形如 /app/fnos-dsh-manager/。'
+  if (reason === 'no-method') return '宿主 SDK 上没有 openFileManager 方法，可能是旧版宿主。'
+  if (reason === 'timeout') return '调用超时，宿主没回应。请确认是从 fnOS 应用中心进入本套件。'
+  return `宿主拒绝了这个目录（${reason.slice('rejected: '.length)}）：该路径多半还没授权给本套件。`
 }
 
 export async function render(host, ctx) {
@@ -110,7 +94,7 @@ export async function render(host, ctx) {
         <div class="row"><span class="k">更新</span><span class="v">${item.updatedAt ? timeAgo(item.updatedAt) : '—'}</span></div>
         <div class="row"><span class="k">创建</span><span class="v">${item.createdAt ? localTime(item.createdAt) : '—'}</span></div>
         <div class="btn-row">
-          ${path ? `<button class="btn btn-primary" data-open="${esc(path)}">打开文件夹</button>` : ''}
+          ${path ? `<button class="btn btn-primary" data-open="${esc(path)}" title="调 fnOS 文件管理器打开这个目录">打开文件夹</button>` : ''}
           ${path ? `<button class="btn" data-browse="${esc(path)}">浏览目录</button>` : ''}
           ${path ? `<button class="btn btn-ghost" data-copy="${esc(path)}">复制路径</button>` : ''}
         </div>
@@ -143,11 +127,24 @@ export async function render(host, ctx) {
   })
 
   host.querySelectorAll('[data-open]').forEach((button) => {
-    button.addEventListener('click', () => {
+    button.addEventListener('click', async () => {
       const path = button.dataset.open
-      const result = openFileManager(path)
+      // 握手最多 5 秒、调用上限 8 秒，期间必须给出「在做事」的状态，否则
+      // 用户只会以为按钮没反应。
+      const label = button.textContent
+      button.disabled = true
+      button.textContent = '调用中…'
+      let result
+      try {
+        result = await openFileManager(path)
+      } catch (error) {
+        result = { ok: false, reason: `host-rejected: ${error?.message ?? error}` }
+      } finally {
+        button.disabled = false
+        button.textContent = label
+      }
       if (result.ok) {
-        toast('已交给 fnOS 文件管理器打开', 'ok')
+        toast('已打开文件管理器', 'ok')
         return
       }
       // 打不开就说清楚是哪一种打不开，否则只剩一句"不可用"，无法判断该做什么。

@@ -685,9 +685,10 @@ async function pythonBin() {
    * exponentially — measured at 20-29 requests/second against a designed 1/3s.
    */
   const overviewJs = await (await fetch(`${base}/assets/views/overview.js`)).text()
-  const usageAnchor = overviewJs.indexOf('startUsageTimer(host)')
+  const domJsText = await (await fetch(`${base}/assets/dom.js`)).text()
+  const usageAnchor = overviewJs.indexOf('startUsageTimer(host, ctx)')
   check('the overview view creates its usage timer synchronously',
-    usageAnchor !== -1, 'overview.js no longer uses startUsageTimer(host)')
+    usageAnchor !== -1, 'overview.js no longer calls startUsageTimer(host, ctx)')
   const beforeAwait = (() => {
     const decl = overviewJs.indexOf('function startUsageTimer(')
     if (decl === -1 || usageAnchor === -1) return false
@@ -706,6 +707,31 @@ async function pythonBin() {
   check('the usage cleanup also guards writes after the request',
     /let stopped = false/.test(overviewJs) && /if \(stopped\) return/.test(overviewJs),
     'overview.js has no stopped guard — a late response can write into a torn-down view')
+
+  /* --- the usage poller must not duplicate the push channel ---------------
+   *
+   * The server samples the dsh process tree every second and pushes it
+   * (dashboard-usage.js StartUsageSampler). Polling /api/usage on top of that
+   * requests the same two numbers over HTTP 20x a minute for nothing, and every
+   * full re-render used to restart the timer with an immediate sample on top.
+   * The poll is now a fallback that only runs while the push channel is down.
+   */
+  check('the usage poller stands down while the push channel is live',
+    /if \(!ctx\.pushLive\(\)\)/.test(overviewJs),
+    'overview.js polls /api/usage unconditionally — it duplicates the per-second usage push')
+  check('the 15s safety-net re-render only runs when the push channel is down',
+    /if \(pushLive\) return[\s\S]{0,120}renderTab\(\)/.test(appJsText),
+    'app.js re-renders every 15s even when pushes are arriving')
+  check('a visit event no longer triggers a full re-render',
+    /event\.type === 'visit'\) \{\s*applyVisit\(event\)/.test(appJsText)
+      && !/scheduleSoftRefresh/.test(appJsText),
+    'app.js still re-renders the whole view on every proxied request (visit)')
+  check('the visit cell the push updates is the one the view renders',
+    /data-visit-ip/.test(overviewJs) && /\[data-visit-ip\]/.test(appJsText),
+    'the pushed visit IP has no matching element in overview.js')
+  check('the push channel reports its connection state',
+    /export function ws\(onEvent, onState\)/.test(domJsText) && /onState\?\.\(connected\)/.test(domJsText),
+    'dom.js ws() does not report open/close, so callers cannot degrade the poll')
 
   /* The second half of the fix: serialise renderTab() itself. Even with a
    * synchronously-created timer, two overlapping renders would still each

@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.0.43 - 2026-10-12
+
+### 修复
+
+- **工作区「打开文件夹」点了没反应 / 提示了却没打开**：改用宿主注入到页面的全局能力（`window.trimSdk || window.fnSdk || window.sdk`）调 `openFileManager(path)`。旧实现调完不 `await` 宿主的 Promise，失败只变成控制台里一条 unhandled rejection，UI 却弹「已交给 fnOS 文件管理器打开」——提示成功、什么都没发生。同时按 `typeof openFileManager !== 'function'` 判一次能力是否真的可用。
+- **`/api/usage` 被高频请求**（网关地址下尤其明显）：三个源头在叠加——概览页硬编码 3s 轮询、全局 15s 兜底整页重渲（每次重渲都会重建轮询定时器并**立即多打一发**）、每个代理请求的 `visit` 事件也触发整页重渲。而服务端本来就每秒推一帧 usage，前端收到后是直接写 DOM 的，轮询纯属重复。
+  - 轮询改为**只在推送断开时运行**（每次 tick 重查连接状态，降级自愈，通道一恢复就自动停）；
+  - 15s 兜底重渲加连接状态约束，推送通着时不再跑；
+  - `visit` 从「整页重渲」降为「只改最近访问那一行文本」。
+  - 净效果：24+ 次/分钟 → 推送正常时 **0 次**；WS 被网关剥掉时自动降级回 3s 一次。
+- **「最近访问」在还没有任何记录时是空的**：那条 `暂无访问记录` 分支让首条 visit 推送没有元素可写。现恒渲染 IP 单元格。
+
+### 瘦身
+
+- 删除 vendor 的 `@trimjs/web-app`（约 40KB）与授权回调页 `callback.html`，项目**重回零第三方代码**（`package.json` 无依赖、仓库无 `node_modules`，打包流程本就按零依赖设计）。
+- 死代码清理 **-202 行**：删除 LAN 直绑死链（`supportsConcreteHost` / `bindLanDirect` / `preferredPatchHost` / `writeWebserverPatch`）、无用的 `shellQuote` / `joinUrl` / `invalidateNodeScan` / `invalidateLanCache`、**一份重复且排序有 bug 的 `compareVersions`**（`split(/[.+-]/)` 丢预发布语义，会把 rc 排到正式版前面）、`SetTargetVersion` / `Poke`、`webSocketClientCount`、前端 `attr` / `isRemote`。
+
+### 门禁
+
+- check 28/15/0，smoke **110/110**（新增 5 条断言：推送在线时不轮询、15s 兜底受连接状态约束、visit 不整页重渲、visit 单元格两端对齐、`ws()` 上报连接状态）。
+
 ## v1.0.42 - 2026-10-12
 
 ### 新增

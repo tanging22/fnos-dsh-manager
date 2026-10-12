@@ -84,6 +84,10 @@ const ctx = {
   onLeave(fn) {
     leavers.push(fn)
   },
+  /** 推送通道当前是否在线。视图用它决定要不要降级轮询。 */
+  pushLive() {
+    return pushLive
+  },
 }
 
 function applyPill(status) {
@@ -109,7 +113,7 @@ function applyPill(status) {
   }
 }
 
-// A push event (WS status/visit/access) can re-enter renderTab() while an
+// A push event (WS status/usage/visit) can re-enter renderTab() while an
 // earlier call is still awaiting its view. Serialising the whole body keeps a
 // slow render from being torn down by the next one, so each view registers
 // exactly one cleanup — otherwise its pollers accumulate without bound (see
@@ -175,32 +179,36 @@ document.getElementById('refresh')?.addEventListener('click', () => {
   toast('已刷新')
 })
 
+// Real-time push channel: replaces the 15s poll with server-driven updates.
+// Status/usage/visit events re-render the active view; a status event also
+// refreshes the header pill. `pushLive` tracks whether the channel is actually
+// up — the 15s safety net below only runs while it is down, because with the
+// push channel up every field it would refresh is already being pushed.
+//
+// visit 是高频事件（一次代理请求就推一条）。它只影响「最近访问」那一个字段，
+// 所以只改那一行文本,不再整页重渲 —— 整页重渲会重建概览页的 3s 轮询定时器,
+// 实测把 /api/usage 从每 3s 一次抬到每秒多次。
+let pushLive = false
+
 setInterval(() => {
+  if (pushLive) return
   if (state.tab === 'overview' && isPanelVisible()) renderTab()
 }, 15000)
 
-// Real-time push channel: replaces the 15s poll with server-driven updates.
-// Status/access/visit events re-render the active view; a status event also
-// refreshes the header pill. The interval above stays as a safety net for when
-// the gateway strips WS upgrades (then push silently no-ops and poll carries).
-//
-// visit/access 是高频事件（一次代理请求就推一条）, 若每条都触发整页 renderTab,
-// 突发流量会瞬间排队一长串重渲。这里做 800ms 尾沿去抖: 只在事件停歇后渲一次。
-let visitDebounce = null
-function scheduleSoftRefresh() {
-  if (visitDebounce) clearTimeout(visitDebounce)
-  visitDebounce = setTimeout(() => {
-    visitDebounce = null
-    if (state.tab === 'overview') renderTab()
-  }, 800)
+/** 只刷新「最近访问」的来源 IP，不重渲整页。 */
+function applyVisit(event) {
+  if (state.tab !== 'overview') return
+  const cell = document.querySelector('[data-visit-ip]')
+  if (cell) cell.textContent = event?.ip || '—'
 }
+
 const closeWs = ws((event) => {
   if (!isPanelVisible()) return
   if (event.type === 'status') {
     applyPill(event)
     if (state.tab === 'overview') renderTab()
   } else if (event.type === 'usage') {
-    // dsh 进程树资源推送：直接写 5 列指标网格的 #m-cpu / #m-mem，与 3s 轮询渲染一致。
+    // dsh 进程树资源推送：直接写 5 列指标网格的 #m-cpu / #m-mem，与轮询渲染一致。
     if (state.tab === 'overview') {
       const cpuEl = document.getElementById('m-cpu')
       const memEl = document.getElementById('m-mem')
@@ -208,8 +216,13 @@ const closeWs = ws((event) => {
       if (memEl) memEl.textContent = event.memory ?? '-'
     }
   } else if (event.type === 'visit') {
-    scheduleSoftRefresh()
+    applyVisit(event)
   }
+}, (connected) => {
+  const was = pushLive
+  pushLive = connected
+  // 通道刚恢复时补一次全量：断线期间的状态变化只有 HTTP 能拿到。
+  if (connected && !was && isPanelVisible()) renderTab()
 })
 window.addEventListener('beforeunload', closeWs)
 

@@ -1,10 +1,11 @@
 /**
- * The panel's HTTP surface: its own REST API, its static UI, and a reverse
- * proxy in front of dsh that doubles as the visitor recorder.
+ * The panel's HTTP surface: its own REST API, its static UI, and the reverse
+ * proxy in front of dsh.
  *
- * Why a proxy at all: dsh keeps no access records, so "who visited recently"
- * has to be observed somewhere. Routing the entry through here means every hit
- * is attributable while adding nothing to dsh itself. See dashboard-access.js.
+ * Why a proxy at all: dsh binds its own loopback only, so nothing but this
+ * process can reach it. Every outside entry (the /p/ prefix here, and the
+ * dedicated LAN port) is a pass through this proxy, which is also where the
+ * panel injects the `dsh-auth-*` credential it holds on the browser's behalf.
  */
 
 import { createReadStream, existsSync, statSync, realpathSync } from 'node:fs'
@@ -68,7 +69,7 @@ let pluginJob = null
 
 /**
  * Connected WebSocket clients (raw sockets upgraded via `/ws`). Every client
- * receives the same push events, so status/log/access changes reach all open
+ * receives the same push events, so status/usage changes reach all open
  * panels without polling. Kept as plain sockets so no third-party ws lib is
  * needed — we speak the minimal RFC6455 handshake + unmasked text frames only.
  */
@@ -1446,7 +1447,7 @@ export function createConsoleServer() {
     }
   })
 
-  // WebSocket upgrade: `/ws` becomes a push channel for status/log/access.
+  // WebSocket upgrade: `/ws` becomes a push channel for status/usage/visit.
   // The trust fence applies here too — an untrusted Host can't open a socket.
   //
   // The whole handler is wrapped: an exception thrown inside an `upgrade`
@@ -1523,11 +1524,6 @@ export function closeAllWebSockets() {
     try { socket.destroy() } catch { /* ignore */ }
   }
   wsClients.clear()
-}
-
-/** How many push sockets are currently attached (diagnostics/tests). */
-export function webSocketClientCount() {
-  return wsClients.size
 }
 
 // `stripLoopbackLocation` 一并导出：它把 dsh 打印的回环地址改写成面板内可点开的

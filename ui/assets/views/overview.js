@@ -181,9 +181,7 @@ export async function render(host, ctx) {
       </div>
       <div class="card">
         <div class="card-head"><h3><span class="card-icon">👥</span>最近访问</h3></div>
-        ${status.recentVisit ? `
-          <div class="row"><span class="k">来源 IP</span><span class="v"><code>${esc(status.recentVisit.ip || '-')}</code></span></div>
-        ` : '<p class="empty">暂无访问记录</p>'}
+        <div class="row"><span class="k">来源 IP</span><span class="v"><code data-visit-ip>${esc(status.recentVisit?.ip || '-')}</code></span></div>
       </div>
       <div class="card">
         <div class="card-head"><h3><span class="card-icon">🔑</span>会话代持</h3>
@@ -235,32 +233,42 @@ export async function render(host, ctx) {
   //
   // 清理函数必须在任何 await 之前注册。renderTab() 的流程是
   // 「先 leavers.splice() 回收上一轮的清理函数，再 await module.render()」，
-  // 而 WS 推送（app.js 的 status/visit/access 事件）随时可能在这个 await
+  // 而 WS 推送（app.js 的 status/usage/visit 事件）随时可能在这个 await
   // 期间再次调用 renderTab()。若等 await 结束才注册，那一次并发渲染会把
   // 尚未入列的清理函数漏掉，于是每漏一个就永久多留一个 3s 定时器，
   // /api/usage 的请求量呈指数增长（实测每秒 20~29 次，正常应为每 3s 一次）。
-  const cleanupUsage = startUsageTimer(host)
+  const cleanupUsage = startUsageTimer(host, ctx)
   ctx.onLeave(() => { cleanupUsage() })
 }
 
 // dsh 进程树 CPU/内存采样：写入 5 列指标网格的 #m-cpu / #m-mem。
-// 同步返回清理函数，不再 await 首次采样——首次采样在后台触发即可。
-function startUsageTimer(host) {
+//
+// **推送在线时不轮询。** 服务端 SubscribeUsage 每秒推一帧（dashboard-usage.js
+// 的 StartUsageSampler），前端直接写这两个节点；此时再每 3s 拉一次
+// /api/usage 就是同一份数字的重复请求 —— 实测叠加上游的整页重渲后请求量
+// 远超设计的 1/3s。只有推送断开（老网关剥掉 WS 升级）才降级轮询，
+// 且降级是自愈的：ctx.pushLive() 每次 tick 都重查，通道一恢复就自动停。
+//
+// 同步返回清理函数，不 await 首次采样——首次采样在后台触发即可。
+function startUsageTimer(host, ctx) {
   let stopped = false
   const draw = async () => {
-    let usage
-    try {
-      usage = await api('/api/usage')
-    } catch {
-      usage = { cpu: '-', memory: '-' }
-    }
-    // 请求期间可能已被切走：此时 DOM 里已没有 #m-cpu/#m-mem，querySelector
-    // 自然返回 null，无需再判断，也不写任何已卸载节点。
     if (stopped) return
-    const cpuEl = host.querySelector('#m-cpu')
-    const memEl = host.querySelector('#m-mem')
-    if (cpuEl) cpuEl.textContent = usage.cpu ?? '-'
-    if (memEl) memEl.textContent = usage.memory ?? '-'
+    if (!ctx.pushLive()) {
+      let usage
+      try {
+        usage = await api('/api/usage')
+      } catch {
+        usage = { cpu: '-', memory: '-' }
+      }
+      // 请求期间可能已被切走：此时 DOM 里已没有 #m-cpu/#m-mem，querySelector
+      // 自然返回 null，无需再判断，也不写任何已卸载节点。
+      if (stopped) return
+      const cpuEl = host.querySelector('#m-cpu')
+      const memEl = host.querySelector('#m-mem')
+      if (cpuEl) cpuEl.textContent = usage.cpu ?? '-'
+      if (memEl) memEl.textContent = usage.memory ?? '-'
+    }
   }
   draw()
   const timer = setInterval(draw, 3000)
