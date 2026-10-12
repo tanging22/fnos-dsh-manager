@@ -60,9 +60,19 @@ export async function render(host, ctx) {
     ? (healthy ? PHASE_BADGE.running : PHASE_BADGE.starting)
     : PHASE_BADGE.stopped)
 
-  // 会话代持：面板必须持有 dsh 的登录凭据才能反代。缺失时（典型是 fnOS 升级
-  // 重启面板、dsh 却还活着）接口会 401、前端 WS 60 秒超时——这里直接告警。
+  // 会话代持：面板代替浏览器持有 dsh 登录凭据，反代请求由它注入 Cookie，用户不必
+  // 把 token 暴露在地址栏。缺凭据的典型现场是 fnOS 升级重启了面板、dsh 却还活着
+  // （不再打印 Launch Token）—— 此时反代 401、前端 WS 60 秒超时。
+  //
+  // 原本这是一张独立卡片，解释文字占掉大半个「面板信息」区。现在说明改为挂在按钮栏
+  // 两个状态项的 title 上（悬停可见），状态本身一眼就能看出颜色，不必再占位置。
   const sessionOk = Boolean(status.session?.cookie || status.session?.token)
+  const tokenHint = status.session?.token
+    ? 'dsh 启动时打印的 Launch Token，面板据此换出 dsh 登录 Cookie。'
+    : '未捕获到 Launch Token：dsh 只在启动那一刻打印一次。若反代 401、WebSocket 60 秒超时，请重启服务重新捕获。'
+  const cookieHint = sessionOk
+    ? '反代请求由面板注入这个 Cookie，你不必把 token 暴露在地址栏。'
+    : '缺少 dsh-auth Cookie：面板无法代持登录态，反代会 401、前端 WebSocket 将在 60 秒后超时。请重启服务重新捕获。'
 
   // dsh 最近一次启动打印的地址（`http://127.0.0.1:<port>/?token=…`）。
   //
@@ -157,16 +167,16 @@ export async function render(host, ctx) {
         <button class="btn" data-action="restart" type="button">🔄 重启服务</button>
         <button class="btn" data-action="open" data-open="/p/" type="button">🔗 打开面板入口</button>
         <button class="btn" data-action="open" data-open="/api/versions" type="button">📦 版本管理</button>
-        <span class="bar-divider" aria-hidden="true"></span>
-        <span class="bar-stat" title="dsh 启动时打印的 Launch Token，面板据此换 dsh 登录 Cookie">
+        <span class="bar-stat ${status.session?.token ? 'is-ok' : 'is-bad'}"
+              title="${esc(tokenHint)}">
           <span class="bar-stat-k">Launch Token</span>
-          <span class="bar-stat-v ${status.session?.token ? 'is-ok' : 'is-bad'}">${status.session?.token ? '已捕获' : '未捕获'}</span>
+          <span class="bar-stat-v">${status.session?.token ? '已捕获' : '未捕获'}</span>
         </span>
-        <span class="bar-stat" title="反代请求由面板注入这个 Cookie，你不必把 token 暴露在地址栏">
+        <span class="bar-stat ${status.session?.cookie ? 'is-ok' : 'is-bad'}"
+              title="${esc(cookieHint)}">
           <span class="bar-stat-k">dsh-auth</span>
-          <span class="bar-stat-v ${status.session?.cookie ? 'is-ok' : 'is-bad'}">${status.session?.cookie ? '已持有' : '缺失'}</span>
+          <span class="bar-stat-v">${status.session?.cookie ? '已持有' : '缺失'}</span>
         </span>
-        <span class="bar-divider" aria-hidden="true"></span>
         ${launchUrl
           ? `<button class="btn launch-btn" data-action="copy-launch" data-copy="${esc(launchUrl)}" type="button"
                title="点击复制：${esc(launchUrl)}${launchEntry ? `&#10;Shift+点击用面板域名打开同一地址（${esc(launchEntry)}）` : ''}">
@@ -203,12 +213,6 @@ export async function render(host, ctx) {
         <div class="row"><span class="k">地址</span><span class="v" title="${esc(visit.path || '-')}"><code data-visit-path>${esc(visit.path || '-')}</code></span></div>
         <div class="row"><span class="k">来源 IP</span><span class="v" title="${esc(visit.ip || '-')}"><code data-visit-ip>${esc(visit.ip || '-')}</code></span></div>
         <div class="row"><span class="k">客户端</span><span class="v" data-visit-agent title="${esc(visit.agent || '-')}">${esc(visit.agent || '-')}</span></div>
-      </div>
-      <div class="card">
-        <div class="card-head"><h3><span class="card-icon">🔑</span>会话代持</h3>
-          <span class="badge ${sessionOk ? 'badge-ok' : 'badge-warn'}">${sessionOk ? '已就绪' : '缺凭据'}</span></div>
-        <p class="muted">面板代替你的浏览器持有 dsh 登录态：反代请求由面板注入 Cookie，你不必把 token 暴露在地址栏。状态见上方按钮栏。</p>
-        ${sessionOk ? '' : '<p class="empty">面板手里没有 dsh 登录凭据，反代会 401、前端 WebSocket 将在 60 秒后超时。请重启 dsh 重新捕获（重启后新进程会重新打印 Launch Token）。</p>'}
       </div>
     </div>
   `

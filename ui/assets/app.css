@@ -338,7 +338,9 @@ html, body {
 .status-lamp.lamp-snapshotting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 .status-lamp.lamp-stopped { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 40%, transparent); }
 
-/* 运行控制按钮栏：融入状态卡底部（替代原 action-grid） */
+/* 运行控制按钮栏：融入状态卡底部（替代原 action-grid）。
+   栏内所有元素——按钮、状态项、启动地址——共用同一套盒模型（同内边距、同圆角、
+   同字号），任何一项单独偏离都会在一行里显得突兀。 */
 .action-bar {
   display: flex;
   flex-wrap: wrap;
@@ -378,15 +380,16 @@ html, body {
    地址很长且含 token，按钮必须能收缩到剩余空间内，所以：
    - 容器 flex:1 + min-width:0（允许收缩到内容宽度以下）
    - 地址 ellipsis 单行截断，而不是 word-break 换行把按钮撑成两行
-   - title 属性保留完整值，鼠标悬停可见 */
+   - title 属性保留完整值，鼠标悬停可见
+   盒模型与 .action-bar .btn 一致（9px/16px、13px、10px 圆角），只是宽度可变。 */
 .launch-btn {
   flex: 1 1 0;
   min-width: 0;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
-  font-size: 12px;
+  padding: 9px 16px;
+  font-size: 13px;
   border-radius: 10px;
   cursor: pointer;
   text-align: left;
@@ -406,29 +409,37 @@ html, body {
 .launch-btn:hover .launch-btn-v { color: var(--text); }
 .launch-btn.is-empty { cursor: default; opacity: 0.6; }
 
-/* 按钮栏里的状态项（会话代持两项）：不是按钮，只是和按钮同级的一行状态。
-   用 tag 而非 .btn，避免被读成可点的东西 —— 它们的 title 解释用途。 */
+/* 按钮栏里的状态项（会话代持两项）：与按钮同级的只读标签。
+   刻意不用 .btn 类 —— 它们不可点，做成按钮样式会误导。它们复刻按钮的盒模型
+   （边框、底色、内边距、圆角、字号），只是没有 hover 反馈，因此在同一行里
+   与按钮等高对齐、不显突兀。状态用左侧小圆点表达，不用整段文字染色 —— 染色
+   会让两段文字长短不一时基线看着歪。 */
 .bar-stat {
   display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-  font-size: 12px;
-  padding: 4px 2px;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
+  font-size: 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
   white-space: nowrap;
+  cursor: default;
+  user-select: none;
 }
+/* 状态点：正常为绿，缺失为黄。 */
+.bar-stat::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.bar-stat.is-ok::before { background: var(--ok); }
+.bar-stat.is-bad::before { background: var(--warn); }
 .bar-stat-k { color: var(--muted); }
-.bar-stat-v { font-weight: 700; }
-.bar-stat-v.is-ok { color: var(--ok); }
-.bar-stat-v.is-bad { color: var(--warn); }
-
-/* 分隔竖线：把「操作」/「状态」/「启动地址」三组在视觉上分开 */
-.bar-divider {
-  width: 1px;
-  align-self: stretch;
-  min-height: 20px;
-  background: var(--line);
-  margin: 0 2px;
-}
+.bar-stat-v { color: var(--text); font-weight: 600; }
 
 /* 5 列指标网格（运行状态/PID/CPU/内存/运行时间，对齐 Go 版 grid-cols-5） */
 .metric-grid {
@@ -623,7 +634,12 @@ html, body {
 .dot-fail { background: var(--fail); box-shadow: 0 0 0 3px color-mix(in srgb, var(--fail) 20%, transparent); }
 .dot-idle { background: var(--muted); }
 
-.badge {
+/* 卡片头部的标记：.badge（带状态色）与 .tag（中性）是同一语义的东西——挂在标题
+   右侧的一枚小徽标。之前两者各写一套盒模型（badge 2px/10px/12px 无边框，tag
+   1px/7px/11px 有边框），于是同一行并列的卡片右上角徽标大小、边框都不一致。
+   现在共用一条基线盒模型 + 各自的语义变体，只差颜色。 */
+.badge,
+.tag {
   display: inline-flex;
   align-items: center;
   padding: 2px 10px;
@@ -631,6 +647,7 @@ html, body {
   font-size: 12px;
   font-weight: 700;
   line-height: 1.5;
+  white-space: nowrap;
 }
 .badge-ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
 .badge-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
@@ -729,20 +746,16 @@ table.data th, table.data td {
 table.data th { color: var(--muted); font-weight: 600; }
 table.data td.num, table.data th.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data tbody tr:hover { background: var(--panel-2); }
-.tag {
-  display: inline-block;
-  padding: 1px 7px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  border: 1px solid var(--line);
-  background: var(--panel-2);
-  color: var(--muted);
-}
+/* .tag 的盒模型已与 .badge 合并到上面，这里只保留中性底色与语义变体。
+   tag-danger / tag-muted 在表格里被引用（settings.js），此前没有定义，
+   属于静默失效的样式——补上，语义与 tag-current 一致。 */
+.tag { background: var(--panel-2); color: var(--muted); }
 .tag-ok { color: var(--ok); }
 .tag-warn { color: var(--warn); }
 .tag-fail { color: var(--fail); }
-.tag-current { color: var(--accent); border-color: var(--accent); }
+.tag-current { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.tag-danger { color: var(--fail); background: color-mix(in srgb, var(--fail) 14%, transparent); }
+.tag-muted { color: var(--muted); }
 
 .scroll { overflow-x: auto; }
 

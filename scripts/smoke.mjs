@@ -771,6 +771,53 @@ async function pythonBin() {
       && /bar-stat-k">dsh-auth/.test(overviewJs)
       && overviewJs.indexOf('bar-stat-k">Launch Token') < overviewJs.indexOf('class="btn launch-btn"'),
     'the session-hold indicators are not in the action bar, or come after the launch address')
+  /* The status items used to be bare text (no border, 4px 2px padding, baseline
+   * aligned, 12px) sitting in a row of padded buttons — three different box
+   * models on one line, which read as "pasted in from elsewhere". They must
+   * share the button box model and signal state with a dot rather than by
+   * colouring the text, so both labels keep the same baseline. */
+  check('the status items share the action bar box model instead of ad-hoc padding',
+    /\.bar-stat \{[\s\S]{0,400}?padding: 9px 16px[\s\S]{0,200}?border-radius: 10px[\s\S]{0,200}?background: var\(--panel-2\)/.test(appCss)
+      && /\.action-bar \.btn \{[\s\S]{0,120}?padding: 9px 16px[\s\S]{0,120}?border-radius: 10px/.test(appCss),
+    'bar-stat and .action-bar .btn use different box metrics — the row will look ragged')
+  check('status is shown by a dot, not by colouring the label text',
+    /\.bar-stat\.is-ok::before/.test(appCss) && /\.bar-stat\.is-bad::before/.test(appCss)
+      && /\.bar-stat-v \{ color: var\(--text\)/.test(appCss)
+      && !/bar-stat-v\.is-(ok|bad)/.test(appCss)
+      && /class="bar-stat \$\{status\.session\?\.token \? 'is-ok' : 'is-bad'\}"/.test(overviewJs),
+    'the state modifier belongs on .bar-stat (for the dot), not on the text span')
+  check('the launch address uses the same box metrics as the buttons',
+    /\.launch-btn \{[\s\S]{0,400}?padding: 9px 16px[\s\S]{0,200}?border-radius: 10px/.test(appCss)
+      && /\.launch-btn \{[\s\S]{0,400}?font-size: 13px/.test(appCss),
+    'the launch-address button is a different size from its neighbours')
+
+  /* The session-hold card is gone; its explanation moved into the two status
+   * items' title attributes (hover). Nothing may drift back: an orphan variable
+   * would mean the explanation was dropped rather than moved. */
+  check('the session-hold card is gone and its explanation moved to the hover titles',
+    !/card-icon">🔑<\/span>会话代持/.test(overviewJs)
+      && /const tokenHint =/.test(overviewJs) && /const cookieHint =/.test(overviewJs)
+      && /class="bar-stat[^"]*"\s*\n\s*title="\$\{esc\(tokenHint\)\}"/.test(overviewJs)
+      && /title="\$\{esc\(cookieHint\)\}"/.test(overviewJs),
+    'the session-hold card was removed but the explanation is not reachable from the status items')
+  /* Both tags were the same idea — a small marker hung to the right of a card
+   * title — yet carried two box models, so three cards in one row showed badges
+   * of different size and border. They must now share one base declaration. */
+  check('badge and tag share one box model',
+    /\.badge,\s*\n\.tag \{/.test(appCss)
+      && !/\.tag \{[^}]*display: inline-block/.test(appCss)
+      && !/\.tag \{[^}]*border: 1px solid var\(--line\)/.test(appCss),
+    '.tag and .badge still declare separate box models — side-by-side markers will differ in size')
+  /* tag-danger / tag-muted were referenced by settings.js but had no rule at
+   * all — the markup rendered completely unstyled and nothing complained.
+   * Derive the referenced set from the views instead of hardcoding it, so the
+   * next variant someone types is caught the moment it goes missing. */
+  const viewSources = ['overview', 'plugins', 'settings', 'versions', 'workspace']
+    .map((v) => readFileSync(join(ROOT, `ui/assets/views/${v}.js`), 'utf8')).join('\n')
+  const usedTagVariants = [...new Set([...viewSources.matchAll(/\btag-[a-z-]+/g)].map((m) => m[0]))]
+  check('every tag variant used in a view actually has a rule',
+    usedTagVariants.length > 0 && usedTagVariants.every((c) => new RegExp(`\\.${c} \\{`).test(appCss)),
+    `these tag variants have no CSS rule: ${usedTagVariants.filter((c) => !new RegExp(`\\.${c} \\{`).test(appCss)).join(', ') || '(none found — the scan is broken)'}`)
   check('the standalone launch-URL row is gone',
     !/launch-url-row/.test(overviewJs) && !/launch-url-row/.test(appCss),
     'the old launch-url-row markup/css is still present')
