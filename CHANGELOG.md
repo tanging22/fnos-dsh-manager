@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.0.39 - 2026-10-12
+
+v1.0.38 发布后收到反馈：升级后 dsh 客户端连接异常（插件接口 404、WS 60s 超时、控制台报错）。逐行复查 1.0.38 全部 738 行 diff 后，未发现必然破坏连接的缺陷；但确认该版本一次性改动了配置目录、插件安装、HTML 代理、端口扫描、进程时序五类与连接相关的路径，且只在开发机过 smoke、未经真实 fnOS 升级验证。本版不引入新功能，只把两处“优化可能变成回归”的行为改为带兜底的形态：**任何单文件场景下，行为都是 1.0.37 与 1.0.38 的并集，不会比任何一版更差**。
+
+### 兜底（回归防御）
+
+- **config 路径增加默认 home 回退**（`cmd/dashboard-config.js`）。1.0.38 把 `.credentials.yaml` / `.env` / `proxy.conf` / `trusted_hosts.conf` 全部改为跟随 `activeDshHome()`（与 dsh 启动参数 HOME/DSH_HOME/USERPROFILE 一致，修掉了“自愈修 A 目录、dsh 读 B 目录”的不一致）。但用户切换过 dsh 版本时，`workspace.active` 指向版本目录下的 home，而这些文件是历史版本写在**默认 home** 里的——1.0.38 会去一个空目录里找它们，表现为“升级后配置全丢、连不上”。现对每个文件独立判定：active home 有该文件 → 用 active（1.0.38 的正确行为，那才是 dsh 会读的那份）；只有默认 home 有 → 用默认 home（1.0.37 及之前的行为，“之前是好的”）；两边都没有 → active home（写入目标 = dsh 读取处）。`writeTrustedHosts()` 的 mkdir 跟着兜底解析后的路径走，避免写进未创建的目录。
+- **registry 查询在 npm view 失败后增加直连兜底**（`cmd/dashboard-utils.js`）。1.0.38 为让代理生效把 registry 查询改走 `npm view`。npm 失败有两种完全不同的原因：registry 真的不通（旧实现同样失败，不是回归），和**这台机器上 npm 自身配置坏了**（`.npmrc` 指向死代理/镜像等——这类机器上 1.0.37 的直连 fetch 是能用的，不兜底，“优化”就变成了回归）。现 npm view 非 0 退出后再给直连一次机会（15s 短超时，快速失败）；两边都不通才上报 `registry-unreachable`，detail 同时携带两边的错误（npm 的 stderr 往往就是“哪个代理连不上”的答案）。
+- smoke 新增 4 条断言钉住兜底语义：guard 脚本内构造 `workspace.active` 指向版本 home 的场景，验证“只在默认 home 有 → 回退”、“active 也有 → 优先 active”、“两边都没有 → 落 active”、“受信主机写入跟随兜底路径”。
+
 ## v1.0.38 - 2026-10-12
 
 本次为稳定性与性能维护版，聚焦三件事：**去掉周期性阻塞事件循环的同步子进程**、**降低长跑期全量 `/proc` 扫描的 CPU 开销**、**修掉审计发现的功能 bug**。共改动 9 个文件。

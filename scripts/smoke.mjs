@@ -915,6 +915,32 @@ async function pythonBin() {
             const res = resources.readResources()
             out.diskMs = Date.now() - t0
             out.diskTotal = (res.disks[0] || {}).total || 0
+
+            // ---- config home 兜底（v1.0.39）----
+            // workspace.active 指向版本 home，而凭据只写在默认 home（历史版本
+            // 留下的）时，路径必须兜底回默认 home —— 否则升级后表现为"配置全丢"
+            // （1.0.37 的行为）。active home 也有一份时必须以 active 为准，那才是
+            // dsh 启动参数 HOME/DSH_HOME/USERPROFILE 指向的位置（1.0.38 的正确行为）。
+            const fs = require('fs')
+            const join = require('path').join
+            const defaultHome = process.env.DSH_HOME
+            const versionHome = join(process.env.DATA_DIR, 'versions', '9.9.9', 'home')
+            fs.mkdirSync(versionHome, { recursive: true })
+            fs.mkdirSync(defaultHome, { recursive: true })
+            fs.writeFileSync(join(defaultHome, '.credentials.yaml'), 'DEEPSEEK_API_KEY: x\\n')
+            fs.writeFileSync(join(process.env.DATA_DIR, 'workspace.active'), versionHome + '\\n')
+            out.credFallsBackToDefault = config.credentialsPath() === join(defaultHome, '.credentials.yaml')
+            fs.writeFileSync(join(versionHome, '.credentials.yaml'), 'DEEPSEEK_API_KEY: y\\n')
+            out.credPrefersActive = config.credentialsPath() === join(versionHome, '.credentials.yaml')
+            out.proxyConfDefaultsToActive = config.proxyConfPath() === join(versionHome, 'proxy.conf')
+            // 受信主机只存在于默认 home 时，写入必须落到默认 home（与 1.0.37 一致），
+            // 且不能在 active home 里留下第二份。
+            fs.writeFileSync(join(defaultHome, 'trusted_hosts.conf'), 'a.example.com\\n')
+            config.writeTrustedHosts(['b.example.com'])
+            out.trustedWriteFollowsFallback =
+              fs.readFileSync(join(defaultHome, 'trusted_hosts.conf'), 'utf8').trim() === 'b.example.com' &&
+              !fs.existsSync(join(versionHome, 'trusted_hosts.conf'))
+            fs.unlinkSync(join(process.env.DATA_DIR, 'workspace.active'))
             process.stdout.write(JSON.stringify(out))
           })
         })
@@ -944,6 +970,14 @@ async function pythonBin() {
     guard.order === '0.2.1,0.2.1-rc.1,0.2.1-alpha.2', `got ${guard.order}`)
   check('the resource sampler answers without forking a subprocess',
     guard.diskTotal > 0 && guard.diskMs < 1000, `total=${guard.diskTotal} in ${guard.diskMs}ms ${guard.fatal ?? ''}`)
+  check('config paths fall back to the default home when the active one lacks the file',
+    guard.credFallsBackToDefault === true, JSON.stringify(guard))
+  check('config paths prefer the active home when it has the file',
+    guard.credPrefersActive === true, JSON.stringify(guard))
+  check('a file in neither home resolves to the active home',
+    guard.proxyConfDefaultsToActive === true, JSON.stringify(guard))
+  check('trusted-host writes follow the fallback path',
+    guard.trustedWriteFollowsFallback === true, JSON.stringify(guard))
 } finally {
   panel.kill('SIGTERM')
   stub.close()

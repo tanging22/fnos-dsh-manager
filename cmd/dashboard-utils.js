@@ -389,6 +389,13 @@ export function runWithTimeout(command, args = [], timeoutMs = 10000, options = 
  * 顺带的好处：npm view 复用 npm 自己的 registry、CA、authToken、证书配置，
  * 面板不需要自己拼 URL / 处理 scope 编码 / 处理镜像站的路径差异。
  *
+ * v1.0.39 兜底：npm view 失败（无论 spawn 抛错还是进程非 0 退出）后再给直连
+ * fetch 一次机会。原因是 npm 失败有两种完全不同的原因——registry 真的不通
+ * （旧实现同样失败，不是回归），和**这台机器上 npm 自身配置坏了**（.npmrc
+ * 指向死代理/镜像等；这种机器上 v1.0.37 的直连 fetch 是能用的）。不兜底，
+ * "优化"就在这类机器上变成了回归。代价是真实网络故障时多等一遍 fetch 超时
+ * （兜底用 15s 短超时），换来的是一类环境从"坏了"恢复到"好的"。
+ *
  * 返回 `{ ok: true, doc }` 或 `{ ok: false, error, detail }`，永不抛异常。
  */
 export async function registryDoc(pkg, { registry, proxy, timeoutMs = 30000 } = {}) {
@@ -407,16 +414,22 @@ export async function registryDoc(pkg, { registry, proxy, timeoutMs = 30000 } = 
   }
 
   // code 127 = runWithTimeout 的 spawn 'error' 分支（ENOENT/EACCES/EINVAL），
-  // 同样是 npm 不可用，而不是 registry 的问题。只有 npm 真的跑起来了，它的
-  // 结论（registry-unreachable 等）才可信 —— 否则一次真实的网络故障会白白
-  // 再等一遍 fetch 超时。
+  // 同样是 npm 不可用，而不是 registry 的问题。
   if (result.code === 127) return registryDocViaFetch(name, registry)
 
   if (result.code !== 0) {
+    // npm 跑起来了但自己失败。可能是 registry 不通，也可能是这台机器的 npm
+    // 配置（代理/镜像/.npmrc）坏了 —— 后者 v1.0.37 直连 fetch 时是好的。
+    // 区分不可靠，直接再给直连一次机会；两边都不通才上报，且把两边的错误
+    // 都带进 detail（npm 的 stderr 往往就是"哪个代理连不上"的答案）。
+    const direct = await registryDocViaFetch(name, registry, 15000)
+    if (direct.ok) return direct
+    const npmWhy = (result.stderr || result.stdout || '').trim().slice(0, 200)
+    const fetchWhy = direct.detail ? `direct: ${direct.detail}` : ''
     return {
       ok: false,
       error: 'registry-unreachable',
-      detail: (result.stderr || result.stdout || '').trim().slice(0, 400),
+      detail: [npmWhy, fetchWhy].filter(Boolean).join(' | ').slice(0, 400),
     }
   }
   // npm 偶尔在 stdout 前面吐一行通知/警告：只取第一个 `{` 到最后一个 `}`。
@@ -434,11 +447,12 @@ export async function registryDoc(pkg, { registry, proxy, timeoutMs = 30000 } = 
 /**
  * 兜底路径：直接用 Node 的 fetch 打 registry。
  *
- * **不读 HTTP_PROXY/HTTPS_PROXY**，所以只有在 npm 根本用不上时才走这里
- * （CI / 开发机 / npm 缺失的极简环境）。生产环境（fnOS，npm 一定在）由
- * `npm view` 承担，代理才生效。
+ * **不读 HTTP_PROXY/HTTPS_PROXY**，所以它是"npm 用不了 / npm 配置坏了"时的
+ * 备用通道，不是常规通道：生产环境（fnOS，npm 一定在）由 `npm view` 承担，
+ * 代理才生效。`timeoutMs` 比 npm 那条路短——兜底讲究快速失败，不值得为一次
+ * 备用尝试等满长超时。
  */
-async function registryDocViaFetch(pkg, registry) {
+async function registryDocViaFetch(pkg, registry, timeoutMs = 25000) {
   const packagePath = pkg.startsWith('@')
     ? `${pkg.slice(0, pkg.indexOf('/'))}/${encodeURIComponent(pkg.slice(pkg.indexOf('/') + 1))}`
     : encodeURIComponent(pkg)
@@ -450,7 +464,7 @@ async function registryDocViaFetch(pkg, registry) {
       .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
       .then(doc => process.stdout.write(JSON.stringify(doc)))
       .catch(e => { process.stderr.write(e.message); process.exit(1); });
-  `, url], 25000)
+  `, url], timeoutMs)
   if (result.code !== 0) {
     return {
       ok: false,

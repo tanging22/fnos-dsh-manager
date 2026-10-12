@@ -30,30 +30,44 @@ import {
 export const CONFIG_PATH = join(DATA_DIR, 'console-config.json')
 
 /**
- * dsh 的 home 相关路径 —— 一律走 `activeDshHome()` 而不是常量 `DSH_HOME`。
+ * dsh 的 home 相关路径。
  *
- * 旧实现在模块加载时用 `DSH_HOME`（= `${DATA_DIR}/dsh_home`）把这些路径固定
- * 下来，而 `preStartSelfHeal()` / `dshLaunch()` / `profileDir()` 用的是
- * `activeDshHome()`（读 `${DATA_DIR}/workspace.active`，可能指向版本目录下的
- * 另一个 home）。结果是两条路径不一致：chmod/chown 自愈修的是 A 目录，受信
- * 主机、凭据、proxy.conf 却写在 B 目录 → 权限自愈与受信主机配置双双失效。
+ * v1.0.38 把这些路径从模块加载期的常量 `DSH_HOME` 改成全部跟随
+ * `activeDshHome()`，与 dsh 启动参数（HOME/DSH_HOME/USERPROFILE 三件套都指向
+ * activeDshHome()）同源，修掉了"自愈修 A 目录、dsh 读 B 目录"的不一致。
  *
- * 这些改成函数，每次调用时重新解析，与 dsh 实际使用的 home 保持同源。
+ * 但那只在 `workspace.active` 缺失或指向默认 home 时与旧版等价。一旦用户切换
+ * 过 dsh 版本，`workspace.active` 指向版本目录下的 home，而凭据 / 受信主机 /
+ * proxy.conf 是历史版本写在**默认 home** 里的 —— 1.0.38 的面板会去一个空目录里
+ * 找它们，用户看到的就是"升级后配置全丢、连不上"。
+ *
+ * v1.0.39 兜底（对每个文件独立判定，不猜目录）：
+ *   active home 有该文件 → 用它（dsh 实际读取的位置，1.0.38 的正确行为）；
+ *   只有默认 home 有     → 用它（1.0.37 及之前的行为，"之前是好的"）；
+ *   两边都没有           → active home（写入目标 = dsh 读取的位置）。
+ * 于是任何"文件只存在于一个 home"的场景，行为都是两个旧版本的并集，不会比
+ * 任何一版更差；两边都有时以 active 为准（那才是 dsh 会读的那份）。
  */
+function homePath(file) {
+  const active = join(activeDshHome(), file)
+  if (existsSync(active) || !existsSync(join(DSH_HOME, file))) return active
+  return join(DSH_HOME, file)
+}
+
 export function credentialsPath() {
-  return join(activeDshHome(), '.credentials.yaml')
+  return homePath('.credentials.yaml')
 }
 
 export function envPath() {
-  return join(activeDshHome(), '.env')
+  return homePath('.env')
 }
 
 export function proxyConfPath() {
-  return join(activeDshHome(), 'proxy.conf')
+  return homePath('proxy.conf')
 }
 
 export function trustedConfPath() {
-  return join(activeDshHome(), 'trusted_hosts.conf')
+  return homePath('trusted_hosts.conf')
 }
 export const VERSIONS_DIR = join(DATA_DIR, 'versions')
 export const LOGS_DIR = join(DATA_DIR, 'logs')
@@ -846,9 +860,12 @@ export function trustedHosts() {
  */
 export function writeTrustedHosts(list) {
   const hosts = [...new Set((list ?? []).map((h) => String(h).trim().toLowerCase()).filter(Boolean))]
-  const home = activeDshHome()
-  mkdirSync(home, { recursive: true })
-  writeFileSync(trustedConfPath(), `${hosts.join('\n')}${hosts.length ? '\n' : ''}`, 'utf8')
+  const path = trustedConfPath()
+  // 目标可能已被 homePath() 兜底到默认 home（文件只存在于那里时），mkdir 必须
+  // 跟着解析后路径的父目录走，不能想当然 mkdir activeDshHome() —— 否则写进一个
+  // 尚未创建的目录会直接 ENOENT。
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, `${hosts.join('\n')}${hosts.length ? '\n' : ''}`, 'utf8')
   return hosts
 }
 
