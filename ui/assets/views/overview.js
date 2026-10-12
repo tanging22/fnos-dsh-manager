@@ -64,6 +64,15 @@ export async function render(host, ctx) {
   // 重启面板、dsh 却还活着）接口会 401、前端 WS 60 秒超时——这里直接告警。
   const sessionOk = Boolean(status.session?.cookie || status.session?.token)
 
+  // dsh 最近一次启动打印的地址（`http://127.0.0.1:<port>/?token=…`）。
+  //
+  // 这条地址里主机是 dsh 自己的回环，照着点只会连到浏览器所在的那台机器，
+  // 所以它只用来「看 + 复制」；真正能点的是 `session.entry` —— 同一个地址
+  // 剥掉回环主机、换上面板代理前缀后的路径，在当前面板域名下打开即可凭
+  // token 换到自己的 30 天 Cookie。
+  const launchUrl = status.session?.url || ''
+  const launchEntry = status.session?.entry || ''
+
   // dsh 进程树资源（CPU/内存）初始占位，由 renderDshUsage 填充。
   const cpuMetric = '<div class="metric-value" id="m-cpu">—</div>'
   const memMetric = '<div class="metric-value" id="m-mem">—</div>'
@@ -140,6 +149,17 @@ export async function render(host, ctx) {
         <button class="btn" data-action="restart" type="button">🔄 重启服务</button>
         <button class="btn" data-action="open" data-open="/p/" type="button">🔗 打开面板入口</button>
         <button class="btn" data-action="open" data-open="/api/versions" type="button">📦 版本管理</button>
+        <button class="btn" data-action="launch" type="button">🔑 启动地址</button>
+      </div>
+
+      <!-- dsh 启动时打印的带 token 地址。整块带 data-copy，供下面的复制按钮取用。 -->
+      <div class="launch-url-row" data-copy="${esc(launchUrl)}">
+        <span class="launch-url-label">启动地址</span>
+        ${launchUrl
+          ? `<code class="launch-url">${esc(launchUrl)}</code>
+             <button class="btn btn-ghost" data-action="copy-launch" type="button">复制</button>
+             ${launchEntry ? '<span class="muted">按钮会用面板域名打开同一地址</span>' : ''}`
+          : '<span class="muted">尚未捕获——dsh 每次启动会打印一次，重启服务后这里就有</span>'}
       </div>
     </div>
 
@@ -193,6 +213,23 @@ export async function render(host, ctx) {
   for (const btn of host.querySelectorAll('.action-bar [data-open="/p/"]')) {
     btn.addEventListener('click', () => { window.open(url('/p/'), '_blank', 'noopener') })
   }
+  // 「启动地址」→ 复制 dsh 自己打印的那条，并用面板域名打开同一地址。
+  for (const btn of host.querySelectorAll('.action-bar [data-action="launch"]')) {
+    btn.addEventListener('click', () => {
+      if (!launchEntry) {
+        toast('还没有捕获到启动地址：dsh 每次启动才打印一次，请重启一次服务', 'error')
+        return
+      }
+      if (launchUrl) copyText(launchUrl)
+      window.open(url(launchEntry), '_blank', 'noopener')
+    })
+  }
+  for (const btn of host.querySelectorAll('[data-action="copy-launch"]')) {
+    btn.addEventListener('click', () => {
+      const text = btn.closest('[data-copy]')?.dataset.copy || launchUrl
+      if (text) copyText(text)
+    })
+  }
 
   // dsh 进程树资源：定时刷新。
   //
@@ -228,6 +265,36 @@ function startUsageTimer(host) {
   draw()
   const timer = setInterval(draw, 3000)
   return () => { stopped = true; clearInterval(timer) }
+}
+
+/**
+ * 复制文本。
+ *
+ * 直连面板端口（http://<NAS-IP>:28001）是非安全上下文，`navigator.clipboard`
+ * 根本不存在 —— 只写 `navigator.clipboard.writeText(...)` 会抛 TypeError，
+ * 按钮表现成"点了没反应"。这里回退到临时 textarea + execCommand。
+ */
+function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => toast('已复制', 'ok'),
+      () => toast('复制失败，请手动选中', 'error'),
+    )
+    return
+  }
+  try {
+    const area = document.createElement('textarea')
+    area.value = text
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    const ok = document.execCommand('copy')
+    area.remove()
+    toast(ok ? '已复制' : '复制失败，请手动选中', ok ? 'ok' : 'error')
+  } catch {
+    toast('复制失败，请手动选中', 'error')
+  }
 }
 
 function fmtUptime(ms) {

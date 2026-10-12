@@ -452,7 +452,17 @@ const routes = {
       recentVisit: lastVisitor(),
       // 会话代持状态：cookie=false 而 dsh 在跑 = 反代没有凭据，前端 WS 会在
       // 60 秒后超时。暴露出来让首页能直接告警，不用翻日志。
-      session: sessionHoldState(),
+      //
+      // `url` 是 dsh 自己打印的那条地址（回环 + token），只能看/复制——照着点
+      // 会连到浏览器自己那台机器上。`entry` 是同一条地址去掉回环主机、换上面板
+      // 代理前缀后的路径，在当前面板域名下可直接打开（浏览器凭 token 换到自己
+      // 的 30 天 Cookie，不再完全依赖面板代持）。
+      session: (() => {
+        const hold = sessionHoldState()
+        const proxy = loadConfig().proxy ?? {}
+        const prefix = proxy.enabled === false ? '' : (proxy.pathPrefix || '/p')
+        return { ...hold, entry: hold.url ? stripLoopbackLocation(hold.url, prefix) : '' }
+      })(),
     })
   },
 
@@ -1520,4 +1530,6 @@ export function webSocketClientCount() {
   return wsClients.size
 }
 
-export { routes, UI_DIR, broadcast }
+// `stripLoopbackLocation` 一并导出：它把 dsh 打印的回环地址改写成面板内可点开的
+// 路径（见 /api/status 的 session.entry），门禁要单独钉住这条规则。
+export { routes, UI_DIR, broadcast, stripLoopbackLocation }

@@ -9,30 +9,68 @@
 import { api, esc, toast, bytes, localTime, timeAgo, url } from '../dom.js'
 
 /**
- * 调 fnOS 文件管理器打开一个目录。返回 true 表示已交给 SDK，false 表示不可用。
+ * 调 fnOS 文件管理器打开一个目录。SDK 只能从网关 iframe 的父窗口拿，所以沿
+ * parent 链往上找 —— fnOS 在不同版本/不同嵌套深度下注入 `window.trimSdk` 的
+ * 位置并不一致，只查 `window.trimSdk || window.parent.trimSdk` 在多一层 iframe
+ * 时就找不到。
  *
- * SDK 只能从网关 iframe 的父窗口拿，所以要沿parent 链往上找 ——
- * fnOS 在不同版本/不同嵌套深度下注入 `window.trimSdk` 的位置并不一致，
- * 只查 `window.trimSdk || window.parent.trimSdk` 在多一层 iframe 时就找不到，
- * 于是按钮静默退化成"复制路径"，看起来像"点了没反应"。
+ * 返回 `{ ok, reason }`。旧签名只回 true/false，"打不开"和"为什么打不开"混成
+ * 一个结果，用户只能看到一句笼统的"不可用"。区分出原因才有可操作的建议：
+ *
+ *   not-embedded  面板不是嵌在 fnOS 里打开的（直连 :28001/:28000 端口）。
+ *                 网关没参与，自然没人注入 trimSdk —— 这是最常见的情形。
+ *   cross-origin  嵌在 iframe 里，但父窗口跨域，读 `parent.trimSdk` 直接抛
+ *                 SecurityError（浏览器不允许跨源读属性）。面板与网关不同端口
+ *                 时必踩，且旧实现把异常吞掉后继续上溯，看起来像"没找到 SDK"。
+ *   sdk-missing   能访问父窗口，但整条链上都没有 trimSdk（该版本 fnOS 未注入，
+ *                 或页面是独立标签页打开的）。
+ *   sdk-threw     SDK 在、调用却抛错（典型是路径不在文件管理器可见的目录树里，
+ *                 例如套件私有数据目录下的工作区）。
  */
 function openFileManager(path) {
-  // 沿父窗口链找 SDK，最多上溯 5 层。
   let scope = window
+  let embedded = false
+  let sawCrossOrigin = false
+  let lastError = ''
   for (let depth = 0; scope && depth < 6; depth += 1) {
-    const sdk = scope.trimSdk
+    let sdk = null
+    try {
+      sdk = scope.trimSdk
+      if (window.top !== window.self) embedded = true
+    } catch {
+      // 跨域父窗口：读属性即 SecurityError，连 `sdk` 都拿不到。
+      sawCrossOrigin = true
+      embedded = true
+    }
     if (sdk && typeof sdk.openFileManager === 'function') {
       try {
         sdk.openFileManager(path)
-        return true
-      } catch {
-        // SDK 在但不工作，继续往外找下一个候选。
+        return { ok: true, reason: '' }
+      } catch (error) {
+        lastError = error?.message ?? String(error)
       }
     }
     if (scope.parent === scope) break
     scope = scope.parent
   }
-  return false
+  if (lastError) return { ok: false, reason: `sdk-threw: ${lastError}` }
+  if (!embedded) return { ok: false, reason: 'not-embedded' }
+  if (sawCrossOrigin) return { ok: false, reason: 'cross-origin' }
+  return { ok: false, reason: 'sdk-missing' }
+}
+
+/** 把打不开的原因翻成人能执行的下一步。 */
+function fileManagerHint(reason) {
+  if (reason === 'not-embedded') {
+    return '当前不是从 fnOS 应用中心里打开的面板（直连面板端口），网关不会注入文件管理器 SDK。请从 fnOS 应用中心进入本套件再点。'
+  }
+  if (reason === 'cross-origin') {
+    return '面板与网关不同源，浏览器禁止跨 iframe 调用文件管理器。请从 fnOS 应用中心进入本套件再点。'
+  }
+  if (reason.startsWith('sdk-threw')) {
+    return '文件管理器拒绝了这个路径：多半是工作区在套件私有数据目录里，不在文件管理器可见的共享目录树内。'
+  }
+  return '当前环境没有 fnOS 文件管理器 SDK 可用。请从 fnOS 应用中心进入本套件再点。'
 }
 
 export async function render(host, ctx) {
@@ -107,15 +145,15 @@ export async function render(host, ctx) {
   host.querySelectorAll('[data-open]').forEach((button) => {
     button.addEventListener('click', () => {
       const path = button.dataset.open
-      if (openFileManager(path)) {
+      const result = openFileManager(path)
+      if (result.ok) {
         toast('已交给 fnOS 文件管理器打开', 'ok')
-      } else {
-        // SDK 不可用（非网关环境/直连端口）。明确说清楚到底做了什么——
-        // 原来也提示"路径已复制"，但用的是 copy() 自己的文案，
-        // 在"没打开"之后紧跟一句"已复制"会让人以为两步都成功了。
-        copy(path, true)()
-        toast('文件管理器不可用，已复制路径（请手动粘贴到文件管理器）', 'error')
+        return
       }
+      // 打不开就说清楚是哪一种打不开，否则只剩一句"不可用"，无法判断该做什么。
+      // 路径仍然复制好（quiet，不再重复提示），用户可以直接粘到文件管理器地址栏。
+      copy(path, true)()
+      toast(fileManagerHint(result.reason), 'error')
     })
   })
 }

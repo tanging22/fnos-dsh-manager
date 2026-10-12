@@ -22,11 +22,16 @@ import { DATA_DIR } from './dashboard-utils.js'
 // Launch Token：dsh 启动打印 `dsh web: .*?[?&]token=<token>`（Go launchTokenRe）。
 const LAUNCH_TOKEN_RE = /dsh web: .*?[?&]token=([A-Za-z0-9_-]+)/
 
+// 整条启动地址：同一行里的 URL 本体（含 `?token=…`）。面板只用它做展示与
+// 「一键打开」，不做任何请求 —— 那是 exchangeDshSessionCookie 的职责。
+const LAUNCH_URL_RE = /dsh web:\s*(\S+)/
+
 // 捕获 stdout 时的行缓冲：分块到达时拼出完整行再匹配 token。
 /** 行缓冲硬上限（见 CaptureLaunchToken 里的说明）。 */
 const LINE_BUFFER_CAP = 64 * 1024
 let lineBuffer = ''
 let currentLaunchToken = ''
+let currentLaunchUrl = ''
 let cachedCookie = ''
 let lastTryAt = 0
 
@@ -54,6 +59,7 @@ function loadPersistedSession() {
   try {
     const raw = JSON.parse(readFileSync(SESSION_FILE, 'utf8'))
     if (!currentLaunchToken && typeof raw?.token === 'string') currentLaunchToken = raw.token.trim()
+    if (!currentLaunchUrl && typeof raw?.url === 'string') currentLaunchUrl = raw.url.trim()
     if (!cachedCookie && typeof raw?.cookie === 'string') cachedCookie = raw.cookie.trim()
   } catch {
     // 首次启动没有该文件；文件损坏也当作没有，绝不让它拖垮反代。
@@ -64,7 +70,7 @@ function persistSession() {
   try {
     mkdirSync(dirname(SESSION_FILE), { recursive: true })
     const tmp = `${SESSION_FILE}.tmp`
-    writeFileSync(tmp, `${JSON.stringify({ token: currentLaunchToken, cookie: cachedCookie }, null, 2)}\n`, 'utf8')
+    writeFileSync(tmp, `${JSON.stringify({ token: currentLaunchToken, url: currentLaunchUrl, cookie: cachedCookie }, null, 2)}\n`, 'utf8')
     renameSync(tmp, SESSION_FILE)
     // 这是 dsh 的登录凭据，权限必须收紧（同 .credentials.yaml 的处理）。
     chmodSync(SESSION_FILE, 0o600)
@@ -73,20 +79,34 @@ function persistSession() {
   }
 }
 
-/** 记录（或清空）当前 Launch Token；变化即失效已缓存的会话凭据（Go SetCurrentLaunchToken）。 */
-export function SetCurrentLaunchToken(token) {
+/**
+ * 记录（或清空）当前 Launch Token —— 顺带记下它所在的那条启动地址。
+ *
+ * `launchUrl` 缺省时不改已有地址：本函数的另两个调用点（停止/重启 dsh）传的是
+ * 空 token，那时必须连地址一起清掉（旧地址会让人点到一条已经失效的 token）；
+ * 而只更新 token 的场景不该把地址抹掉。
+ */
+export function SetCurrentLaunchToken(token, launchUrl) {
   loadPersistedSession()
   const trimmed = String(token ?? '').trim()
   if (currentLaunchToken !== trimmed) {
     currentLaunchToken = trimmed
     InvalidateDshSession()
   }
+  if (typeof launchUrl === 'string') currentLaunchUrl = launchUrl.trim()
+  else if (!trimmed) currentLaunchUrl = ''
   persistSession()
 }
 
 export function GetCurrentLaunchToken() {
   loadPersistedSession()
   return currentLaunchToken
+}
+
+/** dsh 最近一次启动打印的完整地址（含 `?token=…`）；未捕获则为空串。 */
+export function GetLaunchUrl() {
+  loadPersistedSession()
+  return currentLaunchUrl
 }
 
 /** 清空缓存的会话凭据（Go InvalidateDshSession）。 */
@@ -104,7 +124,7 @@ export function InvalidateDshSession() {
  */
 export function sessionHoldState() {
   loadPersistedSession()
-  return { token: Boolean(currentLaunchToken), cookie: Boolean(cachedCookie) }
+  return { token: Boolean(currentLaunchToken), cookie: Boolean(cachedCookie), url: currentLaunchUrl }
 }
 
 /**
@@ -119,7 +139,12 @@ export function CaptureLaunchToken(chunk) {
     const line = lineBuffer.slice(0, idx)
     lineBuffer = lineBuffer.slice(idx + 1)
     const m = LAUNCH_TOKEN_RE.exec(line)
-    if (m) SetCurrentLaunchToken(m[1])
+    if (m) {
+      // 地址与 token 同一行，一起取：只存 token 的话前端只能拼出一个
+      // 「大概是这个」的 URL，端口/主机一变就指错地方。
+      const u = LAUNCH_URL_RE.exec(line)
+      SetCurrentLaunchToken(m[1], u ? u[1] : '')
+    }
   }
   // 无上限修复：dsh 若长时间输出不含换行的二进制/进度条，lineBuffer 会无界
   // 增长（一个从不换行的进程可以在几小时内吃光内存）。

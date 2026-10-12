@@ -898,8 +898,9 @@ async function pythonBin() {
       load('dashboard-config.js'),
       load('dashboard-resources.js'),
       load('dashboard-session.js'),
+      load('dashboard-server.js'),
     ])
-      .then(([plugins, config, resources, session]) => {
+      .then(([plugins, config, resources, session, server]) => {
         const out = {
           validName: plugins.isValidPackageName('dshmarket'),
           scopedName: plugins.isValidPackageName('@deepseek-ai/dsh'),
@@ -922,11 +923,28 @@ async function pythonBin() {
           // 面板重启（fnOS 每次升级都会）若把 token/cookie 冲掉，而 dsh 还活着，
           // 反代就没有凭据：HTTP 401、前端 WS 等满 60 秒超时。凭据必须落盘。
           const sessionFile = require('path').join(process.env.DATA_DIR, 'dsh-session.json')
-          out.tokenPersisted = JSON.parse(require('fs').readFileSync(sessionFile, 'utf8')).token === 'abc123'
+          const persisted = JSON.parse(require('fs').readFileSync(sessionFile, 'utf8'))
+          out.tokenPersisted = persisted.token === 'abc123'
+
+          // ---- 启动地址（v1.0.42）----
+          // 首页要展示 dsh 启动打印的那条地址：只留 token 就只能拼出一个"大概是
+          // 这个"的 URL，端口/主机一变就指错地方，所以整条 URL 一起捕获并落盘。
+          out.launchUrlCaptured = session.GetLaunchUrl() === 'http://127.0.0.1:28000/?token=abc123'
+          out.launchUrlPersisted = persisted.url === 'http://127.0.0.1:28000/?token=abc123'
+          // 那条地址的主机是 dsh 自己的回环，照着点会连到浏览器所在机器：面板
+          // 必须把它改写成"当前域名下的代理路径"，且不能重复加前缀（/p/p/）。
+          out.entryRewritten = server.stripLoopbackLocation('http://127.0.0.1:28000/?token=abc123', '/p') === '/p/?token=abc123'
+          out.entryKeepsPrefix = server.stripLoopbackLocation('http://127.0.0.1:28000/p/login', '/p') === '/p/login'
+          out.entryLeavesForeignHost = server.stripLoopbackLocation('http://nas.local/login', '/p') === 'http://nas.local/login'
           // 面板手里没凭据时绝不能剥掉浏览器自己的那份（否则 100% 401）。
           out.cookiePassthrough = session.appendDshSessionCookie('dsh-auth-a=1; foo=2', '') === 'dsh-auth-a=1; foo=2'
           // 有凭据时才替换，且旧的 dsh-auth-* 必须被剥离，不能两份并存。
           out.cookieReplaced = session.appendDshSessionCookie('dsh-auth-a=1; foo=2', 'dsh-auth-b=9') === 'foo=2; dsh-auth-b=9'
+
+          // 停/重启 dsh 传的是空 token：旧地址必须一起清掉，否则首页会一直
+          // 展示一条已经失效的 token。
+          session.SetCurrentLaunchToken('')
+          out.launchUrlCleared = session.GetLaunchUrl() === ''
 
           // 校验与写入必须同一个名字：入参带空格时若写入原始值，package.json 里
           // 会留下一个和 npm 实际装的包对不上的条目。
@@ -1010,6 +1028,18 @@ async function pythonBin() {
     guard.cookiePassthrough === true, JSON.stringify(guard))
   check('the panel cookie replaces instead of joining the browser one',
     guard.cookieReplaced === true, JSON.stringify(guard))
+  check('the launch URL is captured whole, not just the token',
+    guard.launchUrlCaptured === true, JSON.stringify(guard))
+  check('the launch URL is persisted alongside the token',
+    guard.launchUrlPersisted === true, JSON.stringify(guard))
+  check('the launch URL is rewritten into a proxy path under the panel',
+    guard.entryRewritten === true, JSON.stringify(guard))
+  check('an already-prefixed redirect does not get the prefix twice',
+    guard.entryKeepsPrefix === true, JSON.stringify(guard))
+  check('a foreign host is left alone',
+    guard.entryLeavesForeignHost === true, JSON.stringify(guard))
+  check('stopping dsh clears the stale launch URL',
+    guard.launchUrlCleared === true, JSON.stringify(guard))
 } finally {
   panel.kill('SIGTERM')
   stub.close()
