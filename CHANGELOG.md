@@ -1,5 +1,50 @@
 # Changelog
 
+## v1.0.38 - 2026-10-12
+
+本次为稳定性与性能维护版，聚焦三件事：**去掉周期性阻塞事件循环的同步子进程**、**降低长跑期全量 `/proc` 扫描的 CPU 开销**、**修掉审计发现的功能 bug**。共改动 9 个文件。
+
+### 性能（长跑稳定性）
+
+- **`/api/resources` 每 3 秒同步 fork 一次 `df`**：概览页 3 秒轮询，`diskUsage()` 里是 `spawnSync('df', ['-k','-P'])`。`spawnSync` 会**完全阻塞** Node 主线程 —— 期间所有 HTTP 请求、WebSocket 推送、看门狗 tick 全部停摆；NAS 上磁盘繁忙（USB/阵列唤醒）时一次 fork+exec 可达数百毫秒，而读的只是一个分钟级才变化的数字。讽刺的是同项目 `dashboard-process.js` 早已因为完全相同的理由把 `ss -ltnp` 换成了读 `/proc`（那里有大段注释论证过）。现改用 `fs.statfsSync()`（statvfs(2) 绑定）：零子进程、零阻塞，字段与 `df -k -P` 一一对应（total=blocks×bsize，used=(blocks−bfree)×bsize，available=bavail×bsize）。仅在 statfs 不可用时降级到 `df`，并被 30 秒缓存兜住。实测同样 50 次采样：62ms（旧实现要 fork 50 次）。
+- **端口→PID 反查每秒全量扫 `/proc`**：`pidsForInodes()` 是 O(进程数 × fd 数)，200 进程 / 平均 20 fd 的 NAS 就是约 4000 次系统调用；而看门狗 1s tick、usage 采样、stop/start 序列叠加调用，缓存 TTL 却只有 750ms —— 基本每秒真扫 1~2 次，是面板空闲时 CPU 占用的主要来源。两处改进：①TTL 750ms → 3000ms（所有"端口即将易主"的调用点都已显式 `invalidatePortScan()`，3 秒陈旧窗口不会误判）；②新增 inode→pid 增量核对 —— 稳态下先花 O(命中数 × fd)（通常 1 个进程、十几个 readlink）核对外层缓存，只有核对失败（进程换了/端口被抢占）才回到全量扫描。约 4000 次系统调用降到约 20 次。
+- **`access.log` 每次 flush 全量重写**：`trimLog()` 在每个 flush（每 20 条记录或 1 秒，取先到者）都 read 全文件 + write 全文件 + rename。改成超过上限 120% 才裁，把 O(n) 重写摊薄：500 条上限下从"每秒一次 500 行重写"变成"每 100 条记录一次 600 行重写"。
+- `readResources()` 里 `cpus()` 被调用两次（每次都要重新组装数组、解析 model 字符串），改为一次。
+
+### 修复
+
+- **【P0】插件删除接口路径穿越 → 可递归删除任意目录**（`cmd/dashboard-plugins.js`）。`removeBundle()` 的 `name` 直接来自请求体，拼进 `join(profileDir(), 'node_modules', pkg)` 后用 `rmSync(dir, { recursive: true, force: true })` 删除；`join()` 会规范化 `..`，于是 `"../../../../../../etc"` 解析成 `/var/apps/etc` 被整个删掉，且 `force: true` 会吞掉失败。此前唯一挡住它的是**隐式保护**（`npm remove <非法名>` 通常返回非 0 提前 return），那是依赖 npm 的行为、不是校验，换版本/换 registry 就可能失效。现加两道显式防线：npm 官方包名正则 `^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$`（同时拒绝 `..`），以及解析后必须在 `node_modules` 内的包含校验；`installBundle`/`setBundleEnabled` 同口径校验，`installedDir()` 对非法名返回 `null` 而不是一个危险路径。
+- **插件开关写入 YAML 注入**：`setPluginEnabled()` 逐行拼 `cordis.patch.yml`，`id`/`name` 里的换行会变成新的 YAML 条目。现拒绝含换行/控制字符的值。
+- **版本列表把预发布版排在正式版前面**（`cmd/dashboard-versions.js`）。导入的是 `dashboard-utils.js` 的 `compareVersions`，其用 `split(/[.+-]/)` 把 `-` 也当分隔符，**丢失了 prerelease 语义**；`dashboard-config.js` 里另有一个语义正确的 semver 实现。实测旧序 `0.2.1-rc.1 , 0.2.1-alpha.2 , 0.2.1-alpha.1 , 0.2.1` —— 用户容易从下拉顶部误装不稳定版本。改导入源后为 `0.2.1 , 0.2.1-rc.1 , 0.2.1-alpha.2 , 0.2.1-alpha.1`。
+- **超 8MB 的 HTML 被静默截断**：注释写的是"超限直接放弃注入、原样透传"，实际是 `if (buffered <= CAP) chunks.push(c)` —— 超限后停止收集，返回被截断的前 8MB，并且用 `content-length = body.length` 把这个截断长度**声明成完整长度**，客户端拿到残缺页面却不报错。现改为真正的管道直通：已声明长度超限则从第一个字节起 pipe（连缓冲都不建）；chunked 中途超限则写出已收部分后继续 pipe，并**删掉 content-length** 交给分块编码。
+- **registry 查询不走代理**：`fetch()`（undici）**不读 `HTTP_PROXY`/`HTTPS_PROXY`**，而 npm 读。于是设置了代理的机器上会出现「`npm install` 能成功，但可用版本列表 / 插件查询永远 `registry-unreachable`」这种自相矛盾的故障。现统一走新增的 `registryDoc()`（`npm view <pkg> --json`），复用 npm 的 registry/代理/证书配置；仅当 npm 本身不可用（spawn 失败、code 127）时才降级回原 fetch 路径，不会让真实的网络故障白等一遍超时。
+- **`startDsh()` 异常分支泄漏 fd**：`openSync(DSH_LOG)` 在 try 内，而 catch 分支没有 `closeSync`（`exit`/`error` 分支都有关闭 —— 本模块专门修过这个泄漏，这是同一函数的遗漏路径）。fd 已提到 try 外，catch 分支归还。
+- **`signalGroup()` 返回值语义不明且有一处笔误**：`return error && error.code === 'EPERM' ? false : false` 两分支相同，且函数成功发信号后返回 `false`（实为"组还在不在"，与函数名相反）。当前无调用方使用返回值，但极易误导维护；笔误已修正并在注释里写明真实语义。
+- **杀掉残留 dsh 后不等端口释放就 spawn**：`preStartSelfHeal()` 步骤 1 对残留进程发 `SIGTERM` 后立即返回，`startDsh()` 紧接着 spawn → SIGTERM 是异步的，新进程可能撞上 `EADDRINUSE`。`stopDsh()` 有 `waitForPortFree()`，启动路径此前缺这一步，现已补上（仅在真的杀了残留时才等）。
+- **受信主机 / 凭据 / proxy.conf 写到与 dsh 实际 home 不一致的目录**：`CREDENTIALS_PATH`、`ENV_PATH`、`PROXY_CONF`、`TRUSTED_CONF` 在模块加载时按常量 `DSH_HOME` 固定，而 `preStartSelfHeal()` / `dshLaunch()` / `profileDir()` 用的是 `activeDshHome()`（读 `workspace.active`，可能指向版本目录下的另一个 home）。结果是 chmod/chown 自愈修 A 目录、配置写 B 目录，权限自愈与受信主机配置双双失效。四个常量改为按 `activeDshHome()` 实时解析的函数（`credentialsPath()` / `envPath()` / `proxyConfPath()` / `trustedConfPath()`）。
+- **Launch Token 行缓冲无上限**（`cmd/dashboard-session.js`）：`lineBuffer += chunk`，若 dsh 长时间输出不含换行则无界增长。加 64KB 上限（保留尾部，避免把含 token 的行切走）。
+- **工作区「返回上级」比较类型不一致**（`cmd/dashboard-workspace.js`）：`allowed === target` 比较的是 `workspace.json` 里的原始字符串与 `resolve()` 后的绝对路径，几乎不可能相等 → 根工作区时 parent 仍指向 `..`，前端「上级」按钮跳到一个必然被 403 拒绝的路径。改为 `resolve(allowed) === target`。（不是安全漏洞：越界检查本身是可靠的。）
+- **静态目录前缀判断补分隔符**：`serveStatic` 的 `startsWith(UI_DIR)` 对 `/ui` 与 `/ui-other` 会误判。抽出 `withinDir()`，统一按 `dir + sep` 判断（词法路径与 realpath 两处都用）。
+
+### 复查修正（发布前自审，其中 3 项是上一轮修改引入的）
+
+- **`proxyHtml` 超限直通分支没有挂 `error` 监听**（本轮引入）：`content-length` 已声明且超限时函数提前 `return`，而 `upstream.on('error')` 挂在函数末尾 —— IncomingMessage 的 `'error'` 没有监听器就是 uncaughtException，且 `pipe()` 只负责解绑、不会结束 response，客户端会一直挂到超时。现把 `'error'` 监听提到任何提前 return 之前，三条路径全覆盖。
+- **行缓冲上限截断顺序错误**（本轮引入）：`CaptureLaunchToken` 原来在拼行**之前**就 `slice()` 到后 64KB。若一个 chunk 里同时含一条完整的 `dsh web: http://…?token=…` 行和一大段无换行输出，截断会把含 token 的整行从中间切掉 → token 永远捕获不到、反代持续 401，而这种现象极难和"上游改了启动输出"区分开。改为先跑完拆行循环、只对残留的那一条不完整行设上限。
+- **`inodeOwnerCache` 曾为全系统每个 socket 建记录**（本轮引入）：慢路径顺手把**所有** socket 的 inode→pid 都记进缓存，而 `findPidsOnPort()` 永远只查 dsh 一个端口 —— 繁忙 NAS 上几万条纯占内存的 Map 记录换不来任何命中。改为只记本次查询的 inode（1~3 个），缓存规模被查询集封顶且每次整体替换，不随重启次数累积陈旧条目。
+- **`setBundleEnabled` / `removeBundle` 校验与写入用了不同的名字**（本轮引入）：入口用 trim 后的 `pkgName` 校验，函数体却仍用原始 `name` 读写 bundles 数组。入参带空格时校验通过、写进 `package.json` 的却是带空格的名字，与 npm 实际装的包对不上。两处统一为 `pkgName`。`removeBundle` 另有一个算完就没用过的 `target` 死变量，已删。
+- **`waitForPortFree` 预算 500ms 过短**：两处调用都在刚刚 SIGTERM 过之后，而优雅关闭的 dsh 要 flush 日志/会话。放宽到 1500ms（端口真释放时循环立刻返回，只影响失败路径），否则新加的 `preStartSelfHeal` 可能带着一个将死的监听去 spawn、撞 EADDRINUSE。
+- **诊断项的 credentials 检查漏掉 `.env`**：循环里第一个存在的文件就 `return`，所以 `.credentials.yaml` 存在时 `.env` 的权限问题永远查不出来（dsh 对两者都要求 600）。改为逐个看完所有文件再下结论。
+- `dashboard-resources.js` 清掉 4 个已无引用的导入（`existsSync`/`readdirSync`/`statSync`/`join`），降级路径不再重复读一次 `/proc/mounts`。
+
+### 说明
+
+- 面板与 LAN 直连口监听 `0.0.0.0`、局域网内无凭据可访问，是**有意的设计**（依赖 fnOS 网关鉴权 + Host/Origin 信任栅栏），本版未改动。README 第 48 行「登录密码 + HttpOnly 会话 Cookie」的描述与实现不符，建议后续单独订正文档。
+
+### 验证
+
+- `check.mjs` 31 parsed / 15 imported / 0 failure；`smoke.mjs` 83 → **92/92** 全通过。
+- smoke 新增 9 条断言钉住本次修复：超 8MB HTML 必须原样透传不截断、代理大响应后面板仍存活、包名校验接受正常/scope 名而拒绝穿越名、`removeBundle` 在任何递归删除之前拒绝穿越名、版本排序正式版高于自身预发布版、资源采样不 fork 子进程（有容量且 <1000ms）、**含 token 的完整行不被随后的巨量无换行输出挤掉**、**bundle 启停写入 trim 后的包名**。
+
 ## v1.0.37 - 2026-10-11
 
 ### 修复

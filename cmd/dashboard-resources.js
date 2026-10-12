@@ -2,8 +2,12 @@
  * 系统资源占用读取：CPU、内存、磁盘、负载、进程数。
  *
  * 从 Linux 的 /proc 和 /sys 直接读取 CPU/内存/负载（零外部依赖），磁盘容量
- * 用一次 `df -k -P`（fnOS 自带 busybox df），失败时降级为仅报告挂载点。
+ * 走 statvfs(2)（fs.statfsSync），同样零子进程；仅在 statfs 不可用时降级到
+ * 一次 `df -k -P` 并被 30s 缓存兜住。
  * 每个采样都带 try/catch，单个指标失败不影响其余指标。
+ *
+ * 全模块**不得出现同步子进程**：`/api/resources` 被概览页每 3 秒轮询，任何
+ * spawnSync/execSync 都会按轮询频率周期性冻结整个面板的事件循环。
  *
  * 关键诚实点：
  *  - CPU 百分比是「两次采样之间的差值」，所以 readResources() 内部记住上一次
@@ -11,9 +15,8 @@
  *  - 内存的 available 比 free 更有意义（含可回收的 page cache）。
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, statfsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { join } from 'node:path'
 import { totalmem, freemem, loadavg, cpus, uptime } from 'node:os'
 
 /** 上一次 /proc/stat 的 CPU 快照，用于差值计算。 */
@@ -87,11 +90,64 @@ function mountPoints() {
 }
 
 /**
- * 磁盘容量：优先用 `df -k -P`（POSIX 输出，字段稳定），失败则回退到仅
- * 报告挂载点存在性。单位统一换算成字节。
+ * 磁盘容量：**默认不再 fork `df`**。
+ *
+ * 概览页每 3 秒轮询一次 `/api/resources`，旧实现在这里 `spawnSync('df', ...)`。
+ * `spawnSync` 会**完全阻塞** Node 主线程：期间所有 HTTP 请求、WebSocket 推送、
+ * 看门狗 tick 全部停摆。NAS 上 fork 一次通常数十毫秒，磁盘繁忙（USB/阵列唤醒）
+ * 时可达数百毫秒 —— 而这只是为了读一个分钟级才变化的数字。
+ *
+ * 同项目的 dashboard-process.js 早已因为完全相同的理由把 `ss -ltnp` 换成了读
+ * /proc（那里有大段注释论证「同步子进程会阻塞每一个 in-flight 请求」），这里
+ * 属于同一处遗漏。
+ *
+ * `fs.statfsSync()` 是 statvfs(2) 的直接绑定：零子进程、零阻塞、几十微秒，
+ * 且字段与 `df -k -P` 一一对应：
+ *   total = blocks*bsize，used = (blocks-bfree)*bsize，available = bavail*bsize
+ * 只有在 statfs 不可用（极旧内核/Node）时才退回 `df`，并被 30s 缓存兜住，
+ * 保证降级路径也最多每 30 秒阻塞一次而不是每 3 秒。
  */
+const DISK_FALLBACK_TTL_MS = 30000
+let diskFallbackCache = { at: 0, value: null }
+
 function diskUsage() {
-  const fallback = mountPoints().map((m) => ({ ...m, present: true }))
+  const mounts = mountPoints()
+  if (typeof statfsSync === 'function') {
+    return mounts.map((m) => {
+      try {
+        const s = statfsSync(m.mount)
+        const bsize = s.bsize || 4096
+        const total = Number(s.blocks) * bsize
+        const freeBlocks = Number(s.bfree ?? 0)
+        const availBlocks = Number(s.bavail ?? freeBlocks)
+        return {
+          ...m,
+          total,
+          used: total - freeBlocks * bsize,
+          available: availBlocks * bsize,
+          present: true,
+        }
+      } catch {
+        // 挂载点已消失/无权限：只报存在性，不拖垮整个接口。
+        return { ...m, present: true }
+      }
+    })
+  }
+
+  // ── 降级路径：statfs 不可用 ──
+  const now = Date.now()
+  if (diskFallbackCache.value && now - diskFallbackCache.at < DISK_FALLBACK_TTL_MS) {
+    return diskFallbackCache.value.map((d) => ({ ...d }))
+  }
+  // mounts 上面已经读过一次，直接复用，不要再读一遍 /proc/mounts。
+  const fallback = mounts.map((m) => ({ ...m, present: true }))
+  const value = diskUsageViaDf(mounts, fallback)
+  diskFallbackCache = { at: now, value }
+  return value.map((d) => ({ ...d }))
+}
+
+/** `df -k -P`（POSIX 输出，字段稳定），失败则回退到仅报告挂载点存在性。 */
+function diskUsageViaDf(mounts, fallback) {
   let dfOut = ''
   try {
     const r = spawnSync('df', ['-k', '-P'], { encoding: 'utf8', timeout: 5000 })
@@ -118,11 +174,10 @@ function diskUsage() {
   }
 
   // 用 df 的结果补全挂载点（fs 类型从 /proc/mounts 拿）
-  const disks = mountPoints().map((m) => {
+  return mounts.map((m) => {
     const usage = byMount.get(m.mount)
     return usage ? { ...m, ...usage, fs: m.fs } : { ...m, present: true }
   })
-  return disks
 }
 
 /** 收集所有资源指标。 */
@@ -130,12 +185,14 @@ export function readResources() {
   const mem = memoryInfo()
   const cpu = cpuPercent()
   const load = loadavg()
+  // cpus() 每次调用都要重新组装数组（含 model 字符串解析），这里只调一次。
+  const cores = cpus()
 
   return {
     cpu: {
       percent: cpu, // null = 尚无基线（首次）
-      cores: cpus().length,
-      model: cpus()[0]?.model ?? null,
+      cores: cores.length,
+      model: cores[0]?.model ?? null,
       load: { one: load[0], five: load[1], fifteen: load[2] },
     },
     memory: {

@@ -11,7 +11,7 @@ import { createReadStream, existsSync, statSync, realpathSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { join, normalize, extname } from 'node:path'
+import { join, normalize, extname, sep } from 'node:path'
 
 import { cleanLine, lanAddresses, localHost, nowIso, LAN_PROXY_PORT } from './dashboard-utils.js'
 import {
@@ -1017,52 +1017,12 @@ async function proxyToDsh(request, response, { pathPrefix }) {
 
       // HTML：读完整 body，移除 CSP、注入 __DSH_TRANSPORT__ 补丁、禁用强缓存。
       if (contentType.includes('text/html')) {
-        const chunks = []
-        let buffered = 0
-        // 上限保护：上游误标 content-type 或超大 HTML 会让单请求吃任意内存。
-        // 超 8MB 直接放弃注入，原样透传（管道直通，无内存驻留）。
-        const HTML_BUFFER_CAP = 8 * 1024 * 1024
-        upstreamResponse.on('data', (c) => {
-          buffered += c.length
-          if (buffered <= HTML_BUFFER_CAP) chunks.push(c)
-        })
-        upstreamResponse.on('end', () => {
-          // 对齐 Go 版 rewriteFnGatewayHtml：先给 manifest 注入 crossorigin
-          // （网关鉴权 Cookie 携带），再注入特权声明 + 样式隐藏补丁。
-          //
-          // This runs inside a stream 'end' handler, where a throw is an
-          // uncaughtException — and it did throw, on a Buffer-vs-string type
-          // mismatch in injectManifestCredentials, which broke every HTML page
-          // the panel proxied. Injection is a convenience (a privilege hint and
-          // a hidden button), not a correctness requirement, so a failure here
-          // must degrade to "serve the page unmodified" instead of dropping the
-          // request.
-          const raw = Buffer.concat(chunks)
-          let body = raw
-          try {
-            if (buffered <= HTML_BUFFER_CAP) {
-              body = injectDshHtml(injectManifestCredentials(raw), DSH_HTML_SHIM)
-            }
-          } catch (error) {
-            body = raw
-            console.log(`[proxy] html injection skipped: ${error?.message ?? error}`)
-          }
-          delete out['content-security-policy']
-          delete out['content-security-policy-report-only']
-          out['cache-control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-          out['pragma'] = 'no-cache'
-          out['expires'] = '0'
-          delete out['etag']
-          delete out['last-modified']
-          out['content-type'] = 'text/html; charset=utf-8'
-          out['content-length'] = body.length
-          response.writeHead(status, out)
-          response.end(body)
-          visit(status)
-        })
-        upstreamResponse.on('error', () => {
-          if (!response.headersSent) response.writeHead(502)
-          response.end()
+        proxyHtml({
+          status,
+          headers: out,
+          upstream: upstreamResponse,
+          response,
+          onDone: visit,
         })
         return
       }
@@ -1324,17 +1284,127 @@ export function createLanProxyServer() {
   return server
 }
 
+/** 单个 HTML 响应允许驻留内存做注入的上限。超过即放弃注入、原样透传。 */
+const HTML_BUFFER_CAP = 8 * 1024 * 1024
+
+/**
+ * HTML 响应处理：移除 CSP → 注入 __DSH_TRANSPORT__ 补丁 → 禁用强缓存。
+ *
+ * 上限保护是必要的（上游误标 content-type 或超大 HTML 会让单请求吃任意内存），
+ * 但**旧实现的"超限时原样透传"是错的**：它在 'data' 里
+ * `if (buffered <= CAP) chunks.push(c)`，超限后停止收集，最后
+ * `Buffer.concat(chunks)` 得到的是被截断的前 8MB，而且还用
+ * `content-length = body.length` 把这个截断长度**声明成完整长度** —— 客户端拿到
+ * 一个残缺页面却毫无提示（触发概率低，dsh 的 HTML 通常几十 KB，但逻辑是错的）。
+ *
+ * 现在超限分支是真的管道直通：
+ *   - content-length 已声明且超限 → 从第一个字节起就 pipe，连缓冲都不建；
+ *   - chunked（无 content-length）中途超限 → 把已收到的部分写出，剩余继续 pipe，
+ *     并且**删掉 content-length** 交给分块编码，绝不声明一个错误的长度。
+ */
+function proxyHtml({ status, headers, upstream, response, onDone }) {
+  /** 与注入无关、两种路径都要改的响应头。 */
+  const harden = (out) => {
+    delete out['content-security-policy']
+    delete out['content-security-policy-report-only']
+    out['cache-control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    out['pragma'] = 'no-cache'
+    out['expires'] = '0'
+    delete out['etag']
+    delete out['last-modified']
+    out['content-type'] = 'text/html; charset=utf-8'
+    return out
+  }
+
+  const chunks = []
+  let buffered = 0
+  let streaming = false
+
+  // 'error' 监听必须在任何提前 return 之前挂上。IncomingMessage 的 'error' 没有
+  // 监听器就是 uncaughtException；而且 declaredTooBig 分支直接 pipe，若中途出错
+  // 客户端会一直挂到超时（pipe 只负责解绑，不会结束 response）。
+  upstream.on('error', () => {
+    if (!response.headersSent) response.writeHead(502)
+    try { response.end() } catch { /* already ended */ }
+  })
+
+  const startStreaming = () => {
+    if (streaming) return
+    streaming = true
+    const out = harden({ ...headers })
+    // 超限即放弃注入。长度未知/不完整，交给分块编码，不声明 content-length。
+    delete out['content-length']
+    response.writeHead(status, out)
+    for (const chunk of chunks) response.write(chunk)
+    chunks.length = 0
+    upstream.pipe(response)
+  }
+
+  const declared = Number(upstream.headers['content-length'])
+  if (Number.isFinite(declared) && declared > HTML_BUFFER_CAP) {
+    startStreaming()
+    onDone(status)
+    return
+  }
+
+  upstream.on('data', (chunk) => {
+    if (streaming) return
+    buffered += chunk.length
+    chunks.push(chunk)
+    // chunked 响应没有声明长度，只能边收边判：一旦超限立刻切直通。
+    if (buffered > HTML_BUFFER_CAP) {
+      startStreaming()
+      onDone(status)
+    }
+  })
+
+  upstream.on('end', () => {
+    if (streaming) return
+    // 对齐 Go 版 rewriteFnGatewayHtml：先给 manifest 注入 crossorigin
+    // （网关鉴权 Cookie 携带），再注入特权声明 + 样式隐藏补丁。
+    //
+    // This runs inside a stream 'end' handler, where a throw is an
+    // uncaughtException — and it did throw, on a Buffer-vs-string type
+    // mismatch in injectManifestCredentials, which broke every HTML page
+    // the panel proxied. Injection is a convenience (a privilege hint and
+    // a hidden button), not a correctness requirement, so a failure here
+    // must degrade to "serve the page unmodified" instead of dropping the
+    // request.
+    const raw = Buffer.concat(chunks)
+    chunks.length = 0
+    let body = raw
+    try {
+      body = injectDshHtml(injectManifestCredentials(raw), DSH_HTML_SHIM)
+    } catch (error) {
+      body = raw
+      console.log(`[proxy] html injection skipped: ${error?.message ?? error}`)
+    }
+    const out = harden({ ...headers })
+    out['content-length'] = body.length
+    response.writeHead(status, out)
+    response.end(body)
+    onDone(status)
+  })
+}
+
+/** `child` 是否真的位于 `dir` 内（同目录本身算内，同级同名前缀不算）。 */
+function withinDir(child, dir) {
+  return child === dir || child.startsWith(dir.endsWith(sep) ? dir : `${dir}${sep}`)
+}
+
 async function serveStatic(request, response, pathname) {
   const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
   const full = join(UI_DIR, normalize(relative).replace(/^(\.\.[/\\])+/, ''))
-  if (!full.startsWith(UI_DIR) || !existsSync(full) || !statSync(full).isFile()) {
+  // 前缀判断必须带分隔符：/ui 与 /ui-other 是同级目录，裸 startsWith('/ui')
+  // 会把后者也算进 ui 目录内。
+  if (!withinDir(full, UI_DIR) || !existsSync(full) || !statSync(full).isFile()) {
     return badRequest(response, 'not-found', 404)
   }
   // 符号链接逃逸：前缀校验是词法的，createReadStream 会跟随 ui 目录内指向
   // 外部的 symlink 读取任意文件。realpath 校验真实路径仍在 UI_DIR 内。
   try {
     const real = realpathSync(full)
-    if (!real.startsWith(realpathSync(UI_DIR))) return badRequest(response, 'not-found', 404)
+    if (!withinDir(real, realpathSync(UI_DIR))) return badRequest(response, 'not-found', 404)
   } catch { return badRequest(response, 'not-found', 404) }
   response.writeHead(200, {
     'content-type': MIME[extname(full).toLowerCase()] || 'application/octet-stream',

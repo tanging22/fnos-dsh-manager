@@ -1,8 +1,8 @@
 appname=fnos-dsh-manager
-version=1.0.37
+version=1.0.38
 display_name=DSH 管理器
 desc=DeepSeek Harness 的 fnOS 管理面板：查看运行状态与实时日志、在线安装并切换 dsh 版本、记录最近访问来源 IP、提供快捷入口。本套件不内置 dsh 本体，版本由面板按需从 npm 下载，因此升级 dsh 不需要重装套件。
-changelog=1.0.37 修复安装带 postinstall 生命周期脚本的插件失败（如 dsh-workbuddy-connect 依赖的 protobufjs）：面板被 fnOS 套件框架降权启动后自身环境无 PATH，spawn dsh 时原样继承导致 dsh 内 pnpm 执行 postinstall 找不到 node（os error 2），现用 nodeDirEnv 补全 PATH。1.0.36 修复经网关访问时 /ws 握手被 origin-host-mismatch 拒（403）以及服务端控制帧误带 mask 位两项 WS 推送 bug。1.0.35 系统化加固 13 文件。check 31/15/0、smoke 83/83。
+changelog=1.0.38 性能与稳定性维护版：磁盘用量改用 statvfs(2) 去掉每 3 秒一次的同步 fork df；端口→PID 反查改增量核对并放宽 TTL，长跑空闲 CPU 显著下降；修复插件删除接口未校验包名导致的路径穿越（可递归删除任意目录）；修复版本列表把 rc/alpha 排在正式版前面；修复超 8MB HTML 被静默截断且声明错误 content-length；registry 查询改走 npm view 以让代理生效；另有 fd 泄漏、启动不等端口释放、受信主机配置目录与 dsh 实际 home 不一致、行缓冲上限截断顺序等修复。发布前自审又修正 3 项本轮引入的问题。check 31/15/0、smoke 92/92。1.0.37 修复安装带 postinstall 生命周期脚本的插件失败（如 dsh-workbuddy-connect 依赖的 protobufjs）：面板被 fnOS 套件框架降权启动后自身环境无 PATH，spawn dsh 时原样继承导致 dsh 内 pnpm 执行 postinstall 找不到 node（os error 2），现用 nodeDirEnv 补全 PATH。1.0.36 修复经网关访问时 /ws 握手被 origin-host-mismatch 拒（403）以及服务端控制帧误带 mask 位两项 WS 推送 bug。1.0.35 系统化加固 13 文件。check 31/15/0、smoke 83/83。
 platform=all
 source=thirdparty
 maintainer=tanging22

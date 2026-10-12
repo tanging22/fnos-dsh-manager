@@ -9,18 +9,17 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import {
-  compareVersions,
   existsSync as fileExists,
-  joinUrl,
   npmBin,
   npmEnv as npmEnvShared,
+  registryDoc,
   runWithTimeout,
 } from './dashboard-utils.js'
 import {
   DATA_DIR,
   DSH_PACKAGE,
   NODE_MODULES_DSH,
-  VERSIONS_DIR,
+  compareVersions,
   invalidateVersionsCache,
   listInstalledVersions,
   loadConfig,
@@ -61,35 +60,30 @@ export async function fetchAvailableVersions({ force = false } = {}) {
     } catch { /* fall through to network */ }
   }
 
-  // Scoped packages keep their slash: the registry path is /@scope/name, and
-  // encodeURIComponent would turn both separators into escapes npm won't match.
-  const packagePath = DSH_PACKAGE.startsWith('@')
-    ? `${DSH_PACKAGE.slice(0, DSH_PACKAGE.indexOf('/'))}/${encodeURIComponent(DSH_PACKAGE.slice(DSH_PACKAGE.indexOf('/') + 1))}`
-    : encodeURIComponent(DSH_PACKAGE)
-  const url = joinUrl(registry(), `/${packagePath}`)
-  const result = await runWithTimeout(process.execPath, [
-    '-e',
-    `
-    const url = process.argv[1];
-    fetch(url, { headers: { accept: 'application/vnd.npm.install-v1+json' } })
-      .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
-      .then(doc => {
-        const versions = Object.keys(doc.versions || {});
-        const latest = doc['dist-tags']?.latest;
-        process.stdout.write(JSON.stringify({ versions, latest }));
-      })
-      .catch(e => { process.stderr.write(e.message); process.exit(1); });
-    `,
-    url,
-  ], 25000, { env: await npmEnv() })
-
-  if (result.code !== 0) {
-    return { versions: [], latest: null, error: (result.stderr || 'registry-unreachable').trim().slice(0, 400) }
+  // 走 `npm view` 而不是 `node -e fetch`：Node 的 fetch（undici）**不读
+  // HTTP_PROXY/HTTPS_PROXY 环境变量**，而 npm 读。于是"设置里配了代理"时旧实现
+  // 表现为 npm install 成功、可用版本列表却永远 registry-unreachable。
+  // npm view 复用 npm 自己的 registry/代理/证书配置，一处配置处处生效。
+  const doc = await registryDoc(DSH_PACKAGE, { registry: registry(), proxy: loadConfig().install?.proxy })
+  if (!doc.ok) {
+    return { versions: [], latest: null, error: doc.detail ? `${doc.error}: ${doc.detail}` : doc.error }
   }
 
   let parsed = { versions: [], latest: null }
-  try { parsed = JSON.parse(result.stdout) } catch { return { versions: [], latest: null, error: 'bad-registry-payload' } }
+  try {
+    const docVersions = doc.doc?.versions
+    // npm view 的 versions 是数组还是对象取决于 npm 版本/是否带 --json。
+    const list = Array.isArray(docVersions) ? docVersions : Object.keys(docVersions ?? {})
+    parsed = { versions: list, latest: doc.doc?.['dist-tags']?.latest ?? null }
+  } catch {
+    return { versions: [], latest: null, error: 'bad-registry-payload' }
+  }
 
+  // compareVersions 必须用 dashboard-config.js 的那个：utils.js 里的同名实现用
+  // split(/[.+-]/) 把 `-` 也当分隔符，**丢失了 prerelease 语义**（正式版应高于
+  // 自己的预发布版），于是列表顶部会压着 rc/alpha：
+  //   0.2.1-rc.1 , 0.2.1-alpha.2 , 0.2.1-alpha.1 , 0.2.1   ← 误
+  //   0.2.1      , 0.2.1-rc.1    , 0.2.1-alpha.2 , ...      ← 正
   const versions = [...(parsed.versions ?? [])].sort(compareVersions).reverse()
   const payload = { versions, latest: parsed.latest ?? versions[0] ?? null, fetchedAt: Date.now() }
   try {

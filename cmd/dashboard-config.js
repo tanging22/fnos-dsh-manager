@@ -28,10 +28,33 @@ import {
 } from './dashboard-utils.js'
 
 export const CONFIG_PATH = join(DATA_DIR, 'console-config.json')
-export const CREDENTIALS_PATH = join(DSH_HOME, '.credentials.yaml')
-export const ENV_PATH = join(DSH_HOME, '.env')
-export const PROXY_CONF = join(DSH_HOME, 'proxy.conf')
-export const TRUSTED_CONF = join(DSH_HOME, 'trusted_hosts.conf')
+
+/**
+ * dsh 的 home 相关路径 —— 一律走 `activeDshHome()` 而不是常量 `DSH_HOME`。
+ *
+ * 旧实现在模块加载时用 `DSH_HOME`（= `${DATA_DIR}/dsh_home`）把这些路径固定
+ * 下来，而 `preStartSelfHeal()` / `dshLaunch()` / `profileDir()` 用的是
+ * `activeDshHome()`（读 `${DATA_DIR}/workspace.active`，可能指向版本目录下的
+ * 另一个 home）。结果是两条路径不一致：chmod/chown 自愈修的是 A 目录，受信
+ * 主机、凭据、proxy.conf 却写在 B 目录 → 权限自愈与受信主机配置双双失效。
+ *
+ * 这些改成函数，每次调用时重新解析，与 dsh 实际使用的 home 保持同源。
+ */
+export function credentialsPath() {
+  return join(activeDshHome(), '.credentials.yaml')
+}
+
+export function envPath() {
+  return join(activeDshHome(), '.env')
+}
+
+export function proxyConfPath() {
+  return join(activeDshHome(), 'proxy.conf')
+}
+
+export function trustedConfPath() {
+  return join(activeDshHome(), 'trusted_hosts.conf')
+}
 export const VERSIONS_DIR = join(DATA_DIR, 'versions')
 export const LOGS_DIR = join(DATA_DIR, 'logs')
 export const CONSOLE_LOG = join(DATA_DIR, 'console.log')
@@ -801,13 +824,13 @@ export function applyLanBinding() {
 }
 
 export function proxyUrl() {
-  const conf = readKeyValueFile(PROXY_CONF).PROXY
+  const conf = readKeyValueFile(proxyConfPath()).PROXY
   return conf || ''
 }
 
 export function trustedHosts() {
   try {
-    return readFileSync(TRUSTED_CONF, 'utf8')
+    return readFileSync(trustedConfPath(), 'utf8')
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter((line) => line && !line.startsWith('#'))
@@ -823,8 +846,9 @@ export function trustedHosts() {
  */
 export function writeTrustedHosts(list) {
   const hosts = [...new Set((list ?? []).map((h) => String(h).trim().toLowerCase()).filter(Boolean))]
-  mkdirSync(DSH_HOME, { recursive: true })
-  writeFileSync(TRUSTED_CONF, `${hosts.join('\n')}${hosts.length ? '\n' : ''}`, 'utf8')
+  const home = activeDshHome()
+  mkdirSync(home, { recursive: true })
+  writeFileSync(trustedConfPath(), `${hosts.join('\n')}${hosts.length ? '\n' : ''}`, 'utf8')
   return hosts
 }
 

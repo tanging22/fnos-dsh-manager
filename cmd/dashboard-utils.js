@@ -379,6 +379,97 @@ export function runWithTimeout(command, args = [], timeoutMs = 10000, options = 
 }
 
 /**
+ * 查询 registry 上某个包的元数据（packument）。
+ *
+ * 用 `npm view <pkg> --json`，而不是 `node -e "fetch(url)"`：Node 内置的 fetch
+ * （undici）**不读 HTTP_PROXY / HTTPS_PROXY 环境变量**，而 npm 读。于是只要用户
+ * 在设置里配了代理，旧的 fetch 实现就会出现「npm install 能成功，但可用版本列表
+ * / 插件查询永远报 registry-unreachable」这种自相矛盾的故障。
+ *
+ * 顺带的好处：npm view 复用 npm 自己的 registry、CA、authToken、证书配置，
+ * 面板不需要自己拼 URL / 处理 scope 编码 / 处理镜像站的路径差异。
+ *
+ * 返回 `{ ok: true, doc }` 或 `{ ok: false, error, detail }`，永不抛异常。
+ */
+export async function registryDoc(pkg, { registry, proxy, timeoutMs = 30000 } = {}) {
+  const name = String(pkg ?? '').trim()
+  if (!name) return { ok: false, error: 'missing-package' }
+
+  let result
+  try {
+    const args = ['view', name, '--json']
+    if (registry) args.push('--registry', registry)
+    result = await runWithTimeout(npmBin(), args, timeoutMs, { env: await npmEnv(proxy) })
+  } catch (error) {
+    // spawn 本身抛错（npm 不存在 / Windows 上 .cmd 无法直接 spawn：EINVAL）。
+    // 这是"这台机器上 npm 用不了"，不是"registry 不通"，交给 fetch 兜底。
+    return registryDocViaFetch(name, registry)
+  }
+
+  // code 127 = runWithTimeout 的 spawn 'error' 分支（ENOENT/EACCES/EINVAL），
+  // 同样是 npm 不可用，而不是 registry 的问题。只有 npm 真的跑起来了，它的
+  // 结论（registry-unreachable 等）才可信 —— 否则一次真实的网络故障会白白
+  // 再等一遍 fetch 超时。
+  if (result.code === 127) return registryDocViaFetch(name, registry)
+
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      error: 'registry-unreachable',
+      detail: (result.stderr || result.stdout || '').trim().slice(0, 400),
+    }
+  }
+  // npm 偶尔在 stdout 前面吐一行通知/警告：只取第一个 `{` 到最后一个 `}`。
+  const text = String(result.stdout ?? '')
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) return { ok: false, error: 'bad-registry-payload' }
+  try {
+    return { ok: true, doc: JSON.parse(text.slice(start, end + 1)) }
+  } catch {
+    return { ok: false, error: 'bad-registry-payload' }
+  }
+}
+
+/**
+ * 兜底路径：直接用 Node 的 fetch 打 registry。
+ *
+ * **不读 HTTP_PROXY/HTTPS_PROXY**，所以只有在 npm 根本用不上时才走这里
+ * （CI / 开发机 / npm 缺失的极简环境）。生产环境（fnOS，npm 一定在）由
+ * `npm view` 承担，代理才生效。
+ */
+async function registryDocViaFetch(pkg, registry) {
+  const packagePath = pkg.startsWith('@')
+    ? `${pkg.slice(0, pkg.indexOf('/'))}/${encodeURIComponent(pkg.slice(pkg.indexOf('/') + 1))}`
+    : encodeURIComponent(pkg)
+  const base = String(registry || 'https://registry.npmjs.org').replace(/\/+$/, '')
+  const url = `${base}/${packagePath}`
+  const result = await runWithTimeout(process.execPath, ['-e', `
+    const url = process.argv[1];
+    fetch(url, { headers: { accept: 'application/vnd.npm.install-v1+json' } })
+      .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+      .then(doc => process.stdout.write(JSON.stringify(doc)))
+      .catch(e => { process.stderr.write(e.message); process.exit(1); });
+  `, url], 25000)
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      error: 'registry-unreachable',
+      detail: (result.stderr || '').trim().slice(0, 400),
+    }
+  }
+  const text = String(result.stdout ?? '')
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+  if (start < 0 || end <= start) return { ok: false, error: 'bad-registry-payload' }
+  try {
+    return { ok: true, doc: JSON.parse(text.slice(start, end + 1)) }
+  } catch {
+    return { ok: false, error: 'bad-registry-payload' }
+  }
+}
+
+/**
  * Non-loopback IPv4 addresses: what LAN clients can actually reach.
  *
  * Virtual adapters sort last. VPN/TUN clients (this box grows a `198.18.0.1`

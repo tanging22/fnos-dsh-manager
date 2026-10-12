@@ -10,8 +10,8 @@ import { spawnSync } from 'node:child_process'
 import { join, dirname } from 'node:path'
 import { activeDshHome, npmBin, NODE_BIN } from './dashboard-utils.js'
 import {
-  CREDENTIALS_PATH,
-  ENV_PATH,
+  credentialsPath,
+  envPath,
   CONFIG_PATH,
   dshLaunch,
   dshRoot,
@@ -185,15 +185,21 @@ export function runDiagnostics() {
   }))
 
   checks.push(check('credentials', () => {
-    for (const file of [CREDENTIALS_PATH, ENV_PATH]) {
-      if (!existsSync(file)) continue
+    // 逐个看完所有文件再下结论：旧实现在循环里 `return`，只要
+    // `.credentials.yaml` 存在就直接结束，`.env` 的权限问题永远查不出来
+    // （dsh 对两者都要求 600）。
+    const present = [credentialsPath(), envPath()].filter((file) => existsSync(file))
+    if (!present.length) {
+      return { status: 'warn', detail: 'no credentials file yet', fix: 'Set the DeepSeek API key in Settings.' }
+    }
+    for (const file of present) {
       const mode = modeOf(file)
       if (mode && mode !== '600') {
         return { status: 'fail', detail: `${file} is mode ${mode}; dsh requires 600`, fix: `chmod 600 ${file}` }
       }
-      return { status: 'pass', detail: `${file} (mode ${mode})` }
     }
-    return { status: 'warn', detail: 'no credentials file yet', fix: 'Set the DeepSeek API key in Settings.' }
+    const modes = present.map((file) => `${file} (mode ${modeOf(file)})`).join(', ')
+    return { status: 'pass', detail: modes }
   }))
 
   checks.push(check('port', () => {

@@ -81,11 +81,22 @@ export async function flush() {
   }
 }
 
+/**
+ * Cap the log at `access.max` records.
+ *
+ * 只在超过上限 20% 时才裁。旧实现每次 flush（每 20 条记录或 1 秒一次，取先到
+ * 者）都执行一遍 read 全文件 + write 全文件 + rename —— 即 O(n) 全量重写按
+ * 秒触发，文件越大越贵，且 flush 本身是同步 I/O，直接卡住事件循环。
+ * 留出 20% 的余量把重写摊薄：500 条上限时，从「每秒一次 500 行重写」变成
+ * 「每 100 条记录一次 600 行重写」。
+ */
+const TRIM_SLACK = 1.2
+
 function trimLog() {
   const max = Math.max(1, Number(loadConfig().access?.max ?? 500))
   try {
     const lines = readFileSync(ACCESS_LOG_PATH, 'utf8').split('\n').filter(Boolean)
-    if (lines.length <= max) return
+    if (lines.length <= Math.ceil(max * TRIM_SLACK)) return
     const tmp = `${ACCESS_LOG_PATH}.tmp`
     writeFileSync(tmp, `${lines.slice(lines.length - max).join('\n')}\n`, 'utf8')
     renameSync(tmp, ACCESS_LOG_PATH)

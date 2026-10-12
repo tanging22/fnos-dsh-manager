@@ -129,18 +129,24 @@ function writePid(pid) {
 /**
  * Signal an entire process group. Because dsh is spawned `detached: true`, it
  * is a group leader (pgid == its pid), so `-pid` reaches every descendant.
- * Returns `true` once the group is gone (or never existed).
+ *
+ * 返回值语义：**信号送达返回 `false`，组已消失（或从未存在）返回 `true`**
+ * —— 也就是"这个组还在不在"，与函数名相反。历史上这里写成
+ * `error.code === 'EPERM' ? false : false`（两个分支相同，明显笔误），
+ * 语义无从判断。当前没有调用方使用返回值，但极易误导后续维护，故在此写明。
  */
 function signalGroup(pgid, signal) {
   if (!pgid || pgid <= 0) return true
   try {
     process.kill(-pgid, signal)
   } catch (error) {
-    // ESRCH means the group is already gone — that's success.
+    // ESRCH means the group is already gone — that's "gone".
     if (error && error.code === 'ESRCH') return true
-    // EPERM on an adopted pid we do not own: fall through to single-pid below.
-    return error && error.code === 'EPERM' ? false : false
+    // EPERM（进程存在但我们无权发信号，例如被接管的 adopted pid）：
+    // 组还在，调用方会退回单 pid kill。
+    return false
   }
+  // 信号已送达，组此刻仍然存在（SIGTERM 是异步的）。
   return false
 }
 
@@ -211,8 +217,14 @@ async function killProcessTree(pid) {
  * Results are cached for `PORT_SCAN_TTL_MS`: the callers either poll on a 1s
  * tick or run inside a stop sequence where a second of staleness is harmless,
  * and the alternative is one scan per call site rather than per tick.
+ *
+ * 第二轮优化（长跑）：TTL 750ms 在看门狗 1s tick 下几乎等于每次都真扫 ——
+ * 省不下任何一次扫描，却保留了缓存的全部复杂度。提到 3000ms 后，稳态下每
+ * 3~4 个 tick 才扫一次。所有"端口即将易主"的调用点（startDsh / stopDsh /
+ * waitForPortFree / restart）都已经显式 `invalidatePortScan()`，3 秒的陈旧
+ * 窗口不会造成误判。
  */
-const PORT_SCAN_TTL_MS = 750
+const PORT_SCAN_TTL_MS = 3000
 const portScanCache = new Map() // port -> { at, pids }
 
 /** Parse `/proc/net/tcp{,6}` into a set of listening socket inodes per port. */
@@ -238,23 +250,73 @@ function listeningInodes(port) {
   return inodes
 }
 
+/**
+ * 上一轮全量扫描得到的 socket inode → pid 映射。
+ *
+ * 稳态下（dsh 正常监听）端口上的 inode 集合每轮都一样，命中它的进程也不会
+ * 变。所以先花 O(命中数 × fd) 去核对缓存里的候选 pid —— 通常只有 1 个进程、
+ * 十几个 readlink —— 只有核对失败（进程换了、端口被抢占）才回到 O(全部进程
+ * × 全部 fd) 的全量扫描。NAS 上这是从 ~4000 次系统调用降到 ~20 次的差别，
+ * 也是面板空闲时 CPU 占用的主要来源。
+ */
+let inodeOwnerCache = new Map() // inode -> pid
+
+/** 该 pid 是否仍持有这个 socket inode（一次 /proc/<pid>/fd 遍历）。 */
+function pidHoldsInode(pid, inode) {
+  if (!isAlive(pid)) return false
+  let fds = []
+  try { fds = readdirSync(`/proc/${pid}/fd`) } catch { return false }
+  for (const fd of fds) {
+    let link = ''
+    try { link = readlinkSync(`/proc/${pid}/fd/${fd}`) } catch { continue }
+    if (link === `socket:[${inode}]`) return true
+  }
+  return false
+}
+
 /** Map socket inodes to pids via `/proc/<pid>/fd`. */
 function pidsForInodes(inodes) {
   if (!inodes.size) return []
   const pids = new Set()
+
+  // 快路径：核对上一轮的 inode → pid 映射。
+  let allResolved = true
+  for (const inode of inodes) {
+    const pid = inodeOwnerCache.get(inode)
+    if (pid && pidHoldsInode(pid, inode)) pids.add(pid)
+    else allResolved = false
+  }
+  if (allResolved && pids.size) return [...pids]
+
+  // 慢路径：全量扫描。
+  //
+  // 缓存里**只记本次查询的 inode**（而不是全系统每个 socket 都记一条）：
+  // `findPidsOnPort()` 永远只查 dsh 那一个端口，给其余几万个 socket 各建一条
+  // Map 记录换不来任何命中，纯占内存。查询集通常只有 1~3 个 inode，所以缓存规模
+  // 被它封顶，且每次整体替换 —— 不会随重启次数累积陈旧条目。
+  const found = new Map()
   let entries = []
-  try { entries = readdirSync('/proc') } catch { return [] }
+  try { entries = readdirSync('/proc') } catch { return [...pids] }
   for (const name of entries) {
     if (!/^\d+$/.test(name)) continue
+    const pid = Number(name)
     let fds = []
     try { fds = readdirSync(`/proc/${name}/fd`) } catch { continue }
     for (const fd of fds) {
       let link = ''
       try { link = readlinkSync(`/proc/${name}/fd/${fd}`) } catch { continue }
       const m = /^socket:\[(\d+)\]$/.exec(link)
-      if (m && inodes.has(m[1])) { pids.add(Number(name)); break }
+      if (!m) continue
+      if (inodes.has(m[1])) {
+        pids.add(pid)
+        // 同一个 socket 可能被多个 pid 持有（fork 继承）：旧实现会把它们都收下，
+        // 这里保持同样语义，只在缓存里记第一个（快路径命中它即可）。
+        if (!found.has(m[1])) found.set(m[1], pid)
+        break
+      }
     }
   }
+  inodeOwnerCache = found
   return [...pids]
 }
 
@@ -341,9 +403,17 @@ function findDshPidOnPort(port) {
   return 0
 }
 
-/** Block up to 500ms for the port to actually free. */
+/**
+ * Block for the port to actually free.
+ *
+ * 预算 1500ms 而不是 500ms：调用它的两处都在"刚刚 SIGTERM/SIGKILL 过"之后，
+ * 而优雅关闭的 dsh 要 flush 日志/会话，几百毫秒很正常。500ms 太容易在进程还
+ * 没退完时就判定"端口仍被占用"，调用方（尤其新加的 preStartSelfHeal）于是带着
+ * 一个将死的监听去 spawn，撞上 EADDRINUSE。端口一旦真的释放，循环会立刻返回，
+ * 所以放宽预算只影响失败路径，不拖慢正常停止。
+ */
 async function waitForPortFree(port) {
-  const deadline = Date.now() + 500
+  const deadline = Date.now() + 1500
   while (Date.now() < deadline) {
     invalidatePortScan()
     if (findPidsOnPort(port).length === 0) return
@@ -465,14 +535,23 @@ async function preStartSelfHeal(home, port) {
   const notes = []
 
   // 1. Stale listeners on the dsh port (previous unclean shutdown).
+  let killedStale = false
   if (process.platform !== 'win32') {
     for (const pid of findPidsOnPort(port)) {
       if (pid === process.pid) continue
       try {
         if (!isDshProcess(pid)) continue
         process.kill(pid, 'SIGTERM')
+        killedStale = true
         notes.push(`killed stale dsh pid ${pid} on port ${port}`)
       } catch { /* gone already, or unreadable */ }
+    }
+    // SIGTERM 是异步的：发完立刻往下走，startDsh 紧接着 spawn 新进程，而旧
+    // 进程可能还握着端口 → 新进程直接 EADDRINUSE，UI 卡在「启动中」。
+    // stopDsh() 结尾有这一步，启动路径此前缺了。
+    if (killedStale) {
+      await waitForPortFree(port)
+      notes.push(`port ${port} released before launch`)
     }
   }
 
@@ -686,8 +765,12 @@ export async function startDsh() {
     CI: 'true',
     DSH_AGENTS_HOME: join(home, 'agents'),
   })
+  // fd 提到 try 外面：spawn() 同步抛出时（ENOENT/EACCES/EMFILE）catch 分支
+  // 必须能关掉它。此前 catch 分支漏了 closeSync，正是本模块专门修过的 fd
+  // 泄漏（见下方 'exit' 处理里的注释）在同一个函数里的遗漏路径。
+  let fd = null
   try {
-    const fd = openSync(DSH_LOG, 'a')
+    fd = openSync(DSH_LOG, 'a')
     // dsh runs AS the panel (no setuid) — the panel lacks CAP_SETUID, so any
     // `uid`/`gid` here fails with `spawn EPERM`. This matches the Go reference,
     // whose `SysProcAttr` only sets `Setpgid` and never drops privileges.
@@ -749,6 +832,8 @@ export async function startDsh() {
 
     return { ok: true, pid: child.pid, already: false }
   } catch (error) {
+    // spawn() 同步抛出的分支同样开了 fd（openSync 在 try 内但在 spawn 之前）。
+    if (fd !== null) { try { closeSync(fd) } catch { /* already closed */ } }
     appendLog(`[fnos-dsh-manager] spawn failed: ${error?.message ?? error}\n`)
     SetStatus(StatusStopped, `启动失败: ${error?.message ?? error}`)
     return { ok: false, error: 'spawn-failed' }

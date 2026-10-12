@@ -185,7 +185,10 @@ export function listDirectory(requested) {
   return {
     ok: true,
     path: target,
-    parent: allowed === target ? null : resolve(target, '..'),
+    // `allowed` 是 workspace.json 里的原始字符串，`target` 是 resolve() 后的绝对
+    // 路径 —— 两者几乎不可能严格相等，于是在根工作区时 parent 仍指向 `..`，
+    // 前端「上级」按钮会跳到一个必然被 403 拒绝的路径。两边都规范化后再比。
+    parent: resolve(allowed) === target ? null : resolve(target, '..'),
     children,
   }
 }

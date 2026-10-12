@@ -52,10 +52,33 @@ function check(name, condition, detail) {
  * `injectManifestCredentials` could call `.replace()` on a Buffer and throw an
  * uncaught exception on every HTML response while the suite stayed green.
  */
+/* An oversized HTML page: bigger than the panel's 8MB injection cap.
+ *
+ * The buffer cap exists so a mislabelled upstream cannot make one request eat
+ * arbitrary memory — but the old implementation implemented "give up injecting
+ * and pass it through" as `if (buffered <= CAP) chunks.push(c)`, i.e. it stopped
+ * collecting, returned the truncated first 8MB, AND declared that truncated
+ * length as `content-length`. The client silently got a broken page. The fix
+ * pipes the response straight through instead, so the body must arrive intact.
+ */
+const HUGE_PREFIX = '<!doctype html><html><body>'
+const HUGE_SUFFIX = '</body></html>'
+const HUGE_PADDING = 9 * 1024 * 1024
+const HUGE_HTML_LENGTH = HUGE_PREFIX.length + HUGE_PADDING + HUGE_SUFFIX.length
+
 let stubHits = 0
 const stub = createServer((request, response) => {
   stubHits += 1
   const url = request.url ?? '/'
+  if (url.startsWith('/html-huge')) {
+    const body = `${HUGE_PREFIX}${'x'.repeat(HUGE_PADDING)}${HUGE_SUFFIX}`
+    response.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': Buffer.byteLength(body),
+    })
+    response.end(body)
+    return
+  }
   if (url.startsWith('/html')) {
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     response.end(`<!doctype html><html><head>
@@ -393,6 +416,14 @@ try {
     injectedHtml.includes('你好'), 'multi-byte characters were mangled by the re-encode')
   check('the panel survives proxying HTML',
     (await call('/api/status')).status === 200, 'panel died proxying HTML')
+
+  const hugeProxy = await call('/p/html-huge', { key: '' })
+  const hugeBody = await hugeProxy.text()
+  check('proxy passes an oversized HTML page through untruncated',
+    hugeBody.length === HUGE_HTML_LENGTH,
+    `got ${hugeBody.length} bytes, want ${HUGE_HTML_LENGTH}`)
+  check('the panel survives proxying oversized HTML',
+    (await call('/api/status')).status === 200, 'panel died proxying 9MB of HTML')
 
   /* Records are queued and flushed on a timer (see dashboard-access.js), so a
      read taken immediately after the request can still be empty. Poll instead
@@ -832,6 +863,87 @@ async function pythonBin() {
   check('a commented config reports no parse error', probed.err === '', `err=${probed.err}`)
   rmSync(commentProbe, { recursive: true, force: true })
   check('the panel is unaffected by the config probe', (await call('/api/status')).status === 200)
+
+  /* --- regression guards for the audited fixes ----------------------------
+   *
+   * Run in a child process with its own throwaway DATA_DIR, so they can import
+   * the real modules without ever touching a live install. Each one pins a bug
+   * that was found by reading the code rather than by watching it fail, which
+   * is exactly the kind that silently comes back.
+   */
+  const guardDir = join(sandbox, 'guard')
+  mkdirSync(guardDir, { recursive: true })
+  const guardScript = `
+    process.env.DATA_DIR = ${JSON.stringify(guardDir)}
+    process.env.DSH_HOME = ${JSON.stringify(join(guardDir, 'dsh_home'))}
+    const load = (p) => import(require('url').pathToFileURL(${JSON.stringify(ROOT)} + '/cmd/' + p).href)
+    Promise.all([
+      load('dashboard-plugins.js'),
+      load('dashboard-config.js'),
+      load('dashboard-resources.js'),
+      load('dashboard-session.js'),
+    ])
+      .then(([plugins, config, resources, session]) => {
+        const out = {
+          validName: plugins.isValidPackageName('dshmarket'),
+          scopedName: plugins.isValidPackageName('@deepseek-ai/dsh'),
+          traversalRejected: !plugins.isValidPackageName('../../../../../../etc'),
+        }
+        // removeBundle 后面是 rmSync(dir, { recursive: true, force: true })；
+        // 路径穿越的名字必须在碰到文件系统之前就被拒。
+        return plugins.removeBundle('../../../../../../etc').then((r) => {
+          out.removeRejected = r.ok === false && r.error === 'invalid-package-name'
+
+          // 行缓冲上限：截断必须发生在"拆完行"之后。先喂一条含 token 的完整行，
+          // 再喂一段 128KB 不含换行的垃圾 —— token 必须仍然被捕获到，否则反代
+          // 会持续 401。
+          session.CaptureLaunchToken('dsh web: http://127.0.0.1:28000/?token=abc123\\n')
+          out.tokenAfterHugeNoise = session.GetCurrentLaunchToken() === 'abc123'
+          session.CaptureLaunchToken('x'.repeat(128 * 1024))
+          out.bufferBounded = true // 能走到这里就说明没有 OOM/抛错
+
+          // 校验与写入必须同一个名字：入参带空格时若写入原始值，package.json 里
+          // 会留下一个和 npm 实际装的包对不上的条目。
+          return plugins.setBundleEnabled('  dshmarket  ', true).then((r2) => {
+            out.trimmedWrite = r2.ok === true && r2.name === 'dshmarket'
+            const pkg = JSON.parse(require('fs').readFileSync(plugins.profilePackagePath(), 'utf8'))
+            out.bundleRecorded = (pkg.dsh?.profile?.bundles ?? []).includes('dshmarket')
+
+            const list = ['0.2.1', '0.2.1-rc.1', '0.2.1-alpha.2']
+            out.order = [...list].sort(config.compareVersions).reverse().join(',')
+            const t0 = Date.now()
+            const res = resources.readResources()
+            out.diskMs = Date.now() - t0
+            out.diskTotal = (res.disks[0] || {}).total || 0
+            process.stdout.write(JSON.stringify(out))
+          })
+        })
+      })
+      .catch((e) => { process.stdout.write(JSON.stringify({ fatal: String(e && e.message) })) })
+  `
+  const guardOut = await new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e', guardScript], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.on('data', (chunk) => { out += chunk })
+    child.stderr.on('data', () => { /* keep quiet; stdout carries the verdict */ })
+    child.on('close', () => resolve(out))
+    child.on('error', () => resolve(''))
+  })
+  let guard = {}
+  try { guard = JSON.parse(guardOut || '{}') } catch { guard = {} }
+
+  check('a normal package name is accepted', guard.validName === true && guard.scopedName === true, JSON.stringify(guard))
+  check('a traversal package name is rejected', guard.traversalRejected === true, JSON.stringify(guard))
+  check('removeBundle refuses traversal before any recursive delete',
+    guard.removeRejected === true, JSON.stringify(guard))
+  check('the launch-token line survives a huge newline-free burst',
+    guard.tokenAfterHugeNoise === true, `token=${guard.tokenAfterHugeNoise}`)
+  check('bundle enable/disable records the trimmed package name',
+    guard.trimmedWrite === true && guard.bundleRecorded === true, JSON.stringify(guard))
+  check('version sorting puts a release above its own prerelease',
+    guard.order === '0.2.1,0.2.1-rc.1,0.2.1-alpha.2', `got ${guard.order}`)
+  check('the resource sampler answers without forking a subprocess',
+    guard.diskTotal > 0 && guard.diskMs < 1000, `total=${guard.diskTotal} in ${guard.diskMs}ms ${guard.fatal ?? ''}`)
 } finally {
   panel.kill('SIGTERM')
   stub.close()

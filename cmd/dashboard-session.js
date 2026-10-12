@@ -20,6 +20,8 @@ import { managedPort, webserverHost } from './dashboard-config.js'
 const LAUNCH_TOKEN_RE = /dsh web: .*?[?&]token=([A-Za-z0-9_-]+)/
 
 // 捕获 stdout 时的行缓冲：分块到达时拼出完整行再匹配 token。
+/** 行缓冲硬上限（见 CaptureLaunchToken 里的说明）。 */
+const LINE_BUFFER_CAP = 64 * 1024
 let lineBuffer = ''
 let currentLaunchToken = ''
 let cachedCookie = ''
@@ -57,6 +59,17 @@ export function CaptureLaunchToken(chunk) {
     lineBuffer = lineBuffer.slice(idx + 1)
     const m = LAUNCH_TOKEN_RE.exec(line)
     if (m) SetCurrentLaunchToken(m[1])
+  }
+  // 无上限修复：dsh 若长时间输出不含换行的二进制/进度条，lineBuffer 会无界
+  // 增长（一个从不换行的进程可以在几小时内吃光内存）。
+  //
+  // **必须在拆行循环之后**截断：循环结束后 lineBuffer 只剩最后一条不完整的行，
+  // 此时丢头部是安全的。若在拼行之前就 slice，可能把一条完整的
+  // `dsh web: http://...?token=…` 行从中间切断 —— token 永远捕获不到，反代
+  // 会持续 401，而这种现象极难和"上游改了启动输出"区分开。
+  // token 行本身远小于 64KB，所以"丢头部"不可能丢到 token。
+  if (lineBuffer.length > LINE_BUFFER_CAP) {
+    lineBuffer = lineBuffer.slice(lineBuffer.length - LINE_BUFFER_CAP)
   }
 }
 
