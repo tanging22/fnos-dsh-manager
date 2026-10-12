@@ -42,21 +42,70 @@ function isPanelVisible() {
 // 侧栏折叠：点击靠边（收起）→ 再点展开。持久化到 localStorage。
 const sider = document.getElementById('sider')
 const siderToggle = document.getElementById('sider-toggle')
+const siderScrim = document.getElementById('sider-scrim')
+
+/* 窄屏（≤860px）侧栏改成覆盖式抽屉：见 app.css 的媒体查询。
+   桌面端的「折叠」与移动端的「抽屉」是两件事，不能共用一个 class ——
+   桌面折叠是收窄成图标条（宽度动画），移动抽屉是整块盖在内容上。
+   这里用 matchMedia 判定当前处于哪种模式，各自独立控制，
+   并且移动端不读 localStorage 的折叠状态（那个值在桌面写下"1"，
+   带到手机上会让抽屉变成 46px 的窄条、菜单文字全被隐藏）。 */
+const narrowQuery = window.matchMedia('(max-width: 860px)')
+const isNarrow = () => narrowQuery.matches
+
 function applySiderCollapsed(collapsed) {
   if (sider) sider.classList.toggle('collapsed', collapsed)
   if (siderToggle) siderToggle.setAttribute('aria-expanded', String(!collapsed))
 }
+
+function setDrawerOpen(open) {
+  if (!sider) return
+  sider.classList.toggle('drawer-open', open)
+  if (siderScrim) siderScrim.hidden = !open
+  document.body.classList.toggle('drawer-active', open)
+}
+
+function closeDrawer() {
+  if (isNarrow()) setDrawerOpen(false)
+}
+
 if (siderToggle) {
   siderToggle.addEventListener('click', () => {
+    // 移动端同一个按钮改成开关抽屉；桌面端才是折叠/展开。
+    if (isNarrow()) {
+      setDrawerOpen(!sider.classList.contains('drawer-open'))
+      return
+    }
     const collapsed = sider.classList.toggle('collapsed')
     applySiderCollapsed(collapsed)
     try { localStorage.setItem('dsh-sider-collapsed', collapsed ? '1' : '0') } catch {}
   })
-  // 恢复上次折叠状态
+  // 恢复上次折叠状态。移动端不恢复：见上面的说明。
   let saved = false
   try { saved = localStorage.getItem('dsh-sider-collapsed') === '1' } catch {}
-  applySiderCollapsed(saved)
+  applySiderCollapsed(saved && !isNarrow())
 }
+
+// 点遮罩关闭抽屉
+if (siderScrim) siderScrim.addEventListener('click', closeDrawer)
+
+// Esc 关闭抽屉
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeDrawer()
+})
+
+// 从窄屏切回宽屏时清掉抽屉态，否则 .drawer-open 会残留在宽屏上
+narrowQuery.addEventListener('change', (event) => {
+  if (!event.matches) {
+    setDrawerOpen(false)
+    document.body.classList.remove('drawer-active')
+  }
+})
+
+// 移动端选中菜单后自动收起抽屉，否则菜单被抽屉挡住、要点两次
+sider?.addEventListener('click', (event) => {
+  if (event.target.closest('.menu-item')) closeDrawer()
+})
 
 const state = { tab: 'overview', logFile: null }
 const leavers = []

@@ -5,11 +5,15 @@
 指向 TRIM_APPDEST, 网关转发目标 /var/apps/{appname}/target/app.sock 与之一致),
 把请求反向代理到 127.0.0.1:CONSOLE_PORT (面板自带的 HTTP 服务).
 
-职责边界: 本代理只做三件事 ——
+职责边界: 本代理只做五件事 ——
   1. Unix socket <-> TCP 的桥 (fnOS 网关只认 socket);
   2. 剥掉网关前缀 (/app/dsh-console), 让面板只看到它自己的路径;
-  3. WebSocket 升级请求的原始字节透传 (面板的 /p/ 反代会把 dsh 的 WS 一并透过来).
-  4. 转发时把 Host 重写为 127.0.0.1 并剥掉 X-Forwarded-Host: 面板的信任栅栏
+  3. WebSocket 升级请求的原始字节透传 (面板的 /p/ 反代会把 dsh 的 WS 一并透过来);
+  4. HTTP 响应**流式**转发 —— 上游写一段浏览器就收一段, 不在代理里缓冲整个body。
+     这一条是load bearing 的: 缓冲式读取要等上游关闭才返回, 而 dsh 前端有 SSE
+     与其它长连接, 上游永不关闭时代理手里握着整个响应、浏览器一个字节都收不到,
+     前端等满 60 秒后抛 `Connection timed out after 60000ms`, 页面直接废掉。
+  5. 转发时把 Host 重写为 127.0.0.1 并剥掉 X-Forwarded-Host: 面板的信任栅栏
      是 Host/Origin 判定, 若网关的外部 Host 透传过去, 面板会因名字不受信而
      拒绝. 保留 X-Forwarded-For, 让访问日志还能记到真实客户端 IP.
 
@@ -30,6 +34,17 @@ CONSOLE_PORT = int(os.environ.get("CONSOLE_PORT", "28001"))
 SOCK_PATH = os.environ.get("SOCK_PATH", "/var/apps/dsh-console/target/app.sock")
 BACKEND = ("127.0.0.1", CONSOLE_PORT)
 GATEWAY_PREFIX = os.environ.get("GATEWAY_PREFIX", "/app/dsh-console")
+
+# 建立上游连接 + 发出请求体 + 等响应**头**的时限。它只用来收两种半死连接:
+# 客户端发一半就消失、上游根本不回响应头。**不参与响应体的传输** —— 传输
+# 阶段无时限(见 Handler._stream_phase), 否则一条正常的长连接会被自己的超时
+# 在数据还没到达时就掐断。
+REQUEST_TIMEOUT = 300
+# 每次读写的块大小。
+STREAM_CHUNK = 64 * 1024
+# HTML 必须整体读进来才能重写绝对路径; 超过这个上限就放弃注入、直接流式直通
+# (放弃的是注入, 不是传输)。与面板的 HTML_BUFFER_CAP 同值。
+HTML_BUFFER_CAP = 8 * 1024 * 1024
 
 HOP_BY_HOP = {
     "connection", "proxy-connection", "keep-alive", "transfer-encoding",
@@ -133,9 +148,13 @@ def _relay(sock_a, sock_b):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "dsh-console-gateway"
-    # 全链路读超时: 半开连接 / keep-alive 空闲连接各占一条线程, ThreadingHTTPServer
-    # 的线程只增不减。没有这个超时, rfile.readline() 会永久阻塞, 线程耗尽后整个
-    # 网关停摆（"时好时坏"、重启即恢复的典型形态）。60s 覆盖慢请求与空闲 keep-alive。
+    # 空闲 keep-alive 连接的兜底超时: 半开连接 / 长时间没有任何新请求的连接
+    # 各占一条线程, ThreadingHTTPServer 的线程只增不减。没有它, rfile.readline()
+    # 会永久阻塞, 线程耗尽后整个网关停摆("时好时坏"、重启即恢复的典型形态)。
+    #
+    # 它**只**用于等下一个请求。一旦进来一个请求, _stream_phase() 会把两侧
+    # socket 切到无超时 —— 否则一次 90 秒的上游计算或一条永不关闭的 SSE 会被
+    # 这个"空闲"超时腰斩, 而它在等待期间并没有空闲。
     timeout = 60
 
     def log_message(self, *args):
@@ -302,6 +321,44 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _stream_phase(self, *socks):
+        """进入请求体/响应体传输阶段: 两侧 socket 一律不设读超时。
+
+        `timeout = 60` 的唯一职责是"空闲的 keep-alive 连接别把线程钉死", 它
+        只需要作用在**等下一个请求**那一段。一旦真的进来一个请求, 这条连接就
+        归本次处理管到响应结束 —— 中间可能横跨一次 90 秒的上游计算, 或一条
+        上游永不关闭的 SSE。沿用那个超时等于让代理自己腰斩正常请求: 实测
+        直连上游 90 秒后正常返回的响应, 经网关 60.3 秒就被掐成 502; SSE 则
+        更糟, 浏览器 90 秒收到 0 字节 —— dsh 前端等满 60 秒后抛
+        `Connection timed out after 60000ms`。半死对端改由 TCP keepalive 探测。
+        """
+        for sock in socks:
+            if sock is None:
+                continue
+            try:
+                sock.settimeout(None)
+            except Exception:
+                pass
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if hasattr(socket, "TCP_KEEPIDLE"):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                if hasattr(socket, "TCP_KEEPINTVL"):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                if hasattr(socket, "TCP_KEEPCNT"):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except Exception:
+                pass
+
+    def _write_chunk(self, data, chunked):
+        """把一段响应体写给浏览器, 必要时自己分帧。"""
+        if not data:
+            return
+        if chunked:
+            self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+        else:
+            self.wfile.write(data)
+
     def _http_proxy(self, path):
         conn = None
         try:
@@ -325,37 +382,87 @@ class Handler(BaseHTTPRequestHandler):
             headers.pop("X-Forwarded-Host", None)
             headers.pop("Origin", None)
             headers["Host"] = "127.0.0.1:%d" % CONSOLE_PORT
-            conn = http.client.HTTPConnection(*BACKEND, timeout=60)
+            conn = http.client.HTTPConnection(*BACKEND, timeout=REQUEST_TIMEOUT)
             conn.request(self.command, path, body=body, headers=headers)
             resp = conn.getresponse()
-            # HEAD 响应没有 body, 但下方 _rewrite_html 与 body 转发假定有 body。
+            self._stream_phase(self.connection, conn.sock)
+
+            # HEAD 响应没有 body, 但下方 _rewrite_html 与分帧都假定有 body。
             # HEAD 只回状态行 + 头, 不能写 body。
             is_head = self.command == "HEAD"
+            content_type = resp.getheader("Content-Type") or ""
+            declared = resp.getheader("Content-Length") or ""
+            # Content-Length 由我们自己重新声明(分帧方式可能变), 逐跳头一律剥掉。
+            kept = [(k, v) for k, v in resp.getheaders()
+                    if k.lower() not in ("transfer-encoding", "connection", "content-length")]
+
+            # HTML 要整体读进来才能重写绝对路径。**只在长度已知且不超过上限时**
+            # 才这么做: 长度未知(分块/连接关闭定界)的 HTML 若也去 read(), 就会
+            # 阻塞到收满上限或对端关闭 —— 对一个慢HTML 页面就是一次新的挂起。
+            # 那种情况直接走下面的流式直通, 只是少了路径重写。
+            prefix = b""
+            buffered = None
+            if (not is_head
+                    and content_type.lower().startswith("text/html")
+                    and declared.isdigit()
+                    and int(declared) <= HTML_BUFFER_CAP):
+                buffered = resp.read(int(declared))
+
+            if buffered is not None:
+                data = self._rewrite_html(path, content_type, buffered)
+                self.send_response(resp.status)
+                self._response_started = True
+                for key, value in kept:
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+            # 其余一律流式直通: 上游写一段, 浏览器就收一段。
+            #
+            # 早先这里是 `data = resp.read()` —— 把整个响应缓冲完才发出去。对
+            # SSE / 任何长连接, 上游不关闭就永远读不完, 浏览器一个字节都收不到;
+            # 对慢响应则被 60s 超时腰斩。dsh 前端的
+            # `Connection timed out after 60000ms` 就是这条路径的产物。
+            chunked = not declared.isdigit()
+            if content_type.lower().startswith("text/event-stream"):
+                kept.append(("Cache-Control", "no-cache, no-transform"))
+                kept.append(("X-Accel-Buffering", "no"))
             self.send_response(resp.status)
             self._response_started = True
-            for key, value in resp.getheaders():
-                low = key.lower()
-                if low in ("transfer-encoding", "connection", "content-length"):
-                    continue
+            for key, value in kept:
                 self.send_header(key, value)
-            if is_head:
-                # Content-Length 透传（原值）以便客户端正确解析 HEAD。
-                cl = resp.getheader("Content-Length")
-                if cl is not None:
-                    self.send_header("Content-Length", cl)
-                self.end_headers()
-                return
-            data = resp.read()
-            data = self._rewrite_html(path, resp.getheader("Content-Type"), data)
-            self.send_header("Content-Length", str(len(data)))
+            if chunked:
+                # 上游没给长度: 自己分帧, 否则浏览器会一直等 body 结束。
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Content-Length", declared)
             self.end_headers()
-            self.wfile.write(data)
+            self._write_chunk(prefix, chunked)
+            while True:
+                # read1() 而非 read(): read(n) 会**阻塞直到凑满 n 字节**, 对
+                # SSE 这种"每次上游只推几字节、然后安静很久"的响应, 它等于又
+                # 做了一次缓冲 —— 帧要等凑满 64KB 才发得出去。read1() 每次最多
+                # 一次系统调用, 有多少发多少, 上游写一段浏览器就收一段。
+                chunk = resp.read1(STREAM_CHUNK)
+                if not chunk:
+                    break
+                self._write_chunk(chunk, chunked)
+            if chunked:
+                self.wfile.write(b"0\r\n\r\n")
         except Exception as exc:
             self.fail(502, "upstream unreachable: %s" % exc)
         finally:
             try:
                 if conn:
                     conn.close()
+            except Exception:
+                pass
+            # 把空闲 keep-alive 连接的兜底超时还回去, 否则下一轮
+            # handle_one_request 里的 rfile.readline() 会永久阻塞。
+            try:
+                self.connection.settimeout(self.timeout)
             except Exception:
                 pass
 
@@ -414,12 +521,30 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class UnixServer(ThreadingHTTPServer):
-    address_family = socket.AF_UNIX
+    # AF_UNIX 在模块加载时求值会炸掉 Windows 开发机（那边没有这个属性），
+    # 连带 TCP_LISTEN 模式也起不来。故改为在 __init__ 里惰性读取。
+    address_family = None
     allow_reuse_address = True
     daemon_threads = True
 
+    def __init__(self, path, handler):
+        self.address_family = socket.AF_UNIX
+        super().__init__(path, handler)
+
 
 def main():
+    # 生产永远走 unix socket（fnOS 网关按 ui/config 的 gatewaySocket 拨号）。
+    # TCP_LISTEN 只给开发机用：Windows 的 python 没有 socket.AF_UNIX，网关这一跳
+    # 在开发机上根本起不来，上传穿透这类问题就无法端到端复现。它不被设置时行为
+    # 与之前完全一致。
+    tcp_listen = os.environ.get("TCP_LISTEN")
+    if tcp_listen:
+        server = ThreadingHTTPServer(("127.0.0.1", int(tcp_listen)), Handler)
+        print("dsh-console gateway (dev TCP): 127.0.0.1:%d -> 127.0.0.1:%d (prefix %s)"
+              % (int(tcp_listen), CONSOLE_PORT, GATEWAY_PREFIX), flush=True)
+        server.serve_forever()
+        return
+
     for attempt in range(1, 6):
         try:
             if os.path.exists(SOCK_PATH):

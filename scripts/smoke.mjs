@@ -18,6 +18,7 @@
 import { spawn } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { createHash } from 'node:crypto'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -66,10 +67,55 @@ const HUGE_SUFFIX = '</body></html>'
 const HUGE_PADDING = 9 * 1024 * 1024
 const HUGE_HTML_LENGTH = HUGE_PREFIX.length + HUGE_PADDING + HUGE_SUFFIX.length
 
+/* Timings for the streaming assertions (see the /slow and /sse stubs). Kept
+ * short so the gate stays fast — they exist to prove bytes move BEFORE the
+ * response finishes, not to measure anything. */
+const SLOW_DELAY_MS = 2000
+const SSE_INTERVAL_MS = 300
+
 let stubHits = 0
+/** Last request body the upload sink received; see the sink's comment. */
+let lastUpload = null
 const stub = createServer((request, response) => {
   stubHits += 1
   const url = request.url ?? '/'
+  /* A response that takes a while to arrive, and one that never ends.
+   *
+   * Both exist to pin the gateway's response direction. proxy.py used to read
+   * the whole upstream response into memory (`resp.read()`) before writing a
+   * single byte to the browser, so these two turned into:
+   *
+   *   - `/slow`: the 60s socket timeout fired first and the browser got a 502,
+   *     even though the upstream answered perfectly well — measured 60.3s to
+   *     failure against a 90s upstream that returned fine when dialled directly.
+   *   - `/sse`: the upstream never closes, so `read()` never returned and the
+   *     browser received **zero** bytes — measured 0 bytes after 90s. That is
+   *     the production symptom: dsh's client waits, gets nothing, and throws
+   *     `Connection timed out after 60000ms`.
+   *
+   * Intervals are scaled down (2s / 300ms) so the gate stays fast; what is
+   * being asserted is "bytes flow before the response completes", not timing. */
+  if (url.startsWith('/slow')) {
+    setTimeout(() => {
+      response.writeHead(200, { 'content-type': 'text/plain', 'content-length': 4 })
+      response.end('late')
+    }, SLOW_DELAY_MS)
+    return
+  }
+  if (url.startsWith('/sse')) {
+    response.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+    })
+    let n = 0
+    const timer = setInterval(() => {
+      response.write(`data: tick ${n}\n\n`)
+      n += 1
+    }, SSE_INTERVAL_MS)
+    // Never ends on its own — that is the whole point.
+    response.on('close', () => clearInterval(timer))
+    return
+  }
   if (url.startsWith('/html-huge')) {
     const body = `${HUGE_PREFIX}${'x'.repeat(HUGE_PADDING)}${HUGE_SUFFIX}`
     response.writeHead(200, {
@@ -99,6 +145,36 @@ const stub = createServer((request, response) => {
 </head><body><h1>你好 dsh</h1>
 <div data-slot="settings.action">open config</div>
 </body></html>`)
+    return
+  }
+  /* Binary upload sink. dsh's skill upload is
+   *   POST /api/session/uploadFileBinary?sessionId=…&name=….zip
+   *   content-type: application/octet-stream
+   * and it is the one path where the two reverse proxies handle the body
+   * differently from every other request: the gateway's body_bytes() buffers
+   * the whole thing and re-sends it, while the panel pipes it through. Nothing
+   * here asserted a request BODY ever survived a hop, so a proxy that dropped,
+   * truncated or re-framed it would still have left the suite green — which is
+   * how "the file manager's upload silently fails" can reach production with a
+   * fully green gate. Record the bytes and their hash; the assertions below
+   * compare them against what was sent. */
+  if (url.startsWith('/api/session/uploadFileBinary')) {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = Buffer.concat(chunks)
+      lastUpload = {
+        method: request.method,
+        url,
+        contentType: request.headers['content-type'] ?? '',
+        contentLength: request.headers['content-length'] ?? '',
+        transferEncoding: request.headers['transfer-encoding'] ?? '',
+        size: body.length,
+        sha256: createHash('sha256').update(body).digest('hex'),
+      }
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, size: body.length }))
+    })
     return
   }
   response.writeHead(200, { 'content-type': 'text/plain' })
@@ -329,6 +405,84 @@ function rawUpgradeUnix({ socketPath, host, path, protocol = 'typert-mux' }) {
   })
 }
 
+/**
+ * Plain GET over the gateway's Unix socket that reports WHEN bytes arrived.
+ *
+ * The whole point is the timing, so this deliberately records two moments:
+ * `firstBodyAt` (first byte after the header block) and `endAt` (observation
+ * ended). A proxy that streams gives firstBodyAt << endAt; one that buffers the
+ * whole upstream response first collapses both onto the same instant — or, for
+ * a never-ending upstream, never produces a body byte at all. Those are exactly
+ * the two shapes of the production bug, and asserting on the finished body
+ * alone cannot tell them apart.
+ *
+ * Chunked framing is decoded so the assertions can look at real payload text.
+ */
+function rawStreamUnix({ socketPath, host, path, waitMs = 4000 }) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now()
+    const socket = connect(socketPath, () => {
+      socket.write([
+        `GET ${path} HTTP/1.1`,
+        `Host: ${host}`,
+        'Accept: */*',
+        '',
+        '',
+      ].join('\r\n'))
+    })
+    const chunks = []
+    let headAt = null
+    let firstBodyAt = null
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      const raw = Buffer.concat(chunks)
+      const split = raw.indexOf('\r\n\r\n')
+      const head = split === -1 ? raw.toString('binary') : raw.subarray(0, split).toString('binary')
+      let body = split === -1 ? Buffer.alloc(0) : raw.subarray(split + 4)
+      // De-chunk if the gateway framed it for us (it must, having no length).
+      if (/^transfer-encoding:\s*chunked/im.test(head)) {
+        const parts = []
+        let rest = body
+        for (;;) {
+          const nl = rest.indexOf('\r\n')
+          if (nl === -1) break
+          const size = Number.parseInt(rest.subarray(0, nl).toString('binary').split(';')[0], 16)
+          if (!Number.isFinite(size) || size === 0) break
+          parts.push(rest.subarray(nl + 2, nl + 2 + size))
+          rest = rest.subarray(nl + 2 + size + 2)
+        }
+        body = Buffer.concat(parts)
+      }
+      resolve({
+        head,
+        body: body.toString('binary'),
+        status: Number(/^HTTP\/1\.\d (\d{3})/.exec(head)?.[1] ?? 0),
+        headAt,
+        firstBodyAt,
+        endAt: Date.now() - started,
+        total: raw.length,
+      })
+      socket.destroy()
+    }
+    socket.on('data', (chunk) => {
+      chunks.push(chunk)
+      if (headAt === null && Buffer.concat(chunks).indexOf('\r\n\r\n') !== -1) {
+        headAt = Date.now() - started
+      }
+      if (firstBodyAt === null && headAt !== null) {
+        const buf = Buffer.concat(chunks)
+        if (buf.length > buf.indexOf('\r\n\r\n') + 4) firstBodyAt = Date.now() - started
+      }
+    })
+    socket.on('error', (error) => { if (!done) { done = true; reject(error) } })
+    // The SSE upstream never ends, so this timeout IS the end of observation.
+    socket.on('close', finish)
+    setTimeout(finish, waitMs).unref?.()
+  })
+}
+
 try {
   await new Promise((resolve) => stub.listen(STUB_PORT, '127.0.0.1', resolve))
 
@@ -404,6 +558,82 @@ try {
   check('proxy forwards to dsh', proxied.status === 200, `got ${proxied.status}`)
   check('proxy upstream actually served it', (await proxied.text()).includes('stub:/hello'), 'stub did not see the request')
   check('proxy reached the stub exactly once', stubHits === 1, `stubHits=${stubHits}`)
+
+  /* --- the panel proxy STREAMS SSE (the gateway hop used to buffer it) ----
+   *
+   * The production symptom is dsh's client throwing
+   * `Connection timed out after 60000ms` and the page going dead. The cause was
+   * a proxy hop that read the whole upstream response before answering: against
+   * an upstream that never closes, the browser gets nothing, ever — so no
+   * assertion on a *completed* body could ever have caught it. Assert that a
+   * frame shows up while the upstream is still open.
+   *
+   * The stub's SSE never ends, so the reader is torn down explicitly once a
+   * frame has been seen (and on any failure) — otherwise the suite would wait
+   * on a response that is designed never to complete. */
+  const sseAbort = new AbortController()
+  const sseStarted = Date.now()
+  let sseFirstFrameAt = null
+  let sseHeaderOk = false
+  let sseDetail = ''
+  try {
+    const sseRes = await fetch(`${base}/p/sse`, { signal: sseAbort.signal })
+    sseHeaderOk = sseRes.status === 200
+      && /text\/event-stream/i.test(sseRes.headers.get('content-type') ?? '')
+    sseDetail = `${sseRes.status} ${sseRes.headers.get('content-type')}`
+    const reader = sseRes.body.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const text = Buffer.from(value ?? []).toString('utf8')
+      if (text.includes('tick')) { sseFirstFrameAt = Date.now() - sseStarted; break }
+    }
+  } catch (error) {
+    sseDetail = error.message
+  } finally {
+    sseAbort.abort()
+  }
+  check('the panel proxy answers a never-ending upstream with headers', sseHeaderOk, sseDetail)
+  check('the panel proxy forwards SSE frames while the upstream is still open',
+    sseFirstFrameAt !== null && sseFirstFrameAt < SLOW_DELAY_MS,
+    `first frame after ${sseFirstFrameAt}ms (upstream pushes every ${SSE_INTERVAL_MS}ms)`)
+
+  /* --- binary upload survives the proxy (skill upload) -------------------
+   * The panel's proxy handles a request body differently from every other
+   * request: `request.pipe(proxied)` streams it to dsh, while responses go
+   * through the HTML/SSE/plain branches. No assertion anywhere covered a
+   * request BODY, so a hop that dropped, truncated or re-framed the payload
+   * would leave this suite fully green while skill upload failed in
+   * production. Assert on size AND sha256: a truncation that happens to be a
+   * whole number of bytes still fails the hash.
+   */
+  const uploadPayload = Buffer.concat([
+    Buffer.from('PK\u0003\u0004', 'binary'),
+    Buffer.from(Array.from({ length: 200 * 1024 }, (_, i) => (i * 37 + (i >> 8)) & 0xff)),
+  ])
+  const uploadSha = createHash('sha256').update(uploadPayload).digest('hex')
+  const uploadPath = '/p/api/session/uploadFileBinary'
+    + '?sessionId=session-225c3408-9dc0-4746-b3e2-6903ad6e1f99&name=fnos-skill.zip'
+  const uploadRes = await fetch(`${base}${uploadPath}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: uploadPayload,
+  })
+  check('a binary upload gets a real answer, not a proxy error',
+    uploadRes.status === 200, `got ${uploadRes.status}`)
+  check('the upload reached dsh', lastUpload !== null, 'the upload sink saw nothing')
+  if (lastUpload) {
+    check('the uploaded body is byte-for-byte intact',
+      lastUpload.size === uploadPayload.length && lastUpload.sha256 === uploadSha,
+      `sent ${uploadPayload.length} bytes (${uploadSha.slice(0, 12)}), `
+      + `dsh got ${lastUpload.size} bytes (${lastUpload.sha256.slice(0, 12)})`)
+    check('the upload keeps its content type',
+      lastUpload.contentType.includes('octet-stream'), lastUpload.contentType)
+    check('the upload query string (sessionId + file name) is preserved',
+      lastUpload.url.startsWith(uploadPath.slice('/p'.length))
+        && lastUpload.url.includes('name=fnos-skill.zip'),
+      `dsh saw ${lastUpload.url}`)
+  }
 
   /* --- proxy serves REAL HTML through the injection path ------------------
    *
@@ -587,7 +817,7 @@ async function pythonBin() {
   }
 
   if (!hasUnixSocket) {
-    console.log('  ~ skipped 6 gateway checks (no python with AF_UNIX on this platform)')
+    console.log('  ~ skipped 11 gateway checks (no python with AF_UNIX on this platform)')
   } else {
   const gatewaySock = join(sandbox, 'gateway.sock')
   const gateway = spawn(python, [join(ROOT, 'cmd', 'proxy.py')], {
@@ -622,6 +852,49 @@ async function pythonBin() {
         check('the gateway 101 keeps the subprotocol', /sec-websocket-protocol: typert-mux/i.test(gw.head),
           gw.head.replace(/\r\n/g, ' | '))
         check('the gateway tunnel carries upstream frames back', gw.tail.includes('hi'), `tail=${JSON.stringify(gw.tail)}`)
+
+        /* --- the gateway must STREAM, not buffer, in the response direction --
+         *
+         * `proxy.py` used to `resp.read()` the entire upstream response before
+         * writing one byte back, and to give both sockets a blanket 60s read
+         * timeout. Against a never-ending upstream that means the browser gets
+         * nothing at all, forever — measured 0 bytes after 90s — and against a
+         * slow one it means the proxy kills a request the upstream was about to
+         * answer. The visible result is dsh's client giving up with
+         * `Connection timed out after 60000ms` and the page going dead.
+         *
+         * These assert on ARRIVAL TIME, because the finished body is identical
+         * either way — only the timing distinguishes a streaming proxy from a
+         * buffering one. SSE is the decisive case: its upstream never ends, so a
+         * buffering proxy can never produce a body byte no matter how long you
+         * wait. */
+        const sse = await rawStreamUnix({
+          socketPath: gatewaySock,
+          host: 'gw.local',
+          path: '/app/gw/sse',
+          waitMs: 1500,
+        })
+        check('a never-ending upstream still gets response headers out',
+          /^HTTP\/1\.1 200 /.test(sse.head), sse.head.split('\r\n')[0] ?? '(empty)')
+        check('the gateway forwards SSE bytes while the upstream is still open',
+          sse.firstBodyAt !== null && sse.body.includes('tick'),
+          `firstBodyAt=${sse.firstBodyAt}ms body=${JSON.stringify(sse.body.slice(0, 60))}`)
+        check('SSE bytes arrive long before the observation window ends',
+          sse.firstBodyAt !== null && sse.firstBodyAt < sse.endAt - 200,
+          `firstBodyAt=${sse.firstBodyAt}ms endAt=${sse.endAt}ms`)
+
+        /* A slow-but-finite response must reach the browser intact. Before the
+         * fix the gateway's own 60s timeout turned this into a 502. */
+        const slow = await rawStreamUnix({
+          socketPath: gatewaySock,
+          host: 'gw.local',
+          path: '/app/gw/slow',
+          waitMs: 6000,
+        })
+        check('a slow upstream response is delivered, not turned into a gateway error',
+          slow.status === 200, `got ${slow.status}`)
+        check('the slow response body arrives intact', slow.body.includes('late'),
+          `body=${JSON.stringify(slow.body.slice(0, 60))}`)
       }
     } finally {
       gateway.kill()

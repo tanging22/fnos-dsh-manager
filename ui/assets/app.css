@@ -24,6 +24,11 @@
   --menu-active-text: #4d94ff;
   --metric-bg: rgba(255, 255, 255, 0.03);
   --metric-line: rgba(255, 255, 255, 0.06);
+  /* 侧栏宽度与图标方框尺寸抽成变量：折叠态的可用空间必须能整除容纳方框，
+     否则图标方框会被侧栏裁掉右边一截。改这两个值时两处一起生效。 */
+  --sider-w: 208px;
+  --sider-w-collapsed: 46px;
+  --mi-box: 26px;
 }
 
 @media (prefers-color-scheme: light) {
@@ -72,10 +77,10 @@ html, body {
 /* 折叠箭头伸出侧栏右缘，避免被 .shell 的 overflow:hidden 裁剪。 */
 .main { position: relative; }
 
-/* ---------- sidebar (对齐 Go 版 NLayoutSider 240px) ---------- */
+/* ---------- sidebar (对齐 Go 版 NLayoutSider) ---------- */
 
 .sider {
-  width: 240px;
+  width: var(--sider-w);
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -93,15 +98,18 @@ html, body {
 /* 侧栏折叠：靠边收起为窄条，只留图标 —— 图标仍然可点击并打开对应页面。
    旧规则是 .sider-top/.sider-bottom 整块 opacity:0 + pointer-events:none，
    结果折叠后菜单既看不见也点不动，等于把导航废掉了。现在只隐藏文字：
-   .mi-label 与 .brand-text 消失，按钮本体保持可交互。 */
-.sider.collapsed { width: 44px; }
-.sider.collapsed .sider-top,
-.sider.collapsed .sider-bottom { padding: 12px 6px; }
+   .mi-label 与 .brand-text 消失，按钮本体保持可交互。
+
+   折叠宽度必须 ≥ 图标方框(26) + 按钮左右内边距(2×5) + 侧栏内边距(2×4) = 44，
+   否则方框会被裁掉右边一截 —— 这正是之前"图标底部框框看着缺一块"的成因。
+   这里给 46px 余量，并让 .mi-box 用 flex 居中，任何宽度下都不会偏。 */
+.sider.collapsed { width: var(--sider-w-collapsed); }
+.sider.collapsed .sider-top { padding: 10px 4px; gap: 10px; }
+.sider.collapsed .sider-bottom { padding: 10px 4px; }
 .sider.collapsed .mi-label,
 .sider.collapsed .brand-text { display: none; }
-.sider.collapsed .brand-card { justify-content: center; padding: 10px 0; }
-.sider.collapsed .menu-item { justify-content: center; gap: 0; padding: 8px 0; }
-.sider.collapsed .mi-icon { width: auto; }
+.sider.collapsed .brand-card { justify-content: center; padding: 9px 0; }
+.sider.collapsed .menu-item { justify-content: center; gap: 0; padding: 6px 0; }
 .sider.collapsed .sider-toggle .toggle-chevron { transform: rotate(180deg); }
 
 /* 折叠箭头：常驻侧栏右缘外侧，点击靠边、再点展开。 */
@@ -128,15 +136,15 @@ html, body {
 .sider-toggle:hover { color: var(--text); background: var(--panel-2); }
 .toggle-chevron { transition: transform .2s ease; }
 
-.sider-top { display: flex; flex-direction: column; gap: 12px; padding: 12px; min-height: 0; overflow: hidden; transition: opacity .15s ease; }
+.sider-top { display: flex; flex-direction: column; gap: 10px; padding: 10px; min-height: 0; overflow: hidden; transition: opacity .15s ease; }
 
 /* 品牌卡：点击跳 GitHub（对齐 Go 版品牌卡片） */
 .brand-card {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px;
-  border-radius: 16px;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 14px;
   background: var(--brand-bg);
   border: 1px solid var(--line);
   cursor: pointer;
@@ -150,7 +158,7 @@ html, body {
 .brand-sub { font-size: 11px; color: var(--muted); }
 
 /* 菜单（对齐 Go 版 n-menu） */
-.menu { display: flex; flex-direction: column; gap: 2px; }
+.menu { display: flex; flex-direction: column; gap: 3px; }
 .menu-item {
   appearance: none;
   display: flex;
@@ -161,7 +169,7 @@ html, body {
   background: none;
   border: 0;
   border-radius: 10px;
-  padding: 8px 12px;
+  padding: 6px 10px;
   color: var(--muted);
   font: inherit;
   font-weight: 600;
@@ -175,9 +183,34 @@ html, body {
   background: var(--menu-active);
   color: var(--menu-active-text);
 }
-.mi-icon { font-size: 15px; width: 20px; text-align: center; flex-shrink: 0; }
 
-.sider-bottom { padding: 12px; border-top: 1px solid var(--line); transition: opacity .15s ease; }
+/* 图标方框：固定尺寸 + 居中，展开与折叠两态几何完全一致。
+   之前是裸 emoji（.mi-icon 只有 font-size + width），emoji 字形宽度随字体变化，
+   折叠态还要靠 `width:auto` 反向覆盖，导致方框在两态下尺寸不同、位置漂移。
+   现在宽度/高度都锁死，emoji 只负责内容。 */
+.mi-box {
+  width: var(--mi-box);
+  height: var(--mi-box);
+  flex: 0 0 var(--mi-box);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  font-size: 14px;
+  line-height: 1;
+  background: var(--metric-bg);
+  transition: background .15s ease;
+}
+.menu-item:hover .mi-box { background: var(--brand-hover-bg); }
+.menu-item[aria-selected="true"] .mi-box { background: rgba(43, 127, 255, 0.18); }
+.mi-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sider-bottom { padding: 10px; border-top: 1px solid var(--line); transition: opacity .15s ease; }
 
 /* ---------- main ---------- */
 
@@ -260,16 +293,12 @@ html, body {
   gap: 12px;
 }
 
-/* 首页总览：三列排布，尽量一屏放完所有卡片 */
+/* 首页总览：自动排布，尽量一屏放完所有卡片。
+   minmax(300px, 1fr) + auto-fit：容器够宽时自动 3 列，放不下第3 列时退2 列、
+   再退 1 列，不需要为每个断点手写列数。 */
 .overview-grid {
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   align-items: stretch;
-}
-@media (max-width: 1000px) {
-  .overview-grid { grid-template-columns: repeat(2, 1fr); }
-}
-@media (max-width: 620px) {
-  .overview-grid { grid-template-columns: 1fr; }
 }
 
 /* ---------- overview 核心大卡片（对齐 Go 版 Overview.vue） ---------- */
@@ -441,10 +470,14 @@ html, body {
 .bar-stat-k { color: var(--muted); }
 .bar-stat-v { color: var(--text); font-weight: 600; }
 
-/* 5 列指标网格（运行状态/PID/CPU/内存/运行时间，对齐 Go 版 grid-cols-5） */
+/* 5列指标网格（运行状态/PID/CPU/内存/运行时间，对齐 Go 版 grid-cols-5）
+
+   自动排布：不再写死 5 列。repeat(auto-fit, minmax(148px, 1fr)) 会按**容器实际
+   宽度**算出能放几列，放不下就自动换行 —— 侧栏折叠、窗口缩放、手机横竖屏
+   都不需要额外的断点，写死的 5 列在窄容器里会把每格压到 60px 以下、标签换行。 */
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
   gap: 12px;
 }
 .metric {
@@ -458,6 +491,7 @@ html, body {
   background: var(--metric-bg);
   border: 1px solid var(--metric-line);
   text-align: center;
+  min-width: 0;
   transition: border-color .15s ease, background .15s ease;
 }
 .metric:hover { border-color: var(--brand-hover); background: var(--brand-hover-bg); }
@@ -465,6 +499,7 @@ html, body {
   font-size: 12px;
   color: var(--muted);
   font-weight: 500;
+  white-space: nowrap;
 }
 .metric .metric-value {
   font-size: 16px;
@@ -472,12 +507,12 @@ html, body {
   color: var(--text);
   font-variant-numeric: tabular-nums;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-@media (max-width: 860px) {
-  .metric-grid { grid-template-columns: repeat(2, 1fr); }
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* 运行控制区（对齐 Go 版 actionCards 4 列） */
 .section-title {
   margin: 16px 0 10px;
   font-size: 16px;
@@ -485,16 +520,13 @@ html, body {
   letter-spacing: -0.01em;
   color: var(--text);
 }
+
+/* 运行控制区。同样改为自适应列数，minmax 与 .metric-grid 一致，
+   保证按钮卡与状态卡在同一宽度下落在同一套列宽上（视觉对齐的关键）。 */
 .action-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 14px;
-}
-@media (max-width: 1000px) {
-  .action-grid { grid-template-columns: repeat(2, 1fr); }
-}
-@media (max-width: 620px) {
-  .action-grid { grid-template-columns: 1fr; }
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  gap: 12px;
 }
 .action-card {
   display: flex;
@@ -845,7 +877,9 @@ table.data tbody tr:hover { background: var(--panel-2); }
   border-radius: 8px;
 }
 .skel-title { height: 26px; width: 42%; }
-.skel-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+/* 骨架网格：minmax 必须与 .metric-grid 完全一致（148px），否则真实内容渲染
+   出来时列数与骨架对不上，首屏切换会跳一下。 */
+.skel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 12px; }
 .skel-box { height: 76px; }
 .skel-line { height: 14px; }
 .skel-line.short { width: 62%; }
@@ -858,17 +892,11 @@ table.data tbody tr:hover { background: var(--panel-2); }
   100% { background-position: 0 50%; }
 }
 
-/* 窄屏时骨架网格降列，断点与 .metric-grid 的 860px 保持一致，
-   免得骨架是 5 列而真实内容已经切成 2 列，切换时出现跳动。 */
-@media (max-width: 860px) {
-  .skel-grid { grid-template-columns: repeat(2, 1fr); }
-}
-
-/* 工作区卡片网格（对齐 Go 版工作区页的双列布局） */
+/* 工作区卡片网格：minmax 与 .overview-grid 同为 300px，两页列宽保持一致。 */
 .ws-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
 }
 .ws-card code {
   font-size: 12px;
@@ -897,3 +925,94 @@ table.data tbody tr:hover { background: var(--panel-2); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .noscript { padding: 24px; }
+
+/* ---------- 移动端适配 ---------- */
+
+/* 抽屉遮罩：桌面端不参与布局（position:fixed + 默认隐藏）。
+   [hidden] 必须被显式覆盖 —— display:flex 会盖掉 UA 的 [hidden]{display:none}，
+   那样遮罩会一直盖在内容上、点什么都没反应。这正是之前"hidden 是惰性的"
+   那个坑的同一个形状。 */
+.sider-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+  background: rgba(0, 0, 0, 0.45);
+  border: 0;
+}
+.sider-scrim[hidden] { display: none; }
+
+/* 中等屏（平板 / 窄桌面）：侧栏收窄，间距收紧 */
+@media (max-width: 1100px) {
+  :root { --sider-w: 184px; }
+  .topbar { padding: 12px 18px; }
+  .view { padding: 16px 18px calc(20px + env(safe-area-inset-bottom, 0px)); }
+}
+
+/* 窄屏：侧栏变覆盖式抽屉，不再占据布局宽度。
+   移动端不套用 .collapsed —— 那个 class 是桌面端的"图标窄条"，
+   两者叠加会把菜单文字藏掉、只剩一列图标，比抽屉本身更难用。 */
+@media (max-width: 860px) {
+  .sider {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 40;
+    width: min(280px, 82vw);
+    transform: translateX(-100%);
+    transition: transform .22s ease;
+    box-shadow: 0 0 24px rgba(0, 0, 0, .35);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .sider.drawer-open { transform: translateX(0); }
+  /* 抽屉态下强制展开，忽略桌面端写进 localStorage 的 collapsed */
+  .sider.collapsed { width: min(280px, 82vw); }
+  .sider.collapsed .mi-label,
+  .sider.collapsed .brand-text { display: revert; }
+  .sider.collapsed .menu-item { justify-content: flex-start; gap: 10px; padding: 6px 10px; }
+  .sider.collapsed .brand-card { justify-content: flex-start; padding: 9px 10px; }
+  .sider.collapsed .sider-top,
+  .sider.collapsed .sider-bottom { padding: 10px; }
+
+  /* 抽屉里的箭头指向左侧（收起方向），不再是"折叠/展开" */
+  .sider-toggle { top: 12px; right: 10px; }
+  .sider-toggle .toggle-chevron { transform: rotate(0deg); }
+  .sider.drawer-open .sider-toggle .toggle-chevron { transform: rotate(180deg); }
+
+  /* 抽屉打开时锁住背景滚动，否则手指在遮罩上滑动会连带滚页面 */
+  body.drawer-active { overflow: hidden; }
+
+  /* 触控目标不小于 40px（Apple HIG 建议 44，这里取折中） */
+  .menu-item { padding: 10px; min-height: 40px; }
+  .sider-toggle { width: 32px; height: 32px; }
+  .btn, .pill { min-height: 34px; }
+
+  .topbar { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
+  .page-title { font-size: 17px; }
+  .view { padding: 14px 14px calc(20px + env(safe-area-inset-bottom, 0px)); }
+  /* 手机上放宽到全宽：1152px 的约束在窄屏没有意义，反而让卡片贴边太近 */
+  .view > * { max-width: 100%; }
+
+  /* 卡片内边距收紧，避免小屏上每张卡都被内边距吃掉空间 */
+  .card { padding: 12px; }
+  .hero-card { padding: 14px; }
+  .metric { padding: 10px 6px; }
+  .metric .metric-value { font-size: 15px; }
+}
+
+/* 手机竖屏：栅格 minmax 降到 2 列下限以下，让每张卡有足够宽度。
+   auto-fit 会据此自动排布，不需要按屏幕宽度写死列数。 */
+@media (max-width: 560px) {
+  .metric-grid,
+  .skel-grid,
+  .action-grid { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+  .overview-grid,
+  .ws-grid,
+  .grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
+  .metric-label, .metric .metric-label { font-size: 11px; }
+  .metric .metric-value { font-size: 14px; }
+  .section-title { font-size: 15px; }
+  /* 表格类内容横向滚动，而不是把整页撑宽 */
+  table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
+}
