@@ -8,7 +8,7 @@
  * - 面板信息卡上移，一个主页显示所有信息。
  */
 
-import { api, esc, bytes, localTime, toast, url } from '../dom.js'
+import { api, esc, toast, url } from '../dom.js'
 
 // 五态 → 状态灯（颜色指示灯，替换原「进入 Harness」按钮）。
 const PHASE_LAMP = {
@@ -154,14 +154,11 @@ export async function render(host, ctx) {
         <div class="card-head"><h3><span class="card-icon">🖥️</span>面板</h3><span class="badge badge-idle">v${esc(status.panel?.version ?? '-')}</span></div>
         <div class="row"><span class="k">端口</span><span class="v">${esc(status.port ?? '-')}</span></div>
         <div class="row"><span class="k">数据目录</span><span class="v">${esc(status.panel?.dataDir ?? '-')}</span></div>
-        <div class="row"><span class="k">访问量</span><span class="v">${esc(status.access?.lines ?? 0)} 条 · ${bytes(status.access?.bytes ?? 0)}</span></div>
       </div>
       <div class="card">
         <div class="card-head"><h3><span class="card-icon">👥</span>最近访问</h3></div>
         ${status.recentVisit ? `
-          <div class="row"><span class="k">来源</span><span class="v"><code>${esc(status.recentVisit.ip || '-')}</code></span></div>
-          <div class="row"><span class="k">路径</span><span class="v">${esc(status.recentVisit.path || '-')}</span></div>
-          <div class="row"><span class="k">时间</span><span class="v">${localTime(status.recentVisit.ts)}</span></div>
+          <div class="row"><span class="k">来源 IP</span><span class="v"><code>${esc(status.recentVisit.ip || '-')}</code></span></div>
         ` : '<p class="empty">暂无访问记录</p>'}
       </div>
     </div>

@@ -47,21 +47,22 @@
         </div>
       </div>
 
+      <!--
+        文字统一包在 .mi-label 里：侧栏折叠时只隐藏这个 span，图标保留且仍可点击
+        （见 app.css 的 .sider.collapsed 规则）。title 提供折叠态的悬浮提示。
+      -->
       <nav class="menu" role="tablist">
-        <button class="menu-item" role="tab" data-tab="overview" aria-selected="true"><span class="mi-icon">📊</span>概览</button>
-        <button class="menu-item" role="tab" data-tab="workspace" aria-selected="false"><span class="mi-icon">📁</span>工作区</button>
-        <button class="menu-item" role="tab" data-tab="plugins" aria-selected="false"><span class="mi-icon">🧩</span>插件管理</button>
-        <button class="menu-item" role="tab" data-tab="patches" aria-selected="false"><span class="mi-icon">🩹</span>补丁</button>
-        <button class="menu-item" role="tab" data-tab="versions" aria-selected="false"><span class="mi-icon">🔄</span>版本</button>
-        <button class="menu-item" role="tab" data-tab="access" aria-selected="false"><span class="mi-icon">👥</span>访问记录</button>
-        <button class="menu-item" role="tab" data-tab="shortcuts" aria-selected="false"><span class="mi-icon">🔗</span>快捷入口</button>
-        <button class="menu-item" role="tab" data-tab="logs" aria-selected="false"><span class="mi-icon">📄</span>运行日志</button>
+        <button class="menu-item" role="tab" data-tab="overview" aria-selected="true" title="概览"><span class="mi-icon">📊</span><span class="mi-label">概览</span></button>
+        <button class="menu-item" role="tab" data-tab="workspace" aria-selected="false" title="工作区"><span class="mi-icon">📁</span><span class="mi-label">工作区</span></button>
+        <button class="menu-item" role="tab" data-tab="plugins" aria-selected="false" title="插件管理"><span class="mi-icon">🧩</span><span class="mi-label">插件管理</span></button>
+        <button class="menu-item" role="tab" data-tab="versions" aria-selected="false" title="版本"><span class="mi-icon">🔄</span><span class="mi-label">版本</span></button>
+        <button class="menu-item" role="tab" data-tab="logs" aria-selected="false" title="运行日志"><span class="mi-icon">📄</span><span class="mi-label">运行日志</span></button>
       </nav>
     </div>
 
     <div class="sider-bottom">
       <nav class="menu" role="tablist">
-        <button class="menu-item" role="tab" data-tab="settings" aria-selected="false"><span class="mi-icon">⚙️</span>应用设置</button>
+        <button class="menu-item" role="tab" data-tab="settings" aria-selected="false" title="应用设置"><span class="mi-icon">⚙️</span><span class="mi-label">应用设置</span></button>
       </nav>
     </div>
   </aside>

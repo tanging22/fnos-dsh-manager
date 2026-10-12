@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { join, normalize, extname, sep } from 'node:path'
 
-import { cleanLine, lanAddresses, localHost, nowIso, LAN_PROXY_PORT } from './dashboard-utils.js'
+import { cleanLine, lanAddresses, nowIso } from './dashboard-utils.js'
 import {
   CONSOLE_PORT,
   DATA_DIR,
@@ -39,7 +39,7 @@ import {
   pruneVersions,
   removeVersion,
 } from './dashboard-versions.js'
-import { accessLogStats, clearVisitors, recordVisit, recentVisitors, recentLogins } from './dashboard-access.js'
+import { lastVisitor, recordVisit } from './dashboard-access.js'
 import { isTrustedRequest, clientIp, requestHost } from './dashboard-trust.js'
 import { runDiagnostics } from './dashboard-diagnostics.js'
 import { environmentState, repairEnvironment } from './dashboard-env.js'
@@ -55,7 +55,6 @@ import {
   MARKET_PACKAGE,
 } from './dashboard-plugins.js'
 import { GetDshSessionCookie, appendDshSessionCookie } from './dashboard-session.js'
-import { applyPatches, patchState } from './dashboard-patches.js'
 
 const UI_DIR = process.env.CONSOLE_UI
   ? join(process.env.CONSOLE_UI)
@@ -420,8 +419,6 @@ function settingsView() {
     trustedHosts: config.trustedHosts ?? [],
     trustedHostsFile: config.trustedHostsFile ?? [],
     access: {
-      enabled: config.access?.enabled !== false,
-      max: config.access?.max ?? 500,
       trustProxyHeaders: config.access?.trustProxyHeaders !== false,
     },
     install: {
@@ -429,7 +426,6 @@ function settingsView() {
       proxy: config.install?.proxy || '',
     },
     versions: { keep: config.versions?.keep ?? 3 },
-    shortcuts: config.shortcuts ?? [],
     proxyUpstream: proxyUrl(),
   }
 }
@@ -451,11 +447,9 @@ const routes = {
         uiProxy: loadConfig().proxy?.enabled !== false,
         proxyUrl: proxyUrl(),
       },
-      access: accessLogStats(),
       version: currentVersion(),
       time: nowIso(),
-      recentLogin: recentLogins(1)[0] ?? null,
-      recentVisit: recentVisitors(1)[0] ?? null,
+      recentVisit: lastVisitor(),
     })
   },
 
@@ -589,28 +583,6 @@ const routes = {
     broadcast({ type: 'status', ...(await dshStatus()) })
   },
 
-  'GET /api/access': async (request, response) => {
-    const url = new URL(request.url, 'http://localhost')
-    const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 500)
-    json(response, 200, {
-      enabled: loadConfig().access?.enabled !== false,
-      entries: recentVisitors(limit),
-      stats: accessLogStats(),
-    })
-  },
-
-  'DELETE /api/access': async (request, response) => {
-    clearVisitors()
-    json(response, 200, { ok: true, cleared: true })
-    broadcast({ type: 'access' })
-  },
-
-  'GET /api/access/login': async (request, response) => {
-    const url = new URL(request.url, 'http://localhost')
-    const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 200)
-    json(response, 200, { entries: recentLogins(limit) })
-  },
-
   'GET /api/settings': async (request, response) => {
     json(response, 200, settingsView())
   },
@@ -625,7 +597,7 @@ const routes = {
     const config = loadConfig()
     const next = { ...config }
 
-    for (const key of ['mode', 'shortcuts']) {
+    for (const key of ['mode']) {
       if (body[key] !== undefined) next[key] = body[key]
     }
     // `lanBind` is tri-state and validated before it reaches disk:
@@ -666,21 +638,6 @@ const routes = {
     json(response, 200, runDiagnostics())
   },
 
-  // 补丁状态/应用：面板内改 dsh 自己的客户端 bundle（见 dashboard-patches.js）。
-  // 应用后必须重启 dsh 才生效——bundle 是启动时读进内存的。
-  'GET /api/patches': async (request, response) => {
-    json(response, 200, patchState())
-  },
-
-  'POST /api/patches/apply': async (request, response) => {
-    const result = applyPatches()
-    if (!result.ok) return badRequest(response, 'patch-failed', 500)
-    // Patched bundles are read at startup, so a running dsh still serves the
-    // old copy. Restart here rather than making the operator remember to.
-    await restartDsh()
-    json(response, 200, { ...result, restarted: true })
-  },
-
   'GET /api/env': async (request, response) => {
     json(response, 200, environmentState())
   },
@@ -707,23 +664,6 @@ const routes = {
     const path = url.searchParams.get('path') || ''
     const result = listDirectory(path)
     json(response, result.ok ? 200 : (result.status ?? 400), result)
-  },
-
-  'GET /api/shortcuts': async (request, response) => {
-    // dsh 只听 127.0.0.1:3080，所以只有回环这一条是「dsh 本体」；其余 LAN 条目
-    // 指向面板带 token 的直连口（:28000），等效于本机访问。
-    const port = listenPort()
-    const lan = lanAddresses()
-    json(response, 200, {
-      entries: [
-        { label: 'Loopback (dsh 本体)', url: `http://127.0.0.1:${port}/`, note: '只信任本机，需 token' },
-        { label: 'Loopback (面板代理)', url: `http://127.0.0.1:${CONSOLE_PORT}/p/`, note: 'recorded' },
-        { label: '直连口 (免 token)', url: `http://127.0.0.1:${LAN_PROXY_PORT}/`, note: 'recorded，自动注入 token' },
-        ...lan.map((ip) => ({ label: `LAN ${ip}`, url: `http://${ip}:${LAN_PROXY_PORT}/`, note: '免 token 直连 dsh' })),
-        { label: 'Hostname', url: `http://${localHost()}:${LAN_PROXY_PORT}/`, note: 'mDNS may be needed' },
-      ],
-      custom: loadConfig().shortcuts ?? [],
-    })
   },
 
   'GET /api/plugins': async (request, response) => {
@@ -876,14 +816,27 @@ function injectDshHtml(body, shim) {
 
 /** Strip a loopback authority from a redirect Location so the client stays on
  *  the gateway host instead of drifting to 127.0.0.1 (Go `rewriteGatewayLocation`). */
-function stripLoopbackLocation(loc) {
+/**
+ * Rewrite a `Location` that points back at dsh's loopback listener.
+ *
+ * Upstream thinks it lives at `127.0.0.1:<dsh port>`, so any redirect it
+ * issues carries that authority. Handing it to the browser verbatim sends the
+ * client to *its own* loopback — nothing is listening there, so the page comes
+ * up blank (or "connection refused") instead of following the redirect inside
+ * the proxy. Rewriting to a path keeps the browser on the origin it is already
+ * talking to.
+ *
+ * `pathPrefix` matters: under the console proxy dsh lives at `/p/`, so a bare
+ * `/login` would escape the prefix and 404. Put the prefix back on.
+ */
+function stripLoopbackLocation(loc, pathPrefix = '') {
   if (!loc) return loc
   try {
     const u = new URL(loc, 'http://localhost')
     if (u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '::1') {
-      u.protocol = ''
-      u.host = ''
-      return u.pathname + (u.search || '') + (u.hash || '')
+      const path = u.pathname + (u.search || '') + (u.hash || '')
+      // 已经带前缀就不要再加（避免 /p/p/）。
+      return pathPrefix && !path.startsWith(pathPrefix) ? `${pathPrefix}${path}` : path
     }
   } catch {}
   return loc
@@ -1023,12 +976,13 @@ async function proxyToDsh(request, response, { pathPrefix }) {
           upstream: upstreamResponse,
           response,
           onDone: visit,
+          pathPrefix,
         })
         return
       }
 
       // 其它（JS/CSS/图片/JSON/字体）：原样转发，仅剥重定向里的回环主机。
-      if (out['location']) out['location'] = stripLoopbackLocation(out['location'])
+      if (out['location']) out['location'] = stripLoopbackLocation(out['location'], pathPrefix)
       delete out['content-length']
       response.writeHead(status, out)
       upstreamResponse.pipe(response)
@@ -1302,11 +1256,15 @@ const HTML_BUFFER_CAP = 8 * 1024 * 1024
  *   - chunked（无 content-length）中途超限 → 把已收到的部分写出，剩余继续 pipe，
  *     并且**删掉 content-length** 交给分块编码，绝不声明一个错误的长度。
  */
-function proxyHtml({ status, headers, upstream, response, onDone }) {
+function proxyHtml({ status, headers, upstream, response, onDone, pathPrefix = '' }) {
   /** 与注入无关、两种路径都要改的响应头。 */
   const harden = (out) => {
     delete out['content-security-policy']
     delete out['content-security-policy-report-only']
+    // 重定向同样要走回环剥离：上游返回的 302 常带 HTML body，于是落在这个
+    // 分支而非上面的「其它」分支——漏在这里等于把浏览器送去它自己的
+    // 127.0.0.1:3080，页面就是一片空白。
+    if (out['location']) out['location'] = stripLoopbackLocation(out['location'], pathPrefix)
     out['cache-control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     out['pragma'] = 'no-cache'
     out['expires'] = '0'

@@ -29,13 +29,9 @@ export async function render(host, ctx) {
     </div>
 
     <div class="card">
-      <h3>访问日志</h3>
-      <label class="checkbox"><input type="checkbox" id="access-enabled" ${data.access?.enabled !== false ? 'checked' : ''}> 记录代理访问</label>
+      <h3>访问来源</h3>
       <label class="checkbox"><input type="checkbox" id="access-trust" ${data.access?.trustProxyHeaders !== false ? 'checked' : ''}> 信任 X-Forwarded-For</label>
-      <label class="field">
-        <span>保留记录上限</span>
-        <input id="access-max" type="number" min="50" max="5000" value="${esc(data.access?.max ?? 500)}" style="max-width:140px">
-      </label>
+      <p class="muted">主页只展示最近一次访问者 IP；开启后以来源代理头为准，关闭则以直连 socket 地址为准。</p>
       <div class="btn-row"><button class="btn btn-primary" id="save-access">保存访问设置</button></div>
     </div>
 
@@ -97,9 +93,7 @@ export async function render(host, ctx) {
   host.querySelector('#save-access').addEventListener('click', () => {
     post({
       access: {
-        enabled: host.querySelector('#access-enabled').checked,
         trustProxyHeaders: host.querySelector('#access-trust').checked,
-        max: Number(host.querySelector('#access-max').value) || 500,
       },
     }, '访问设置已保存')
   })

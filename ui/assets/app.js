@@ -11,13 +11,10 @@ import * as overview from './views/overview.js'
 import * as logs from './views/logs.js'
 import * as versions from './views/versions.js'
 import * as plugins from './views/plugins.js'
-import * as patches from './views/patches.js'
-import * as access from './views/access.js'
-import * as shortcuts from './views/shortcuts.js'
 import * as settings from './views/settings.js'
 import * as workspace from './views/workspace.js'
 
-const VIEWS = { overview, logs, versions, plugins, patches, access, shortcuts, settings, workspace }
+const VIEWS = { overview, logs, versions, plugins, settings, workspace }
 
 const app = document.getElementById('app')
 const view = document.getElementById('view')
@@ -68,9 +65,6 @@ const TAB_TITLES = {
   overview: '概览',
   versions: '版本',
   plugins: '插件管理',
-  patches: '补丁',
-  access: '访问记录',
-  shortcuts: '快捷入口',
   workspace: '工作区',
   settings: '应用设置',
   logs: '运行日志',
@@ -197,7 +191,7 @@ function scheduleSoftRefresh() {
   if (visitDebounce) clearTimeout(visitDebounce)
   visitDebounce = setTimeout(() => {
     visitDebounce = null
-    if (state.tab === 'overview' || state.tab === 'access') renderTab()
+    if (state.tab === 'overview') renderTab()
   }, 800)
 }
 const closeWs = ws((event) => {
@@ -213,7 +207,7 @@ const closeWs = ws((event) => {
       if (cpuEl) cpuEl.textContent = event.cpu ?? '-'
       if (memEl) memEl.textContent = event.memory ?? '-'
     }
-  } else if (event.type === 'visit' || event.type === 'access') {
+  } else if (event.type === 'visit') {
     scheduleSoftRefresh()
   }
 })

@@ -14,6 +14,7 @@ import { createConsoleServer, createLanProxyServer, closeAllWebSockets, StartWeb
 import { listenPort, StartWatchdog, startDsh } from './dashboard-process.js'
 import { StartUsageSampler } from './dashboard-usage.js'
 import { GetLastRunState, StatusRunning, StatusStarting } from './dashboard-state.js'
+import { applyPatches } from './dashboard-patches.js'
 
 const PANEL_LOG = CONSOLE_LOG
 
@@ -68,6 +69,16 @@ async function main() {
 
   // 采样 dsh 进程树 CPU/内存（无订阅者时 0 成本空转，对齐 Go 版 StartUsageSampler）。
   StartUsageSampler()
+
+  // 补丁自动内置：面板启动即对所有已安装版本应用客户端 bundle 补丁（幂等）。
+  // 覆盖「dsh 在面板外已运行、startDsh 走 already 分支不重新打补丁」的场景——
+  // 文件先修好，下次 dsh 重启自然生效。startDsh 内部还有一道同款调用。
+  try {
+    const patches = applyPatches()
+    if (!patches.ok) log('client patch partially failed at boot')
+  } catch (error) {
+    log(`client patch at boot failed: ${error?.message ?? error}`)
+  }
 
   // 按上次运行状态自启（对齐 Go 版 InitHarness 的 GetLastRunState 分支）：
   // 面板重启前若 dsh 在 running/starting，则自动拉起，否则跳过。

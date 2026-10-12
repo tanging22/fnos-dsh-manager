@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.0.40 - 2026-10-12
+
+按需求做的功能收敛瘦身版：删除三个页面与对应后端，只减不增。
+
+### 补丁自动内置（删除「补丁」管理页）
+
+- 客户端 bundle 的 host-mode 补丁从「手动点按钮应用」改为**全自动**：`startDsh()` 每次启动 dsh 前自动应用（幂等，已打过的跳过），覆盖手动启动 / 重启 / 版本切换后启动 / 面板开机自启全部路径；面板启动时再对所有已安装版本补一遍，覆盖「dsh 在面板外已运行、走 already 分支」的场景（`cmd/dashboard-process.js`、`cmd/dashboard.js`）。
+- 删除 `GET /api/patches`、`POST /api/patches/apply` 路由与 `patchState()`；`dashboard-patches.js` 只保留 `applyPatches()`。
+- 删除 `ui/assets/views/patches.js` 页面与导航入口。
+
+### 访问记录瘦身（删除「访问记录」页，主页只保留最近访问者 IP）
+
+- `dashboard-access.js` 整文件重写：JSONL 访问日志（队列/落盘/裁剪/统计）与 login.log 只读器全部删除，改为单个内存槽记录最近一次访问者 `{ip, ts}`——零磁盘 I/O，代理热路径只剩一次赋值。
+- 删除 `GET /api/access`、`DELETE /api/access`、`GET /api/access/login` 路由；`/api/status` 不再返回 `access`（日志统计）与 `recentLogin`，`recentVisit` 改由内存槽供给。
+- 删除 `ui/assets/views/access.js` 页面与导航入口；主页「最近访问」卡只显示来源 IP 一行，「面板」卡去掉访问量行。
+- 设置页「访问日志」卡收敛为「访问来源」：只保留「信任 X-Forwarded-For」开关（它决定 IP 取值口径，与记录功能无关）；`access.enabled` / `access.max` 配置项退役。
+
+### 删除「快捷入口」
+
+- 删除 `GET /api/shortcuts` 路由、`settingsView` 与 `POST /api/settings` 的 `shortcuts` 字段、config 默认值与 install_callback 写入的 `"shortcuts": []`。
+- 删除 `ui/assets/views/shortcuts.js` 页面与导航入口。
+
+### 修复
+
+- **侧栏折叠后图标不可点**（`ui/assets/app.css`、`ui/index.html`）。旧规则对折叠态的 `.sider-top` / `.sider-bottom` 整块 `opacity:0; pointer-events:none`，菜单连图标一起看不见、也点不动，等于把导航废掉。菜单文字改包在 `.mi-label` 里，折叠时只隐藏文字（`.mi-label` / `.brand-text`），按钮本体保持可交互并居中；每个菜单项补 `title`，折叠态有悬浮提示。
+- **HTML 响应里的重定向 Location 未剥离回环地址**（`cmd/dashboard-server.js`）。上游以为自己住在 `127.0.0.1:3080`，任何 302 都带这个 authority。此前只有「非 HTML」分支做剥离；而 302 常带 HTML body，于是走 `proxyHtml` 分支被漏掉——浏览器被送去**它自己**的 `127.0.0.1:3080`，没有服务监听，表现就是「打开内置反代 :28000 一片空白」。现在 `proxyHtml` 同样重写 Location，且按 `pathPrefix` 补回前缀（`/p/` 下跳 `/p/login`，不会跳出前缀 404）；非 HTML 分支同步改为前缀感知。
+
+### 门禁
+
+- smoke 断言同步重写：旧路由一律断言 404；补丁改由「停 dsh → 构造未打补丁的假版本 → 启动 → 断言 bundle 已打 marker」验证自动内置；最近访问改经 `/api/status.recentVisit` 断言；设置持久化改验 `access.trustProxyHeaders`；新增「HTML 302 的 Location 必须留在代理前缀内」一条。check 28/15/0、smoke 95/95。
+
 ## v1.0.39 - 2026-10-12
 
 v1.0.38 发布后收到反馈：升级后 dsh 客户端连接异常（插件接口 404、WS 60s 超时、控制台报错）。逐行复查 1.0.38 全部 738 行 diff 后，未发现必然破坏连接的缺陷；但确认该版本一次性改动了配置目录、插件安装、HTML 代理、端口扫描、进程时序五类与连接相关的路径，且只在开发机过 smoke、未经真实 fnOS 升级验证。本版不引入新功能，只把两处“优化可能变成回归”的行为改为带兜底的形态：**任何单文件场景下，行为都是 1.0.37 与 1.0.38 的并集，不会比任何一版更差**。

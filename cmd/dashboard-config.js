@@ -94,11 +94,8 @@ export const DEFAULTS = {
     pathPrefix: '',
   },
   access: {
-    enabled: true,
-    max: 500,
     trustProxyHeaders: true,
   },
-  shortcuts: [],
   versions: {
     keep: 3,
   },

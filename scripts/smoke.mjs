@@ -79,6 +79,18 @@ const stub = createServer((request, response) => {
     response.end(body)
     return
   }
+  /* 上游以为自己住在回环上：302 + HTML body（因此走 proxyHtml 分支，而不是
+     上面「其它」分支的 location 剥离）。真实 dsh 在 / 未登录/未初始化时就是
+     这种响应——Location 若原样带出去，浏览器会跳到它自己的 127.0.0.1:3080，
+     表现就是「打开 :28000 一片空白」。 */
+  if (url.startsWith('/redirect')) {
+    response.writeHead(302, {
+      'content-type': 'text/html; charset=utf-8',
+      location: `http://127.0.0.1:${STUB_PORT}/login?next=%2F`,
+    })
+    response.end('<!doctype html><html><body>redirecting</body></html>')
+    return
+  }
   if (url.startsWith('/html')) {
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
     response.end(`<!doctype html><html><head>
@@ -163,8 +175,8 @@ async function waitForPanel(timeoutMs = 15000) {
 }
 
 /** Call the API the way the UI does, with the key header. */
-function call(path, { method = 'GET', key = PASSWORD, headers = {}, body } = {}) {
-  const init = { method, headers: { ...headers } }
+function call(path, { method = 'GET', key = PASSWORD, headers = {}, body, redirect = 'follow' } = {}) {
+  const init = { method, headers: { ...headers }, redirect }
   if (key) init.headers['x-console-key'] = key
   if (body !== undefined) {
     init.body = JSON.stringify(body)
@@ -360,7 +372,9 @@ try {
   const status = await jsonOf(await call('/api/status'))
   check('status reports the panel port', status.panel?.port === PANEL_PORT, JSON.stringify(status.panel))
   check('status reports the configured dsh port', status.port === STUB_PORT, String(status.port))
-  check('status exposes an access-log summary', typeof status.access?.lines === 'number', JSON.stringify(status.access))
+  /* The access log was removed in v1.0.40 (the overview only shows the last
+     visitor's IP), so /api/status must no longer carry a log summary. */
+  check('status carries no access-log summary', status.access === undefined, JSON.stringify(status.access))
   check('status has no secret in it', !JSON.stringify(status).includes(PASSWORD), 'password leaked into /api/status')
 
   /* --- logs -------------------------------------------------------------- */
@@ -380,7 +394,6 @@ try {
   check('versions lists installed entries', Array.isArray(versions.installed), JSON.stringify(versions.installed))
 
   /* --- proxy records a visit (the reason the proxy exists) --------------- */
-  const before = await jsonOf(await call('/api/access?limit=5'))
   const proxied = await call('/p/hello', { key: '' })
   check('proxy forwards to dsh', proxied.status === 200, `got ${proxied.status}`)
   check('proxy upstream actually served it', (await proxied.text()).includes('stub:/hello'), 'stub did not see the request')
@@ -425,24 +438,22 @@ try {
   check('the panel survives proxying oversized HTML',
     (await call('/api/status')).status === 200, 'panel died proxying 9MB of HTML')
 
-  /* Records are queued and flushed on a timer (see dashboard-access.js), so a
-     read taken immediately after the request can still be empty. Poll instead
-     of asserting instantaneously — that is the real contract. */
-  const after = await waitFor(
-    async () => {
-      const body = await jsonOf(await call('/api/access?limit=5'))
-      return (body.stats?.lines ?? 0) > (before.stats?.lines ?? 0) ? body : null
-    },
-    { timeoutMs: 4000, description: 'access record to appear' },
-  )
-  check('proxy recorded the visit', after !== null,
-    `${before.stats?.lines} -> ${after?.stats?.lines ?? 'unchanged'}`)
-  /* Order-independent: the HTML-injection assertions above make their own proxied
-     request, so `/html` may be the newest entry. Look for OUR request by path
-     rather than assuming position 0. */
-  const entries = after?.entries ?? []
-  const hello = entries.find((entry) => entry.path === '/hello')
-  check('recorded entry carries method and path', hello?.method === 'GET', JSON.stringify(entries.slice(0, 3)))
+  /* A 302 carrying an HTML body lands in proxyHtml, which must rewrite the
+     loopback Location too — otherwise the browser follows it to its own
+     127.0.0.1 and comes up blank (the ":28000 opens blank" symptom). */
+  const redirect = await call('/p/redirect', { key: '', redirect: 'manual' })
+  check('an HTML redirect keeps the browser inside the proxy prefix',
+    redirect.headers.get('location') === '/p/login?next=%2F', String(redirect.headers.get('location')))
+
+  /* The JSONL access log is gone (v1.0.40 瘦身): the proxy keeps only the
+     most recent visitor in memory, surfaced as /api/status.recentVisit.
+     recordVisit() runs synchronously inside the proxy's response handling,
+     so it is already set by the time the proxied calls above resolved. */
+  const statusAfter = await jsonOf(await call('/api/status'))
+  check('proxy recorded the last visitor', Boolean(statusAfter.recentVisit?.ip),
+    JSON.stringify(statusAfter.recentVisit))
+  check('the old access-log API is gone', (await call('/api/access?limit=5')).status === 404)
+  check('the old login-log API is gone', (await call('/api/access/login')).status === 404)
 
   /* --- diagnostics and settings ----------------------------------------- */
   const diagnostics = await jsonOf(await call('/api/diagnostics'))
@@ -459,52 +470,51 @@ try {
 
   const saved = await jsonOf(await call('/api/settings', {
     method: 'POST',
-    body: { shortcuts: [{ label: 'Docs', url: 'https://example.com/docs' }], access: { max: 42 } },
+    body: { access: { trustProxyHeaders: false } },
   }))
-  check('settings persist shortcuts', saved.settings?.shortcuts?.[0]?.label === 'Docs', JSON.stringify(saved.settings?.shortcuts))
-  check('settings persist the access cap', saved.settings?.access?.max === 42, String(saved.settings?.access?.max))
+  check('settings persist the proxy-header trust toggle', saved.settings?.access?.trustProxyHeaders === false,
+    JSON.stringify(saved.settings?.access))
 
   const onDisk = JSON.parse(readFileSync(join(dataDir, 'console-config.json'), 'utf8'))
-  check('settings hit the disk', onDisk.access?.max === 42, JSON.stringify(onDisk.access))
+  check('settings hit the disk', onDisk.access?.trustProxyHeaders === false, JSON.stringify(onDisk.access))
 
-  /* --- shortcuts --------------------------------------------------------- */
-  const shortcuts = await jsonOf(await call('/api/shortcuts'))
-  check('shortcuts include a loopback entry', (shortcuts.entries ?? []).some((entry) => entry.url.includes('127.0.0.1')),
-    JSON.stringify(shortcuts.entries))
-  check('shortcuts include the pinned ones', (shortcuts.custom ?? []).some((entry) => entry.label === 'Docs'),
-    JSON.stringify(shortcuts.custom))
+  /* --- shortcuts page removed (v1.0.40 瘦身) ------------------------------ */
+  check('the shortcuts API is gone', (await call('/api/shortcuts')).status === 404)
 
   /* --- service control is safe to call against the stub ------------------ */
   const stopped = await jsonOf(await call('/api/service/stop', { method: 'POST' }))
   check('stop reports success', stopped.ok === true, JSON.stringify(stopped))
 
-  /* --- patches ----------------------------------------------------------- */
-  /* The settings host-mode patch edits dsh's own client bundles, so a fake
-     version dir is all it needs: the module scans `${VERSIONS_DIR}` by name and
-     never imports anything from the version. */
+  /* --- patches: auto-applied on dsh start (page removed in v1.0.40) ------
+   *
+   * The settings host-mode patch edits dsh's own client bundles, so a fake
+   * version dir is all it needs. dsh was stopped by the service-control check
+   * above; starting it funnels through startDsh(), which now applies the
+   * patches automatically — that IS the feature under test. */
   const fakeVersion = '0.0.0-smoke'
   const fakeClient = join(dataDir, 'versions', fakeVersion, 'node_modules', '@deepseek-ai', 'dsh-client-ui-settings', 'lib', 'client.js')
   mkdirSync(join(dataDir, 'versions', fakeVersion), { recursive: true })
   mkdirSync(join(dirname(fakeClient)), { recursive: true })
   writeFileSync(fakeClient, 'window.__ModuleLoader__ = { t: ctx.remote.$host.isLoopback ? "host" : "memory" };\n', 'utf8')
 
-  const patchStateBefore = await jsonOf(await call('/api/patches'))
-  check('patches report an install before the fix', (patchStateBefore.versions ?? [])
-    .flatMap((v) => v.files).some((f) => f.state === 'pending'), JSON.stringify(patchStateBefore))
+  check('the patch management API is gone', (await call('/api/patches')).status === 404)
 
-  const applied = await jsonOf(await call('/api/patches/apply', { method: 'POST' }))
-  check('patch apply reports success', applied.ok === true, JSON.stringify(applied).slice(0, 200))
-  check('patch apply reports it changed a file', (applied.versions ?? [])
-    .flatMap((v) => v.files).some((f) => f.state === 'patched'), JSON.stringify(applied).slice(0, 200))
+  /* The smoke env has no installed dsh (the proxy target is a stub), so the
+     start itself answers dsh-not-installed — what matters here is that the
+     attempt ran the auto-patch before bailing out. */
+  const started = await jsonOf(await call('/api/service/start', { method: 'POST' }))
+  check('start answers with a structured result', typeof started?.ok === 'boolean', JSON.stringify(started).slice(0, 200))
   const patchedText = readFileSync(fakeClient, 'utf8')
   check('the ternary is gone from the bundle', !/isLoopback \? "host" : "memory"/.test(patchedText), patchedText.slice(0, 120))
   check('the bundle carries the marker comment', patchedText.startsWith('/* dsh-console: settings host-mode patch */'),
     patchedText.slice(0, 60))
 
-  const appliedAgain = await jsonOf(await call('/api/patches/apply', { method: 'POST' }))
-  check('re-applying is a no-op, not a double patch', (appliedAgain.versions ?? [])
-    .flatMap((v) => v.files).filter((f) => f.state === 'patched').length === 0,
-    JSON.stringify(appliedAgain).slice(0, 200))
+  /* Starting again must not patch twice: the marker is idempotent. */
+  await call('/api/service/start', { method: 'POST' })
+  const repatched = readFileSync(fakeClient, 'utf8')
+  check('re-starting is a no-op, not a double patch',
+    (repatched.match(/dsh-console: settings host-mode patch/g) ?? []).length === 1,
+    `marker count=${(repatched.match(/dsh-console: settings host-mode patch/g) ?? []).length}`)
 
   /* --- the WS proxy: one handshake header per name ------------------------
    *

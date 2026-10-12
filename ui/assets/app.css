@@ -90,10 +90,18 @@ html, body {
   transition: width .2s ease;
 }
 
-/* 侧栏折叠：靠边收起为窄条，只留折叠箭头。 */
+/* 侧栏折叠：靠边收起为窄条，只留图标 —— 图标仍然可点击并打开对应页面。
+   旧规则是 .sider-top/.sider-bottom 整块 opacity:0 + pointer-events:none，
+   结果折叠后菜单既看不见也点不动，等于把导航废掉了。现在只隐藏文字：
+   .mi-label 与 .brand-text 消失，按钮本体保持可交互。 */
 .sider.collapsed { width: 44px; }
 .sider.collapsed .sider-top,
-.sider.collapsed .sider-bottom { opacity: 0; pointer-events: none; }
+.sider.collapsed .sider-bottom { padding: 12px 6px; }
+.sider.collapsed .mi-label,
+.sider.collapsed .brand-text { display: none; }
+.sider.collapsed .brand-card { justify-content: center; padding: 10px 0; }
+.sider.collapsed .menu-item { justify-content: center; gap: 0; padding: 8px 0; }
+.sider.collapsed .mi-icon { width: auto; }
 .sider.collapsed .sider-toggle .toggle-chevron { transform: rotate(180deg); }
 
 /* 折叠箭头：常驻侧栏右缘外侧，点击靠边、再点展开。 */

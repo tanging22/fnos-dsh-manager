@@ -28,13 +28,10 @@ const SYNTAX_ONLY = new Set([
   // in Node. dom.js runs inside the panel's iframe, not here.
   'ui/assets/app.js',
   'ui/assets/dom.js',
-  'ui/assets/views/access.js',
   'ui/assets/views/logs.js',
   'ui/assets/views/overview.js',
-  'ui/assets/views/patches.js',
   'ui/assets/views/plugins.js',
   'ui/assets/views/settings.js',
-  'ui/assets/views/shortcuts.js',
   'ui/assets/views/versions.js',
   'ui/assets/views/workspace.js',
   // This script: importing it would re-run the whole gate, recursively.

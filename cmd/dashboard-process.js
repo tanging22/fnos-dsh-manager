@@ -51,6 +51,7 @@ import {
 } from './dashboard-state.js'
 import { setTargetPidResolver } from './dashboard-usage.js'
 import { CaptureLaunchToken, SetCurrentLaunchToken } from './dashboard-session.js'
+import { applyPatches } from './dashboard-patches.js'
 
 export const PID_FILE = join(DATA_DIR, 'dsh.pid')
 export const DSH_LOG = join(DATA_DIR, 'dsh.log')
@@ -684,6 +685,17 @@ function buildArgs(port) {
 
 export async function startDsh() {
   return serializeServiceOp(async () => {
+  // 补丁自动内置：客户端 bundle 的 host-mode 补丁在每次启动前置自动应用
+  // （幂等，已打过的文件跳过），不再有手动「应用补丁」页面。放在所有早退分支
+  // 之前——包括「已有活进程直接复用」和「dsh 未安装」——这样新装/切换版本后
+  // 只要还走过一次启动，bundle 就是修好的状态。best-effort，绝不阻塞启动。
+  try {
+    const patches = applyPatches()
+    if (!patches.ok) appendLog(`[fnos-dsh-manager] client patch partially failed\n`)
+  } catch (error) {
+    appendLog(`[fnos-dsh-manager] client patch failed: ${error?.message ?? error}\n`)
+  }
+
   const existing = readPid()
   if (existing && isAlive(existing)) {
     // 已有活进程：直接对齐状态机，避免 UI 与实际脱节。

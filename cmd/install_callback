@@ -144,13 +144,12 @@ if [ ! -f "${DATA_DIR}/console-config.json" ]; then
   "mode": "auto",
   "lanBind": false,
   "proxy": { "enabled": true, "pathPrefix": "/p" },
-  "access": { "enabled": true, "max": 500, "trustProxyHeaders": true },
+  "access": { "trustProxyHeaders": true },
   "versions": { "keep": 3 },
   "install": {
     "npmRegistry": "https://registry.npmjs.org",
     "proxy": "${PROXY_URL}"
-  },
-  "shortcuts": []
+  }
 }
 EOF
     chmod 600 "${DATA_DIR}/console-config.json" 2>/dev/null || true

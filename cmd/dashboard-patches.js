@@ -128,31 +128,3 @@ export function applyPatches() {
   }
   return { ok, versions }
 }
-
-/** Report-only view: what each bundle would look like, without touching disk. */
-export function patchState() {
-  const versions = []
-  for (const version of versionRoots()) {
-    const files = []
-    for (const relative of CANDIDATES) {
-      const path = join(VERSIONS_DIR, version, 'node_modules', '@deepseek-ai', relative)
-      if (!existsSync(path)) continue
-      let state = 'missing'
-      try {
-        const text = readFileSync(path, 'utf8')
-        if (MARKER_RE.test(text)) state = 'already'
-        else if (new RegExp(TERNARY.source).test(text)) state = 'pending'
-      } catch (error) {
-        state = 'error'
-        files.push({ file: relative, state, error: error?.message ?? String(error) })
-        continue
-      }
-      files.push({ file: relative, state })
-    }
-    versions.push({ version, files })
-  }
-  return {
-    versions,
-    applied: versions.every((entry) => entry.files.every((file) => file.state === 'already' || file.state === 'missing')),
-  }
-}
