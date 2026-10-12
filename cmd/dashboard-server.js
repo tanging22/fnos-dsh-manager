@@ -945,16 +945,17 @@ async function proxyToDsh(request, response, { pathPrefix }) {
 
   const startedAt = Date.now()
   const visit = (status) => {
-    recordVisit({
+    // recordVisit 返回它刚写入的完整快照，直接当广播事件发出去：否则广播
+    // 里的字段（path / agent / ts）就得在这里和 recordVisit 各写一遍，两边
+    // 一旦不同步，前端通过推送更新时就只更新得动 IP、其余三行永远是旧的。
+    const recorded = recordVisit({
       ip: realIp,
       method: request.method,
       path: upstream,
       status,
-      tookMs: Date.now() - startedAt,
       userAgent: request.headers['user-agent'],
-      auth: 'passthrough',
     })
-    broadcast({ type: 'visit', ip: realIp, path: upstream, method: request.method, status })
+    if (recorded) broadcast({ type: 'visit', ...recorded })
   }
 
   const proxied = httpRequest(
@@ -1081,9 +1082,7 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
       method: request.method,
       path: upstream,
       status,
-      tookMs: Date.now() - startedAt,
       userAgent: request.headers['user-agent'],
-      auth: 'passthrough',
     })
     console.log(`[ws-proxy] ${upstream} failed: ${error}`)
   }
@@ -1146,9 +1145,7 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
         method: request.method,
         path: upstream,
         status: 101,
-        tookMs: Date.now() - startedAt,
         userAgent: request.headers['user-agent'],
-        auth: 'passthrough',
       })
     } catch (error) {
       fail(error?.message ?? error, 502, 'Bad Gateway')
@@ -1172,9 +1169,7 @@ async function proxyUpgradeToDsh(request, socket, head, { pathPrefix }) {
       method: request.method,
       path: upstream,
       status,
-      tookMs: Date.now() - startedAt,
       userAgent: request.headers['user-agent'],
-      auth: 'passthrough',
     })
   })
 

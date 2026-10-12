@@ -73,6 +73,11 @@ export async function render(host, ctx) {
   const launchUrl = status.session?.url || ''
   const launchEntry = status.session?.entry || ''
 
+  // 最近一次被反代的请求。卡片渲染四行（时间/地址/IP/客户端），所以每一行
+  // 都要有对应元素，否则推送到达时无处可写 —— 四行都恒渲染，不做"有才显示"。
+  const visit = status.recentVisit ?? {}
+  const visitTime = visit.ts ? visitTimeText(visit.ts) : '-'
+
   // dsh 进程树资源（CPU/内存）初始占位，由 renderDshUsage 填充。
   const cpuMetric = '<div class="metric-value" id="m-cpu">—</div>'
   const memMetric = '<div class="metric-value" id="m-mem">—</div>'
@@ -141,7 +146,10 @@ export async function render(host, ctx) {
 
       <div class="hero-divider"></div>
 
-      <!-- 运行控制按钮栏：融入状态卡底部（原独立 action-grid 收敛到此） -->
+      <!-- 运行控制按钮栏：融入状态卡底部（原独立 action-grid 收敛到此）。
+           会话代持的两项状态也并入这一行（与控制按钮同级）——它们本来就是
+           「面板当前能不能干活」的状态指示，塞在下面的信息卡里反而要来回对照。
+           启动地址放最后：它是这组里唯一的信息项，不是操作项。 -->
       <div class="action-bar">
         ${running
           ? `<button class="btn btn-danger" data-action="stop" type="button">⏹ 停止服务</button>`
@@ -149,17 +157,27 @@ export async function render(host, ctx) {
         <button class="btn" data-action="restart" type="button">🔄 重启服务</button>
         <button class="btn" data-action="open" data-open="/p/" type="button">🔗 打开面板入口</button>
         <button class="btn" data-action="open" data-open="/api/versions" type="button">📦 版本管理</button>
-        <button class="btn" data-action="launch" type="button">🔑 启动地址</button>
-      </div>
-
-      <!-- dsh 启动时打印的带 token 地址。整块带 data-copy，供下面的复制按钮取用。 -->
-      <div class="launch-url-row" data-copy="${esc(launchUrl)}">
-        <span class="launch-url-label">启动地址</span>
+        <span class="bar-divider" aria-hidden="true"></span>
+        <span class="bar-stat" title="dsh 启动时打印的 Launch Token，面板据此换 dsh 登录 Cookie">
+          <span class="bar-stat-k">Launch Token</span>
+          <span class="bar-stat-v ${status.session?.token ? 'is-ok' : 'is-bad'}">${status.session?.token ? '已捕获' : '未捕获'}</span>
+        </span>
+        <span class="bar-stat" title="反代请求由面板注入这个 Cookie，你不必把 token 暴露在地址栏">
+          <span class="bar-stat-k">dsh-auth</span>
+          <span class="bar-stat-v ${status.session?.cookie ? 'is-ok' : 'is-bad'}">${status.session?.cookie ? '已持有' : '缺失'}</span>
+        </span>
+        <span class="bar-divider" aria-hidden="true"></span>
         ${launchUrl
-          ? `<code class="launch-url">${esc(launchUrl)}</code>
-             <button class="btn btn-ghost" data-action="copy-launch" type="button">复制</button>
-             ${launchEntry ? '<span class="muted">按钮会用面板域名打开同一地址</span>' : ''}`
-          : '<span class="muted">尚未捕获——dsh 每次启动会打印一次，重启服务后这里就有</span>'}
+          ? `<button class="btn launch-btn" data-action="copy-launch" data-copy="${esc(launchUrl)}" type="button"
+               title="点击复制：${esc(launchUrl)}${launchEntry ? `&#10;Shift+点击用面板域名打开同一地址（${esc(launchEntry)}）` : ''}">
+               <span class="launch-btn-k">🔑 启动地址</span>
+               <code class="launch-btn-v">${esc(launchUrl)}</code>
+             </button>`
+          : `<button class="btn launch-btn is-empty" disabled type="button"
+               title="dsh 每次启动才打印一次地址，重启服务后这里就有">
+               <span class="launch-btn-k">🔑 启动地址</span>
+               <code class="launch-btn-v">尚未捕获</code>
+             </button>`}
       </div>
     </div>
 
@@ -181,13 +199,15 @@ export async function render(host, ctx) {
       </div>
       <div class="card">
         <div class="card-head"><h3><span class="card-icon">👥</span>最近访问</h3></div>
-        <div class="row"><span class="k">来源 IP</span><span class="v"><code data-visit-ip>${esc(status.recentVisit?.ip || '-')}</code></span></div>
+        <div class="row"><span class="k">时间</span><span class="v" data-visit-ts title="${esc(visitTime)}">${esc(visitTime)}</span></div>
+        <div class="row"><span class="k">地址</span><span class="v" title="${esc(visit.path || '-')}"><code data-visit-path>${esc(visit.path || '-')}</code></span></div>
+        <div class="row"><span class="k">来源 IP</span><span class="v" title="${esc(visit.ip || '-')}"><code data-visit-ip>${esc(visit.ip || '-')}</code></span></div>
+        <div class="row"><span class="k">客户端</span><span class="v" data-visit-agent title="${esc(visit.agent || '-')}">${esc(visit.agent || '-')}</span></div>
       </div>
       <div class="card">
         <div class="card-head"><h3><span class="card-icon">🔑</span>会话代持</h3>
           <span class="badge ${sessionOk ? 'badge-ok' : 'badge-warn'}">${sessionOk ? '已就绪' : '缺凭据'}</span></div>
-        <div class="row"><span class="k">Launch Token</span><span class="v">${status.session?.token ? '已捕获' : '未捕获'}</span></div>
-        <div class="row"><span class="k">dsh-auth Cookie</span><span class="v">${status.session?.cookie ? '已持有' : '缺失'}</span></div>
+        <p class="muted">面板代替你的浏览器持有 dsh 登录态：反代请求由面板注入 Cookie，你不必把 token 暴露在地址栏。状态见上方按钮栏。</p>
         ${sessionOk ? '' : '<p class="empty">面板手里没有 dsh 登录凭据，反代会 401、前端 WebSocket 将在 60 秒后超时。请重启 dsh 重新捕获（重启后新进程会重新打印 Launch Token）。</p>'}
       </div>
     </div>
@@ -211,21 +231,17 @@ export async function render(host, ctx) {
   for (const btn of host.querySelectorAll('.action-bar [data-open="/p/"]')) {
     btn.addEventListener('click', () => { window.open(url('/p/'), '_blank', 'noopener') })
   }
-  // 「启动地址」→ 复制 dsh 自己打印的那条，并用面板域名打开同一地址。
-  for (const btn of host.querySelectorAll('.action-bar [data-action="launch"]')) {
-    btn.addEventListener('click', () => {
-      if (!launchEntry) {
-        toast('还没有捕获到启动地址：dsh 每次启动才打印一次，请重启一次服务', 'error')
+  // 「启动地址」按钮：整块就是一个复制动作，点哪都复制 dsh 打印的那条地址。
+  // Shift+点击才是「用面板域名打开同一地址」—— 直接打开原地址会连到浏览器
+  // 所在机器的回环（那条地址里的主机是 dsh 的 127.0.0.1），所以默认动作只复制。
+  for (const btn of host.querySelectorAll('.action-bar [data-action="copy-launch"]')) {
+    btn.addEventListener('click', (event) => {
+      if (event.shiftKey && launchEntry) {
+        window.open(url(launchEntry), '_blank', 'noopener')
         return
       }
-      if (launchUrl) copyText(launchUrl)
-      window.open(url(launchEntry), '_blank', 'noopener')
-    })
-  }
-  for (const btn of host.querySelectorAll('[data-action="copy-launch"]')) {
-    btn.addEventListener('click', () => {
-      const text = btn.closest('[data-copy]')?.dataset.copy || launchUrl
-      if (text) copyText(text)
+      const text = btn.dataset.copy || launchUrl
+      if (text) copyText(text, '启动地址已复制')
     })
   }
 
@@ -239,6 +255,35 @@ export async function render(host, ctx) {
   // /api/usage 的请求量呈指数增长（实测每秒 20~29 次，正常应为每 3s 一次）。
   const cleanupUsage = startUsageTimer(host, ctx)
   ctx.onLeave(() => { cleanupUsage() })
+
+  const cleanupUptime = startUptimeTicker(host, status.state?.startedAt)
+  ctx.onLeave(() => { cleanupUptime() })
+}
+
+// 运行时间：本地每秒自走，不发任何请求。
+//
+// 它此前只在渲染那一刻算一次（`Date.now() - startedAt` 写进 innerHTML），之后
+// 再没东西碰它。而面板的 15s 兜底整页重渲已被 `pushLive` 门控（推送在线时直接
+// return），status 事件只在状态跃迁时来 —— 于是「运行时间」会永远停在打开页面
+// 那一秒的数值，看起来就是"不会自动统计"。
+//
+// 改成前端自己按起点算：起点只来自服务端推送的 status（唯一权威），显示层
+// 每秒重算一次即可。这样既不依赖重渲、也不产生任何 HTTP 请求。
+function startUptimeTicker(host, startedAt) {
+  const el = host.querySelector('#m-uptime')
+  if (!el) return () => {}
+  if (!startedAt) {
+    el.textContent = '—'
+    return () => {}
+  }
+  const tick = () => {
+    // 请求式渲染可能已经把这一格换掉了（切页/重渲），此时不该再写。
+    if (!el.isConnected) return
+    el.textContent = fmtUptime(Date.now() - startedAt)
+  }
+  tick()
+  const timer = setInterval(tick, 1000)
+  return () => clearInterval(timer)
 }
 
 // dsh 进程树 CPU/内存采样：写入 5 列指标网格的 #m-cpu / #m-mem。
@@ -282,10 +327,10 @@ function startUsageTimer(host, ctx) {
  * 根本不存在 —— 只写 `navigator.clipboard.writeText(...)` 会抛 TypeError，
  * 按钮表现成"点了没反应"。这里回退到临时 textarea + execCommand。
  */
-function copyText(text) {
+function copyText(text, okMessage = '已复制') {
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(text).then(
-      () => toast('已复制', 'ok'),
+      () => toast(okMessage, 'ok'),
       () => toast('复制失败，请手动选中', 'error'),
     )
     return
@@ -299,7 +344,7 @@ function copyText(text) {
     area.select()
     const ok = document.execCommand('copy')
     area.remove()
-    toast(ok ? '已复制' : '复制失败，请手动选中', ok ? 'ok' : 'error')
+    toast(ok ? okMessage : '复制失败，请手动选中', ok ? 'ok' : 'error')
   } catch {
     toast('复制失败，请手动选中', 'error')
   }
@@ -314,6 +359,25 @@ function fmtUptime(ms) {
   if (h < 24) return `${h} 小时 ${m % 60} 分`
   const d = Math.floor(h / 24)
   return `${d} 天 ${h % 24} 小时`
+}
+
+/**
+ * 最近访问时间。服务端给的是 ISO 串，这里按浏览器本地时区显示成
+ * 「今天 HH:mm:ss」/「MM-DD HH:mm:ss」——「最近访问」关心的就是几分钟前那
+ * 一次，完整年份没有信息量却要占掉半行宽度。
+ *
+ * 导出供 app.js 的 applyVisit 复用：推送到达时若自己再实现一份，两处格式
+ * 就会在改样式时各自漂移，卡片里显示一种、推送后变成另一种。
+ */
+export function visitTimeText(iso) {
+  const when = new Date(iso)
+  if (Number.isNaN(when.getTime())) return ''
+  const pad = (n) => String(n).padStart(2, '0')
+  const clock = `${pad(when.getHours())}:${pad(when.getMinutes())}:${pad(when.getSeconds())}`
+  const today = new Date()
+  const sameDay = when.toDateString() === today.toDateString()
+  if (sameDay) return `今天 ${clock}`
+  return `${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${clock}`
 }
 
 async function service(action, ctx) {

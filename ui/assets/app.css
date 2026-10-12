@@ -374,30 +374,61 @@ html, body {
   color: var(--text);
 }
 
-/* 启动地址行：dsh 启动时打印的带 token 地址。放在运行控制按钮栏下方，
-   地址可能很长，允许换行而不撑破状态卡。 */
-.launch-url-row {
-  margin-top: 10px;
-  display: flex;
+/* 启动地址按钮：整块可点，点击即复制。
+   地址很长且含 token，按钮必须能收缩到剩余空间内，所以：
+   - 容器 flex:1 + min-width:0（允许收缩到内容宽度以下）
+   - 地址 ellipsis 单行截断，而不是 word-break 换行把按钮撑成两行
+   - title 属性保留完整值，鼠标悬停可见 */
+.launch-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  padding: 6px 12px;
   font-size: 12px;
-  color: var(--muted);
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
 }
-.launch-url-label { flex: 0 0 auto; }
-.launch-url {
+.launch-btn-k { flex: 0 0 auto; white-space: nowrap; }
+.launch-btn-v {
+  flex: 1 1 auto;
+  min-width: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--text);
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 4px 8px;
-  /* 长 URL 不撑破卡片：优先在任意位置断行，而不是横向溢出。 */
-  word-break: break-all;
-  max-width: 100%;
+  color: var(--muted);
+  /* 单行 + 省略号。不用 word-break:break-all —— 那会把地址折成两行，
+     而这个按钮在按钮栏里必须保持单行。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.launch-url-row .btn-ghost { padding: 4px 10px; font-size: 12px; }
+.launch-btn:hover .launch-btn-v { color: var(--text); }
+.launch-btn.is-empty { cursor: default; opacity: 0.6; }
+
+/* 按钮栏里的状态项（会话代持两项）：不是按钮，只是和按钮同级的一行状态。
+   用 tag 而非 .btn，避免被读成可点的东西 —— 它们的 title 解释用途。 */
+.bar-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 2px;
+  white-space: nowrap;
+}
+.bar-stat-k { color: var(--muted); }
+.bar-stat-v { font-weight: 700; }
+.bar-stat-v.is-ok { color: var(--ok); }
+.bar-stat-v.is-bad { color: var(--warn); }
+
+/* 分隔竖线：把「操作」/「状态」/「启动地址」三组在视觉上分开 */
+.bar-divider {
+  width: 1px;
+  align-self: stretch;
+  min-height: 20px;
+  background: var(--line);
+  margin: 0 2px;
+}
 
 /* 5 列指标网格（运行状态/PID/CPU/内存/运行时间，对齐 Go 版 grid-cols-5） */
 .metric-grid {
@@ -565,7 +596,17 @@ html, body {
 }
 .row + .row { border-top: 1px solid var(--line); }
 .row .k { color: var(--muted); flex-shrink: 0; }
-.row .v { font-variant-numeric: tabular-nums; text-align: right; word-break: break-all; }
+/* 值列允许收缩：长路径/长 UA 单行省略（配合下方 title），不把卡片撑宽。
+   word-break:break-all 会让地址折成多行、把卡片撑得很高，所以改成 ellipsis。 */
+.row .v {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row .v code { font-family: inherit; }
 
 /* 状态徽章（运行中 / 已停止 / 启动中）与彩色小圆点 */
 .dot {

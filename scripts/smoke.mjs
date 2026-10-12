@@ -733,8 +733,95 @@ async function pythonBin() {
     /export function ws\(onEvent, onState\)/.test(domJsText) && /onState\?\.\(connected\)/.test(domJsText),
     'dom.js ws() does not report open/close, so callers cannot degrade the poll')
 
-  /* The second half of the fix: serialise renderTab() itself. Even with a
-   * synchronously-created timer, two overlapping renders would still each
+  /* --- recent visit: four rows, not just the IP --------------------------- */
+  /* recordVisit used to keep only {ip, ts} while the four proxy call sites
+   * passed method/path/status/userAgent as well. Everything past the IP was
+   * dropped on the floor, so any row added to the card rendered blank forever.
+   * Assert against statusAfter — the snapshot taken AFTER the proxied calls —
+   * so the slot is actually populated and the check cannot pass vacuously. */
+  check('the stored visit carries the whole request, not just the IP',
+    ['ts', 'method', 'path', 'status', 'agent'].every((k) => k in (statusAfter.recentVisit ?? {})),
+    `recentVisit is missing fields: ${JSON.stringify(statusAfter.recentVisit)}`)
+  check('the visit card renders all four rows',
+    ['data-visit-ts', 'data-visit-path', 'data-visit-ip', 'data-visit-agent'].every((a) => overviewJs.includes(a)),
+    'the visit card does not render time / path / ip / agent')
+  check('a visit push updates all four rows, not just the IP',
+    ['data-visit-ts', 'data-visit-path', 'data-visit-ip', 'data-visit-agent'].every((a) => appJsText.includes(a)),
+    'applyVisit does not write every visit row')
+  check('the visit time format is shared by the view and the push path',
+    /export function visitTimeText/.test(overviewJs) && /overview\.visitTimeText/.test(appJsText),
+    'the visit timestamp is formatted twice — the card and the push can drift apart')
+  check('a visit query string is never stored or shown',
+    /indexOf\('\?'\)/.test(readFileSync(join(ROOT, 'cmd/dashboard-access.js'), 'utf8')),
+    'dashboard-access.js keeps the query string — it can carry the dsh launch token')
+
+  /* --- overview bar layout ---------------------------------------------- */
+  /* The launch URL is a button now (click copies), the session-hold status
+   * moved into the same bar, and the URL has to ellipsis instead of wrapping —
+   * a wrapped button breaks the single-row layout the bar is built around. */
+  const appCss = await (await fetch(`${base}/assets/app.css`)).text()
+  check('the launch address is a click-to-copy control in the button bar',
+    /class="btn launch-btn"/.test(overviewJs) && /data-action="copy-launch"/.test(overviewJs),
+    'the launch address is not a click-to-copy control in the action bar')
+  check('the launch address truncates instead of wrapping the bar',
+    /\.launch-btn-v[\s\S]{0,400}text-overflow: ellipsis/.test(appCss),
+    'the launch address has no ellipsis — it will wrap the bar onto a second line')
+  check('the session-hold status sits in the action bar, before the launch address',
+    /bar-stat-k">Launch Token/.test(overviewJs)
+      && /bar-stat-k">dsh-auth/.test(overviewJs)
+      && overviewJs.indexOf('bar-stat-k">Launch Token') < overviewJs.indexOf('class="btn launch-btn"'),
+    'the session-hold indicators are not in the action bar, or come after the launch address')
+  check('the standalone launch-URL row is gone',
+    !/launch-url-row/.test(overviewJs) && !/launch-url-row/.test(appCss),
+    'the old launch-url-row markup/css is still present')
+
+  /* Uptime used to be frozen: it was computed once during render and nothing
+   * touched it afterwards. The 15s safety-net re-render above now stands down
+   * while pushes are live, and status events only fire on state transitions —
+   * so a running dsh showed the uptime of the moment the page was opened.
+   * The display must now tick on its own, from the pushed start time, with no
+   * HTTP traffic (the point of the whole change was to stop polling). */
+  check('uptime ticks locally instead of being frozen at render time',
+    /function startUptimeTicker\(/.test(overviewJs) && /setInterval\(tick, 1000\)/.test(overviewJs),
+    'overview.js computes uptime once per render and never updates it again')
+  check('the uptime ticker is registered for cleanup like every other timer',
+    /startUptimeTicker\(host, status\.state\?\.startedAt\)/.test(overviewJs)
+      && /ctx\.onLeave\(\(\) => \{ cleanupUptime\(\) \}\)/.test(overviewJs),
+    'the uptime ticker leaks — it is not drained through ctx.onLeave')
+
+  /* The file manager button. The previous revision called
+   * `window.trimSdk.openFileManager(path)`, but the official SDK exports a
+   * `TrimApp` class and the host injects no global at all — the name appears
+   * zero times in @trimjs/web-app. So that path was permanently undefined and
+   * the button could never do anything. Pin the official shape so it cannot
+   * drift back to a global that does not exist. */
+  const workspaceJs = await (await fetch(`${base}/assets/views/workspace.js`)).text()
+  const vendorJs = await (await fetch(`${base}/assets/vendor/trim-web-app.js`)).text()
+  check('the workspace view calls the official TrimApp class',
+    /new TrimApp\(/.test(workspaceJs) && /app\.openFileManager\(path\)/.test(workspaceJs),
+    'workspace.js does not use `new TrimApp().openFileManager(path)`')
+  /* Strip comments before the global-SDK check: the function's doc comment
+   * deliberately quotes `window.trimSdk.openFileManager(path)` as the
+   * anti-pattern, and that text must not read as a live call. */
+  const workspaceCode = workspaceJs
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+  check('the workspace view never reads a non-existent global SDK',
+    !/\bwindow\s*\.\s*(trimSdk|fnSdk)\b/.test(workspaceCode)
+      && !/window\.trimSdk\s*\|\|/.test(workspaceCode),
+    'workspace.js reads window.trimSdk / window.fnSdk — the host injects no such global')
+  check('the official SDK is served and does export TrimApp',
+    /export\s*\{[^}]*\bTrimApp\b/.test(vendorJs) || /class TrimApp/.test(vendorJs),
+    'assets/vendor/trim-web-app.js is missing or does not export TrimApp')
+  check('the official SDK still exposes openFileManager',
+    /openFileManager/.test(vendorJs),
+    'the vendored SDK has no openFileManager — wrong artifact vendored')
+  check('the file manager call is awaited, not fired and forgotten',
+    /await withTimeout\(app\.openFileManager/.test(workspaceJs),
+    'workspace.js does not await the host call — failures surface only as unhandled rejections')
+
+  /* The second half of the render fix: serialise renderTab() itself. Even with
+   * a synchronously-created timer, two overlapping renders would still each
    * register a cleanup while only the last one gets drained. */
   check('renderTab is serialised through a queue',
     /let renderQueue = Promise\.resolve\(\)[\s\S]*?renderQueue\.then\(runRenderTab/.test(appJsText),
@@ -742,6 +829,7 @@ async function pythonBin() {
   check('the render queue drains leavers inside the serialised body',
     /async function runRenderTab\(\)[\s\S]{0,200}leavers\.splice/.test(appJsText),
     'app.js drains leavers outside the queued body')
+
   const traversal = await fetch(`${base}/assets/../../cmd/dashboard.js`)
   check('static server refuses traversal', traversal.status === 404, `got ${traversal.status}`)
 

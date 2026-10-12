@@ -1,19 +1,28 @@
 /**
  * 工作区：列出 dsh 的工作区（标题/路径/会话数/时间），支持「打开文件夹」（调 fnOS
  * 文件管理器）、复制路径与只读浏览目录。对齐 Go 版 Workspace.vue。
- *
- * 「打开文件夹」就一行：宿主注入的全局 SDK 调 `openFileManager(path)`。
- * 见下面 openFileManager() 的说明。
  */
 
 import { api, esc, toast, bytes, localTime, timeAgo, url } from '../dom.js'
 
-/** 宿主（fnOS 应用中心）挂到页面 window 上的能力对象。取不到就是没在宿主里。 */
-function hostSdk() {
-  return window.trimSdk || window.fnSdk || window.sdk || null
+/**
+ * 官方 SDK 只加载一次；加载失败一律解析成 null，不让 import 错误冒泡成崩溃。
+ *
+ * vendor 的是 @trimjs/web-app@0.5.0 的 dist/index.js（未修改，来源与 sha256 见该
+ * 文件头注释）。它导出 TrimApp 类 —— 不是全局对象。
+ */
+let trimAppPromise = null
+
+function loadTrimApp() {
+  if (!trimAppPromise) {
+    trimAppPromise = import('../vendor/trim-web-app.js')
+      .then((mod) => mod?.TrimApp ?? null)
+      .catch(() => null)
+  }
+  return trimAppPromise
 }
 
-/** 给任意 Promise 套硬超时：宿主不回应时不让按钮一直转圈。 */
+/** 给任意 Promise 套硬超时：宿主不回应时不让按钮一直转圈（SDK 自带 5s 握手超时）。 */
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label}超时（${ms}ms）`)), ms)
@@ -25,36 +34,70 @@ function withTimeout(promise, ms, label) {
 }
 
 /**
- * 调 fnOS 文件管理器打开一个目录：
+ * 调 fnOS 文件管理器打开一个目录。官方途径只有一条：
  *
- *   const sdk = window.trimSdk || window.fnSdk || window.sdk
- *   await sdk.openFileManager(path)
+ *   const { TrimApp } = await import('../vendor/trim-web-app.js')
+ *   await new TrimApp().openFileManager(path)
  *
- * 两个必须守住的点是过去"点了没反应"的病根：
- *   1. 必须 await。SDK 方法返回 Promise；旧代码调完立刻 return true，失败只变成
- *      控制台里一条 unhandled rejection，UI 却弹「已交给文件管理器打开」——
- *      提示成功、什么都没发生。
- *   2. 拿到的是不是真能用的对象要判断，不是 const 出来就直接用。
+ * **不要写成 window.trimSdk.openFileManager(path)。** 上一版就是这么写的，而
+ * 这个名字在官方 SDK 产物里出现 0 次 —— 宿主从不注入任何全局 SDK，它只通过
+ * postMessage 握手把方法表交给 new TrimApp() 的实例（SDK 内部的
+ * getWebMethods() 拿不到方法表时抛 "Host bridge is not available outside
+ * iframe or app runtime"）。于是真机上 window.trimSdk 恒为 undefined，
+ * 按钮必然「点了没反应」。
+ *
+ * 必须 await：SDK 方法返回 Promise。旧代码调完立刻 return true，失败只变成
+ * 控制台里一条 unhandled rejection，UI 却弹「已交给文件管理器打开」——
+ * 提示成功、什么都没发生。
+ *
+ * 返回 { ok, reason }，reason 分层对应可执行的下一步：
+ *   no-sdk            官方 SDK 没随包发布。
+ *   not-embedded      页面不在 iframe 里（直连 :28001 或经外部域名反代）。
+ *                     官方 SDK 在这种环境下主动跳过握手，调用不会有任何反应。
+ *   host-unreachable  在 iframe 里但父窗口不是 fnOS 宿主，握手超时。
+ *   host-rejected     宿主收到了但拒绝：路径不在文件管理器可见树内（套件私有
+ *                     数据目录），或宿主版本不支持此方法。
  */
 async function openFileManager(path) {
-  const sdk = hostSdk()
-  if (!sdk) return { ok: false, reason: 'no-sdk' }
-  if (typeof sdk.openFileManager !== 'function') return { ok: false, reason: 'no-method' }
+  const TrimApp = await loadTrimApp()
+  if (!TrimApp) return { ok: false, reason: 'no-sdk' }
+
+  let app
   try {
-    await withTimeout(sdk.openFileManager(path), 8000, '文件管理器')
+    app = new TrimApp({ debug: false })
+  } catch (error) {
+    return { ok: false, reason: `sdk-init: ${error?.message ?? error}` }
+  }
+
+  // 官方 SDK 自报是否独立页面（判据即 window.parent === window）。只在它明确
+  // 为 true 时才判独立 —— 未初始化时该字段是 undefined，不能误杀 iframe 内场景。
+  await withTimeout(app.initPromise, 6000, 'SDK 初始化').catch(() => {})
+  if (app.isStandaloneWeb === true) return { ok: false, reason: 'not-embedded' }
+
+  try {
+    const result = await withTimeout(app.openFileManager(path), 8000, '文件管理器')
+    // 宿主返回 { code, msg, data }：code !== 0 是被拒，不能当成成功。
+    if (result && typeof result === 'object' && 'code' in result && Number(result.code) !== 0) {
+      const detail = result.msg || result.error || `code ${result.code}`
+      return { ok: false, reason: `host-rejected: ${detail}` }
+    }
     return { ok: true, reason: '' }
   } catch (error) {
     const message = String(error?.message ?? error)
-    return { ok: false, reason: /超时/.test(message) ? 'timeout' : `rejected: ${message}` }
+    // 没人回应握手 = 父窗口不是 fnOS 宿主；其余是宿主明确拒绝。
+    if (/timeout|Host bridge/i.test(message)) return { ok: false, reason: 'host-unreachable' }
+    return { ok: false, reason: `host-rejected: ${message}` }
   }
 }
 
 /** 打不开时告诉用户下一步该做什么。 */
 function fileManagerHint(reason) {
-  if (reason === 'no-sdk') return '当前页面没有宿主 SDK（window.trimSdk / fnSdk / sdk 都拿不到）。请从 fnOS 应用中心进入本套件，URL 形如 /app/fnos-dsh-manager/。'
-  if (reason === 'no-method') return '宿主 SDK 上没有 openFileManager 方法，可能是旧版宿主。'
-  if (reason === 'timeout') return '调用超时，宿主没回应。请确认是从 fnOS 应用中心进入本套件。'
-  return `宿主拒绝了这个目录（${reason.slice('rejected: '.length)}）：该路径多半还没授权给本套件。`
+  if (reason === 'no-sdk') return '官方 SDK 没随包发布，调不了 fnOS 文件管理器。'
+  if (reason === 'not-embedded') return '当前页面不是从 fnOS 应用中心打开的（直连面板端口，或经外部域名反代），宿主文件管理器不存在。请从「应用中心 → DSH 管理器」进入后再点。'
+  if (reason.startsWith('sdk-init')) return `文件管理器 SDK 初始化失败：${reason.slice('sdk-init: '.length)}。宿主版本可能过旧。`
+  if (reason === 'host-unreachable') return '页面在 iframe 里，但父窗口不是 fnOS 宿主（握手超时）。请从「应用中心 → DSH 管理器」进入后再点。'
+  if (reason.startsWith('host-rejected')) return `宿主拒绝了这个目录（${reason.slice('host-rejected: '.length)}）：工作区多半位于套件私有数据目录，不在文件管理器可见的目录树内。`
+  return '当前环境拿不到 fnOS 文件管理器能力。'
 }
 
 export async function render(host, ctx) {

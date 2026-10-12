@@ -34,6 +34,10 @@ const SYNTAX_ONLY = new Set([
   'ui/assets/views/settings.js',
   'ui/assets/views/versions.js',
   'ui/assets/views/workspace.js',
+  // Vendored third-party browser bundle (@trimjs/web-app@0.5.0 dist/index.js,
+  // unmodified). It reads `window` at module scope by design, so only its
+  // syntax is checked here — its behaviour is the host SDK's, not ours.
+  'ui/assets/vendor/trim-web-app.js',
   // This script: importing it would re-run the whole gate, recursively.
   'scripts/check.mjs',
 ])

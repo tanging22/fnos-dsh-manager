@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.0.44 - 2026-10-12
+
+### 修复
+
+- **概览「运行时间」永远不自动统计**：这是 1.0.43 引入的回归。该值此前只在渲染那一刻算一次 `Date.now() - startedAt` 就写死进 DOM，之后再没有任何东西碰它；而 1.0.43 为消除 `/api/usage` 冗余轮询，给 15s 兜底整页重渲加了 `if (pushLive) return`，`status` 推送又只在状态**跃迁**时来 —— 两个条件叠加，运行中的 dsh 就永远停在「打开页面那一秒」的数值。现改为 `startUptimeTicker()`：起点仍只认服务端推送的 `startedAt`（唯一权威），显示层由前端每秒重算，**不依赖重渲、不产生任何 HTTP 请求**；节点被换掉时通过 `isConnected` 自行退出，cleanup 走 `ctx.onLeave`（与其余定时器同一规约，防泄漏）。
+  - 教训：整页重渲此前是很多字段隐式的刷新机制，停掉它必须逐字段确认有独立更新源，否则就是静默冻结。
+- **工作区「打开文件夹」点了没反应**（1.0.43 的改法本身是错的）：那一版按 `window.trimSdk || window.fnSdk || window.sdk` 取全局能力，但官方 `@trimjs/web-app` 的产物里 `trimSdk` **出现 0 次** —— 宿主从不注入任何全局对象，它只通过 postMessage 握手把方法表交给 `new TrimApp()` 的实例（SDK 内部 `getWebMethods()` 拿不到方法表时抛 `Host bridge is not available outside iframe or app runtime`）。所以真机上恒为 `undefined`，按钮必然无反应。现重新 vendor 官方产物（`@trimjs/web-app@0.5.0` dist/index.js，39755 字节，sha256 `198cb570…8f3dec`，未做任何修改）并改回官方调用：`new TrimApp()` → `await initPromise` → `await openFileManager(path)`；宿主返回 `{code,msg,data}` 时 `code !== 0` 判为拒绝。失败分层为 `no-sdk / not-embedded / host-unreachable / host-rejected`，每层给出可执行的下一步。
+  - 代价：+40KB 第三方代码，与瘦身方向冲突。penpal 握手无公开规范可仿写，vendor 是唯一可靠路径。
+
+### 变更
+
+- **主页按钮栏改版**：启动地址删掉独立整行，改为按钮栏末尾的**点击即复制**控件（整块可点，label 与地址都可点）；默认动作只复制，**Shift+点击**才用面板域名打开同一地址 —— 原地址里的主机是 dsh 自己的 `127.0.0.1`，直接打开会连到浏览器所在那台机器。地址过长以省略号截断（`text-overflow: ellipsis` + `nowrap`，刻意不用 `word-break: break-all`，那会把按钮折成第二行），完整值保留在 `title`。未捕获到 token 时也渲染同款 disabled 按钮，避免按钮栏宽度跳变。
+- **会话代持两项移入按钮栏**：Launch Token 与 dsh-auth 状态改为与控制按钮同级的状态项，用竖线把「操作 / 状态 / 启动地址」分成三组。刻意不套用 `.btn` 类 —— 它们不可点，做成按钮样式会误导。「会话代持」卡片保留解释与缺凭据告警，不再重复列行。
+- **最近访问补齐四行**（时间 / 地址 / IP / 客户端）：服务端 `recordVisit` 此前签名只接 `{ ip }`，四个代理调用点传入的 `method / path / status / userAgent` 全被丢弃 —— 卡片无论加哪一行都会永远空白，这是个真 bug。现存全量字段，并让 `recordVisit` 返回它写入的快照供 `broadcast` 直接复用（原先广播字段在 `server.js` 里另写一份，两份一旦不同步，前端通过推送更新时就只更新得动 IP）。`path` 剥掉可能携带 launch token 的 query string；客户端归一化为浏览器族（Edge/Opera/Firefox/Chrome/Safari/curl/Node.js，注意 Edge 与 Chrome 的 UA 都含 `Chrome`、Safari 含 `Safari`，须按特异度顺序匹配）。时间格式函数从 overview 导出给 `applyVisit` 复用，避免卡片渲染与推送更新各写一份格式而漂移。
+- **`.row .v` 改用省略号**替代 `word-break: break-all`，此前长路径会把卡片撑得很高。
+
+### 门禁
+
+check 29 parsed / 15 imported / 0 failure，smoke **126/126**（新增 16 条断言，涵盖 uptime 本地自走与其清理、TrimApp 调用形态、无全局 SDK 残留、vendor 完整性、visit 四行字段、按钮栏结构与省略号）。新增的 visit 字段断言使用发过代理请求后的快照而非空状态快照，并经反向验证：手动删掉 `agent` 字段后该断言确实 FAIL。
+
 ## v1.0.43 - 2026-10-12
 
 ### 修复

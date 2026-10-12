@@ -195,11 +195,27 @@ setInterval(() => {
   if (state.tab === 'overview' && isPanelVisible()) renderTab()
 }, 15000)
 
-/** 只刷新「最近访问」的来源 IP，不重渲整页。 */
+/**
+ * 刷新「最近访问」卡的四行（时间/地址/IP/客户端），不重渲整页。
+ *
+ * 整页重渲会把概览页的定时器重建一遍，实测把 /api/usage 请求量抬到每秒多次。
+ * 这里逐个改文本节点；卡片永远渲染这四行（无数据时为 `-`），所以每条 visit
+ * 推送都有元素可写。`title` 一并更新，否则省略号截断后看不到全文。
+ */
 function applyVisit(event) {
   if (state.tab !== 'overview') return
-  const cell = document.querySelector('[data-visit-ip]')
-  if (cell) cell.textContent = event?.ip || '—'
+  const write = (selector, value) => {
+    const cell = document.querySelector(selector)
+    if (!cell) return
+    cell.textContent = value || '-'
+    // 值在 <code> 里时，title 挂在外层 .v 上。
+    const holder = cell.closest('.v') || cell
+    holder.title = value || '-'
+  }
+  write('[data-visit-ts]', overview.visitTimeText(event?.ts))
+  write('[data-visit-path]', event?.path)
+  write('[data-visit-ip]', event?.ip)
+  write('[data-visit-agent]', event?.agent)
 }
 
 const closeWs = ws((event) => {
