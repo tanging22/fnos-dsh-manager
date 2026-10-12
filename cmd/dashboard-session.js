@@ -13,8 +13,11 @@
  * 不碰上游代码，升级安全。
  */
 
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { request as httpRequest } from 'node:http'
 import { managedPort, webserverHost } from './dashboard-config.js'
+import { DATA_DIR } from './dashboard-utils.js'
 
 // Launch Token：dsh 启动打印 `dsh web: .*?[?&]token=<token>`（Go launchTokenRe）。
 const LAUNCH_TOKEN_RE = /dsh web: .*?[?&]token=([A-Za-z0-9_-]+)/
@@ -27,16 +30,62 @@ let currentLaunchToken = ''
 let cachedCookie = ''
 let lastTryAt = 0
 
+/**
+ * 会话代持状态的落盘位置。
+ *
+ * 没有这层持久化，Launch Token 与换来的 `dsh-auth-*` Cookie 只活在模块内存里，
+ * 面板**每次重启都会丢**——而 fnOS 每次升级/重装套件都会重启面板。偏偏 dsh
+ * 此时往往还活着（`startDsh()` 的「已有活进程直接复用」分支不重新 spawn，自然
+ * 也不会重新打印 token），于是反代再没有凭据可注入：
+ *
+ *   - HTTP → 被 dsh 的 token gate 直接 401（面板上表现为各种接口失败）；
+ *   - WebSocket（remote.mux）→ 握手能过，但对端永不回话，前端等满 60 秒后抛
+ *     `Connection timed out after 60000ms`，页面就"废了"。
+ *
+ * 这正是「升级完就不正常」的成因：不是代码变了，是重启把凭据冲掉了。
+ * 写盘后面板重启可原样恢复代持，与 dsh 是否跟着重启无关。
+ */
+const SESSION_FILE = join(DATA_DIR, 'dsh-session.json')
+let sessionLoaded = false
+
+function loadPersistedSession() {
+  if (sessionLoaded) return
+  sessionLoaded = true
+  try {
+    const raw = JSON.parse(readFileSync(SESSION_FILE, 'utf8'))
+    if (!currentLaunchToken && typeof raw?.token === 'string') currentLaunchToken = raw.token.trim()
+    if (!cachedCookie && typeof raw?.cookie === 'string') cachedCookie = raw.cookie.trim()
+  } catch {
+    // 首次启动没有该文件；文件损坏也当作没有，绝不让它拖垮反代。
+  }
+}
+
+function persistSession() {
+  try {
+    mkdirSync(dirname(SESSION_FILE), { recursive: true })
+    const tmp = `${SESSION_FILE}.tmp`
+    writeFileSync(tmp, `${JSON.stringify({ token: currentLaunchToken, cookie: cachedCookie }, null, 2)}\n`, 'utf8')
+    renameSync(tmp, SESSION_FILE)
+    // 这是 dsh 的登录凭据，权限必须收紧（同 .credentials.yaml 的处理）。
+    chmodSync(SESSION_FILE, 0o600)
+  } catch {
+    // 落盘失败不该影响代持本身：内存里的凭据本轮仍然可用。
+  }
+}
+
 /** 记录（或清空）当前 Launch Token；变化即失效已缓存的会话凭据（Go SetCurrentLaunchToken）。 */
 export function SetCurrentLaunchToken(token) {
+  loadPersistedSession()
   const trimmed = String(token ?? '').trim()
   if (currentLaunchToken !== trimmed) {
     currentLaunchToken = trimmed
     InvalidateDshSession()
   }
+  persistSession()
 }
 
 export function GetCurrentLaunchToken() {
+  loadPersistedSession()
   return currentLaunchToken
 }
 
@@ -44,6 +93,18 @@ export function GetCurrentLaunchToken() {
 export function InvalidateDshSession() {
   cachedCookie = ''
   lastTryAt = 0
+  persistSession()
+}
+
+/**
+ * 会话代持是否就位 —— 给状态接口与前端诊断用。
+ *
+ * `cookie: false` 且 dsh 在跑，就是上面那个「HTTP 401 / WS 60 秒超时」的状态，
+ * 一眼能看出来，不用再去翻日志猜。
+ */
+export function sessionHoldState() {
+  loadPersistedSession()
+  return { token: Boolean(currentLaunchToken), cookie: Boolean(cachedCookie) }
 }
 
 /**
@@ -78,6 +139,7 @@ export function CaptureLaunchToken(chunk) {
  * 空（Go GetDshSessionCookie 的节流）；否则用当前 token 换取。
  */
 export function GetDshSessionCookie() {
+  loadPersistedSession()
   if (cachedCookie) return cachedCookie
   if (lastTryAt && Date.now() - lastTryAt < 2000) return ''
   const token = currentLaunchToken
@@ -110,7 +172,11 @@ function exchangeDshSessionCookie(token) {
         res.resume() // drain body; we only care about Set-Cookie
         res.on('end', () => {
           const cookie = findDshAuthCookie(res.headers['set-cookie'])
-          if (cookie) cachedCookie = cookie
+          if (cookie) {
+            cachedCookie = cookie
+            // 换到就落盘：这是下一次面板重启后唯一的凭据来源。
+            persistSession()
+          }
           resolve(cookie)
         })
         // 响应流的 'error' 与 'end' 是互斥的：连接重置时只有前者到达，
@@ -148,6 +214,9 @@ function findDshAuthCookie(setCookie) {
  * （Go appendDshSessionCookie）。
  */
 export function appendDshSessionCookie(clientCookie, sessionCookie) {
+  // 面板手里没有凭据时**绝不能剥离浏览器的凭据**：那样等于把唯一还能用的一道
+  // 认证也拆掉，dsh 必然 401 / WS 无回话。原样透传，浏览器自己那份还能生效。
+  if (!sessionCookie) return clientCookie ?? ''
   const kept = []
   if (clientCookie) {
     for (const part of clientCookie.split(';')) {

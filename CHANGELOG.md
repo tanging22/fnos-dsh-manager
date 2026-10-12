@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.0.41 - 2026-10-12
+
+修复「升级后 dsh 前端连不上」：`Connection timed out after 60000ms` 的根因。
+
+**根因**：面板代持的 dsh 登录凭据（Launch Token + 换来的 `dsh-auth-*` Cookie）
+此前只活在模块内存里，而 fnOS 每次升级/重装套件**都会重启面板**——凭据随之
+清空。偏偏 dsh 此时通常还活着（`startDsh()` 命中「已有活进程直接复用」分支，
+不重新 spawn，自然也不会重新打印 token），于是反代再没有凭据可注入：
+
+- HTTP 请求被 dsh 的 token gate 直接 401；
+- WebSocket（remote.mux）握手能过，但对端永不回话，前端等满 60 秒后抛
+  `Connection timed out after 60000ms`，页面就此"废了"。
+
+这与代码改动无关，纯粹是重启把凭据冲掉了 —— 也就是「之前正常、升级完就坏」。
+
+**修复**
+
+- 凭据落盘：token 与 cookie 写入 `${DATA_DIR}/dsh-session.json`（权限 0600，
+  原子写 + rename），面板重启后自动恢复代持，与 dsh 是否跟着重启无关。
+- Launch Token 也从 dsh 的 **stderr** 捕获（此前只盯 stdout）：不少 CLI 把服务
+  横幅走 stderr，漏掉就永远换不到 cookie。
+- 面板手里没有凭据时**不再剥离浏览器自己的 `dsh-auth-*`**：那样等于把唯一还能
+  用的一道认证也拆掉，必然 401。原样透传。
+- 可观测：复用已有 dsh 进程且缺凭据时，日志明确记一行；`/api/status` 新增
+  `session: { token, cookie }`；概览新增「会话代持」卡，缺凭据时直接告警并提示
+  重启 dsh（重启会重新打印 Launch Token）。
+
+**升级后首次需要手动点一次「重启 dsh」**：本版的持久化只能保住**之后**的凭据，
+当前这一轮已经丢失的凭据仍要靠重启 dsh 重新捕获。之后每次面板重启都能自动恢复。
+
+### 门禁
+
+- smoke 新增 4 条断言：token 落盘后可读回、无凭据时浏览器 cookie 原样透传、
+  有凭据时替换而非拼接、`/api/status` 暴露 session 状态。check 28/15/0、smoke 99/99。
+
 ## v1.0.40 - 2026-10-12
 
 按需求做的功能收敛瘦身版：删除三个页面与对应后端，只减不增。

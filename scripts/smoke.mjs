@@ -375,6 +375,12 @@ try {
   /* The access log was removed in v1.0.40 (the overview only shows the last
      visitor's IP), so /api/status must no longer carry a log summary. */
   check('status carries no access-log summary', status.access === undefined, JSON.stringify(status.access))
+  /* Session holding is what keeps the reverse proxy authenticated. A panel that
+     lost it serves 401s and the dsh client's WebSocket dies after 60s, so the
+     state has to be visible rather than inferred from a blank page. */
+  check('status exposes session-holding state',
+    typeof status.session?.token === 'boolean' && typeof status.session?.cookie === 'boolean',
+    JSON.stringify(status.session))
   check('status has no secret in it', !JSON.stringify(status).includes(PASSWORD), 'password leaked into /api/status')
 
   /* --- logs -------------------------------------------------------------- */
@@ -912,6 +918,16 @@ async function pythonBin() {
           session.CaptureLaunchToken('x'.repeat(128 * 1024))
           out.bufferBounded = true // 能走到这里就说明没有 OOM/抛错
 
+          // ---- 会话代持持久化（v1.0.41）----
+          // 面板重启（fnOS 每次升级都会）若把 token/cookie 冲掉，而 dsh 还活着，
+          // 反代就没有凭据：HTTP 401、前端 WS 等满 60 秒超时。凭据必须落盘。
+          const sessionFile = require('path').join(process.env.DATA_DIR, 'dsh-session.json')
+          out.tokenPersisted = JSON.parse(require('fs').readFileSync(sessionFile, 'utf8')).token === 'abc123'
+          // 面板手里没凭据时绝不能剥掉浏览器自己的那份（否则 100% 401）。
+          out.cookiePassthrough = session.appendDshSessionCookie('dsh-auth-a=1; foo=2', '') === 'dsh-auth-a=1; foo=2'
+          // 有凭据时才替换，且旧的 dsh-auth-* 必须被剥离，不能两份并存。
+          out.cookieReplaced = session.appendDshSessionCookie('dsh-auth-a=1; foo=2', 'dsh-auth-b=9') === 'foo=2; dsh-auth-b=9'
+
           // 校验与写入必须同一个名字：入参带空格时若写入原始值，package.json 里
           // 会留下一个和 npm 实际装的包对不上的条目。
           return plugins.setBundleEnabled('  dshmarket  ', true).then((r2) => {
@@ -988,6 +1004,12 @@ async function pythonBin() {
     guard.proxyConfDefaultsToActive === true, JSON.stringify(guard))
   check('trusted-host writes follow the fallback path',
     guard.trustedWriteFollowsFallback === true, JSON.stringify(guard))
+  check('the launch token survives a panel restart (persisted to disk)',
+    guard.tokenPersisted === true, JSON.stringify(guard))
+  check('the browser cookie is passed through when the panel holds none',
+    guard.cookiePassthrough === true, JSON.stringify(guard))
+  check('the panel cookie replaces instead of joining the browser one',
+    guard.cookieReplaced === true, JSON.stringify(guard))
 } finally {
   panel.kill('SIGTERM')
   stub.close()

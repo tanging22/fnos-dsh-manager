@@ -50,7 +50,7 @@ import {
   StatusStopped,
 } from './dashboard-state.js'
 import { setTargetPidResolver } from './dashboard-usage.js'
-import { CaptureLaunchToken, SetCurrentLaunchToken } from './dashboard-session.js'
+import { CaptureLaunchToken, SetCurrentLaunchToken, sessionHoldState } from './dashboard-session.js'
 import { applyPatches } from './dashboard-patches.js'
 
 export const PID_FILE = join(DATA_DIR, 'dsh.pid')
@@ -701,6 +701,16 @@ export async function startDsh() {
     // 已有活进程：直接对齐状态机，避免 UI 与实际脱节。
     SetStatus(StatusRunning, '')
     SetLastRunState(StatusRunning)
+    // 复用已有进程意味着本次不会重新打印 Launch Token。若此时面板手里既无
+    // token 也无 Cookie（典型场景：fnOS 升级重启了面板，而 dsh 一直活着），
+    // 反代就没有凭据可注入 → 接口 401、前端 WS 等满 60 秒超时。以前这条完全
+    // 沉默，只能靠猜；现在明确落一行日志，配合 /api/status 的 session 字段
+    // 可以直接判定。修复动作是重启 dsh（会重新打印 token）。
+    const hold = sessionHoldState()
+    if (!hold.cookie) {
+      appendLog(`[fnos-dsh-manager] reusing dsh pid ${existing} but no dsh-auth credential is held `
+        + `(token=${hold.token}) — proxy will be unauthenticated; restart dsh to re-capture the launch token\n`)
+    }
     return { ok: true, pid: existing, already: true }
   }
 
@@ -803,6 +813,10 @@ export async function startDsh() {
     child.stderr.on('data', (chunk) => {
       try { writeSync(fd, chunk) } catch { /* log fd closed is fine */ }
       rememberStartupStderr(chunk)
+      // Launch Token 也可能打在 stderr 上：不少 CLI 把服务横幅/诊断信息走 stderr，
+      // 只盯 stdout 就会永远抓不到 token → 换不到 Cookie → 反代 401、WS 60 秒超时。
+      // 多跑一次正则的代价远小于凭据缺失。
+      CaptureLaunchToken(chunk)
     })
     child.on('error', (error) => {
       try { closeSync(fd) } catch { /* already closed */ }

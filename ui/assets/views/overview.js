@@ -60,6 +60,10 @@ export async function render(host, ctx) {
     ? (healthy ? PHASE_BADGE.running : PHASE_BADGE.starting)
     : PHASE_BADGE.stopped)
 
+  // 会话代持：面板必须持有 dsh 的登录凭据才能反代。缺失时（典型是 fnOS 升级
+  // 重启面板、dsh 却还活着）接口会 401、前端 WS 60 秒超时——这里直接告警。
+  const sessionOk = Boolean(status.session?.cookie || status.session?.token)
+
   // dsh 进程树资源（CPU/内存）初始占位，由 renderDshUsage 填充。
   const cpuMetric = '<div class="metric-value" id="m-cpu">—</div>'
   const memMetric = '<div class="metric-value" id="m-mem">—</div>'
@@ -160,6 +164,13 @@ export async function render(host, ctx) {
         ${status.recentVisit ? `
           <div class="row"><span class="k">来源 IP</span><span class="v"><code>${esc(status.recentVisit.ip || '-')}</code></span></div>
         ` : '<p class="empty">暂无访问记录</p>'}
+      </div>
+      <div class="card">
+        <div class="card-head"><h3><span class="card-icon">🔑</span>会话代持</h3>
+          <span class="badge ${sessionOk ? 'badge-ok' : 'badge-warn'}">${sessionOk ? '已就绪' : '缺凭据'}</span></div>
+        <div class="row"><span class="k">Launch Token</span><span class="v">${status.session?.token ? '已捕获' : '未捕获'}</span></div>
+        <div class="row"><span class="k">dsh-auth Cookie</span><span class="v">${status.session?.cookie ? '已持有' : '缺失'}</span></div>
+        ${sessionOk ? '' : '<p class="empty">面板手里没有 dsh 登录凭据，反代会 401、前端 WebSocket 将在 60 秒后超时。请重启 dsh 重新捕获（重启后新进程会重新打印 Launch Token）。</p>'}
       </div>
     </div>
   `

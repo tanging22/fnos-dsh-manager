@@ -54,7 +54,7 @@ import {
   setPluginEnabled,
   MARKET_PACKAGE,
 } from './dashboard-plugins.js'
-import { GetDshSessionCookie, appendDshSessionCookie } from './dashboard-session.js'
+import { GetDshSessionCookie, appendDshSessionCookie, sessionHoldState } from './dashboard-session.js'
 
 const UI_DIR = process.env.CONSOLE_UI
   ? join(process.env.CONSOLE_UI)
@@ -450,6 +450,9 @@ const routes = {
       version: currentVersion(),
       time: nowIso(),
       recentVisit: lastVisitor(),
+      // 会话代持状态：cookie=false 而 dsh 在跑 = 反代没有凭据，前端 WS 会在
+      // 60 秒后超时。暴露出来让首页能直接告警，不用翻日志。
+      session: sessionHoldState(),
     })
   },
 
