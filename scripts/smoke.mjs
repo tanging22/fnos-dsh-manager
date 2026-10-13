@@ -871,7 +871,11 @@ async function pythonBin() {
         const sse = await rawStreamUnix({
           socketPath: gatewaySock,
           host: 'gw.local',
-          path: '/app/gw/sse',
+          // /app/gw (gateway prefix) + /p (the panel's dsh-proxy prefix). The
+          // gateway points at the panel, so anything the stub serves must go
+          // through the panel's /p/ proxy — a bare /app/gw/sse reaches the
+          // panel's own router and comes back 404 {"error":"not-found"}.
+          path: '/app/gw/p/sse',
           waitMs: 1500,
         })
         check('a never-ending upstream still gets response headers out',
@@ -888,7 +892,7 @@ async function pythonBin() {
         const slow = await rawStreamUnix({
           socketPath: gatewaySock,
           host: 'gw.local',
-          path: '/app/gw/slow',
+          path: '/app/gw/p/slow',
           waitMs: 6000,
         })
         check('a slow upstream response is delivered, not turned into a gateway error',
