@@ -73,6 +73,10 @@
     窄屏展开态的遮罩。侧栏本体在窄屏是常驻图标条（46px，见 app.css），
     始终可见、随时可点；只有展开露出文字时才出现这块遮罩，点它或按 Esc 收回。
     桌面端永远 display:none。
+
+    两个状态类互斥：展开态 = 有 .drawer-open 且**没有** .collapsed。
+    这个互斥由 app.js 的 setDrawerOpen 保证 —— 不要在 CSS 里靠源顺序决胜，
+    上一版就是因为两条同 specificity 的 width 规则抢宽度，展开被吃掉了。
   -->
   <div id="sider-scrim" class="sider-scrim" hidden></div>
 

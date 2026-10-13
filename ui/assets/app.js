@@ -48,7 +48,17 @@ const siderScrim = document.getElementById('sider-scrim')
    桌面端的「折叠」与窄屏的「图标条」是同一套几何（46px），但语义不同：
    桌面折叠由用户在 localStorage 里存偏好，窄屏是强制的 —— 竖屏上
    184px 宽的侧栏会把内容挤成一列碎块，所以不读那个偏好。
-   展开（drawer-open）只是把同一条侧栏拉宽露出文字，选完自动收回。 */
+
+   两个状态类**互斥**，这是整套逻辑的支点：
+     图标条态 = 有 .collapsed —— 直接复用桌面那套规则，窄屏 CSS 一条都不重写；
+     展开态   = 有 .drawer-open 且**没有** .collapsed。
+   若两者共存，CSS 里 .sider.collapsed{width} 与 .sider.drawer-open{width}
+   同为 (0,2,0)，胜负只取决于源顺序，后写者赢 —— v1.0.47 把 collapsed 写在了
+   drawer-open 之后，于是展开后侧栏仍只有 46px 宽，文字却被放出来挤成一团。
+
+   互斥的连带好处：箭头方向也不用单独覆盖。图标条态命中桌面那条
+   .sider.collapsed … rotate(180deg)（指向右，点它展开），展开态没有
+   .collapsed 就走默认 0deg（指向左，点它收起），两边天然正确。 */
 const narrowQuery = window.matchMedia('(max-width: 860px)')
 const isNarrow = () => narrowQuery.matches
 
@@ -57,28 +67,30 @@ function applySiderCollapsed(collapsed) {
   if (siderToggle) siderToggle.setAttribute('aria-expanded', String(!collapsed))
 }
 
+/* 窄屏下这里同时负责摆 .collapsed —— 两态互斥的唯一入口。
+   桌面调用时只清展开态残留，不动用户存下来的折叠偏好。 */
 function setDrawerOpen(open) {
   if (!sider) return
   sider.classList.toggle('drawer-open', open)
+  if (isNarrow()) applySiderCollapsed(!open)
   if (siderScrim) siderScrim.hidden = !open
   document.body.classList.toggle('drawer-active', open)
 }
 
 function closeDrawer() {
-  if (isNarrow()) setDrawerOpen(false)
+  // 桌面没有展开态，这句是空操作；窄屏会顺带摆回图标条。
+  setDrawerOpen(false)
 }
 
-/* 按当前视口把侧栏摆到正确形态。窄屏：始终图标条。
-   桌面：读 localStorage 的偏好。 */
+/* 按当前视口把侧栏摆到正确形态。
+   窄屏：收回展开态即回到图标条（setDrawerOpen(false) 内部已摆好）。
+   桌面：清残留后读 localStorage 的偏好。 */
 function syncSiderMode() {
-  if (isNarrow()) {
-    applySiderCollapsed(true)
-  } else {
-    let saved = false
-    try { saved = localStorage.getItem('dsh-sider-collapsed') === '1' } catch {}
-    applySiderCollapsed(saved)
-    setDrawerOpen(false)
-  }
+  setDrawerOpen(false)
+  if (isNarrow()) return
+  let saved = false
+  try { saved = localStorage.getItem('dsh-sider-collapsed') === '1' } catch {}
+  applySiderCollapsed(saved)
 }
 
 if (siderToggle) {
@@ -100,14 +112,11 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeDrawer()
 })
 
-// 视口跨越 860px 时重新摆形态：窄->宽要收回图标条并恢复桌面偏好，
-// 宽->窄要强制图标条（否则侧栏会以桌面宽度占住竖屏）。
+// 视口跨越 860px 时重新摆形态：宽->窄强制图标条（否则 184px 宽的侧栏会占掉
+// 大半个竖屏），窄->宽收回展开态并恢复桌面偏好。
+// 遮罩与 body.drawer-active 的清理已由 setDrawerOpen 统一负责，这里不再重复。
 narrowQuery.addEventListener('change', () => {
   syncSiderMode()
-  if (!isNarrow()) {
-    document.body.classList.remove('drawer-active')
-    if (siderScrim) siderScrim.hidden = true
-  }
 })
 
 // 窄屏选中菜单后自动收回图标条，否则展开态会一直盖着内容

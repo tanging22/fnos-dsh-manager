@@ -961,11 +961,22 @@ table.data tbody tr:hover { background: var(--panel-2); }
   .view { padding: 16px 18px calc(20px + env(safe-area-inset-bottom, 0px)); }
 }
 
-/* 窄屏（手机竖屏为主）：侧栏**常驻**，是一条图标条。
-   关键点：不滑出屏外。之前做成 position:fixed + translateX(-100%) 的抽屉，
-   等于把侧栏删了 —— 用户要靠它在页面间切换，看不见就等于没有导航。
-   现在它始终在场，菜单项只剩图标但每个都可点击切换页面；
-   需要看文字时点侧栏上的箭头，展开成覆盖层，选完自动收回图标条。 */
+/* 窄屏（手机竖屏为主）：侧栏**常驻**，收成一条图标条。
+   不滑出屏外 —— 之前做成 position:fixed + translateX(-100%) 的抽屉，
+   等于把侧栏删了，用户要靠它在页面间切换，看不见就等于没有导航。
+
+   这里沿用 v1.0.41 的**单一状态模型**：图标条态就是桌面的 .collapsed，
+   窄屏不重写它的任何规则（宽度、隐藏文字、箭头朝向都已由桌面那份定义好）。
+   JS 保证 .collapsed 与 .drawer-open 永不共存（见 app.js setDrawerOpen），
+   于是窄屏段里不存在两条同 specificity 的 width 规则按源顺序打架 ——
+   v1.0.47 正是那样把展开弄坏的：.sider.collapsed{width:46px} 写在
+   .sider.drawer-open{width:min(260px,78vw)} 之后（同为 0,2,0），展开后侧栏
+   仍只有 46px 宽，文字却被 .sider.drawer-open .mi-label{display:revert}
+   放了出来，全挤在 46px 里裁成一团。
+
+   同理不写 .sider-toggle 的定位与尺寸：v1.0.47 把它从 v1.0.41 的
+   top:14px/right:-13px/26px 改成 top:12px/right:10px/32px 塞进侧栏内部，
+   46px 宽下按钮占 10~42px，同时压住品牌图（7~39px）与菜单图标（10~36px）。 */
 @media (max-width: 860px) {
   .sider {
     position: fixed;
@@ -973,51 +984,38 @@ table.data tbody tr:hover { background: var(--panel-2); }
     left: 0;
     bottom: 0;
     z-index: 40;
-    /* 图标条宽度：图标框 26 + 菜单内边距 2*5 + 侧栏内边距 2*4 = 46，
-       与桌面 .collapsed 的下限取齐，同一个数值两处好对照。 */
-    width: 46px;
-    transform: none;
+    /* 图标条宽度用变量，与桌面 .collapsed 同一个数值源 */
+    width: var(--sider-w-collapsed);
     transition: width .2s ease;
-    overflow-y: auto;
-    overscroll-behavior: contain;
   }
-  /* 展开态：同一条侧栏拉宽成覆盖层，不另起一层 */
+  /* 展开态：同一条侧栏拉宽成覆盖层，不另起一层。
+     此时侧栏上没有 .collapsed，桌面展开态的基础样式（品牌卡左对齐、
+     菜单 flex-start + gap 10px、sider-top/sider-bottom padding 10px）
+     自动就是对的，窄屏只补宽度与阴影，外加解除 .collapsed 藏起来的那两处文字。 */
   .sider.drawer-open {
     width: min(260px, 78vw);
     box-shadow: 0 0 24px rgba(0, 0, 0, .35);
   }
-  /* 图标条态 = 桌面 collapsed 的同一套规则。这里强制生效，
-     忽略桌面存进 localStorage 的状态：桌面存"未折叠"带到手机上会占掉
-     184px 宽度，竖屏只剩 190px 给内容，卡片会挤成一列碎块。 */
-  .sider.collapsed { width: 46px; }
-  .sider.collapsed .mi-label,
-  .sider.collapsed .brand-text { display: none; }
-  .sider.collapsed .menu-item { justify-content: center; gap: 0; padding: 5px; }
-  .sider.collapsed .brand-card { justify-content: center; padding: 10px 0; }
-  .sider.collapsed .sider-top,
-  .sider.collapsed .sider-bottom { padding: 12px 4px; }
-  /* 展开时把上面藏起来的文字放回来 */
   .sider.drawer-open .mi-label,
   .sider.drawer-open .brand-text { display: revert; }
-  .sider.drawer-open .menu-item { justify-content: flex-start; gap: 10px; padding: 6px 10px; }
-  .sider.drawer-open .brand-card { justify-content: flex-start; padding: 9px 10px; }
-  .sider.drawer-open .sider-top,
-  .sider.drawer-open .sider-bottom { padding: 10px; }
 
-  /* 展开态的箭头指向左侧（收起方向） */
-  .sider-toggle { top: 12px; right: 10px; }
-  .sider-toggle .toggle-chevron { transform: rotate(0deg); }
-  .sider.drawer-open .sider-toggle .toggle-chevron { transform: rotate(180deg); }
+  /* 图标条态：顶部让出 44px 给箭头。
+     箭头是 v1.0.41 的 top:14px / 26px，在 46px 侧栏里占 7~33px，
+     而品牌卡从 padding-top 处就贴上来，两者必然重叠（v1.0.41 桌面折叠态
+     同样如此）。把品牌卡整体下移，箭头、logo、导航各占各的，互不遮挡。
+     展开态没有 .collapsed，这条不生效，品牌卡照旧贴顶。 */
+  .sider.collapsed .sider-top { padding-top: 44px; }
 
   /* 展开时锁住背景滚动，否则手指在侧栏外滑动会连带滚页面 */
   body.drawer-active { overflow: hidden; }
 
-  /* 侧栏脱离布局后，主区要自己让出这 46px */
-  .main { padding-left: 46px; }
+  /* 侧栏 fixed 脱离布局后，主区要自己让出图标条的宽度 */
+  .main { padding-left: var(--sider-w-collapsed); }
 
-  /* 触控目标不小于 40px（Apple HIG 建议 44，这里取折中） */
+  /* 触控目标不小于 40px（Apple HIG 建议 44，这里取折中）。
+     箭头保持桌面那套 26px：它的几何（right:-13px 靠右缘内侧）在 46px 侧栏里
+     没有余量放大，硬放大就会重新压到菜单图标上。 */
   .menu-item { padding: 10px; min-height: 40px; }
-  .sider-toggle { width: 32px; height: 32px; }
   .btn, .pill { min-height: 34px; }
 
   .topbar { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
