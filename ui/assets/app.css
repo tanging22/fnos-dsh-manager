@@ -248,6 +248,11 @@ html, body {
 .topbar-right { display: flex; align-items: center; gap: 8px; }
 
 .muted { color: var(--muted); }
+/* 卡片内的说明文字与下方内容之间要留气口。
+   .card h3 自带 margin:0 0 12px，但 .muted / .scroll 这些块原本是 0，
+   于是浏览目录弹层里"路径说明"和表格紧贴。 */
+.card > .muted { margin: 0 0 10px; }
+.card > .scroll { margin-top: 10px; }
 
 /* ---------- status pill ---------- */
 
@@ -892,16 +897,24 @@ table.data tbody tr:hover { background: var(--panel-2); }
   100% { background-position: 0 50%; }
 }
 
-/* 工作区卡片网格：minmax 与 .overview-grid 同为 300px，两页列宽保持一致。 */
+/* 工作区卡片网格。
+   与 .overview-grid 的区别是刻意为之：工作区卡片内容更重（5 行 key-value
+   + 一行按钮），minmax 300px 下路径 code 会被 ellipsis 切得很短，卡片也挤。
+   340px + 16px 间距让每张卡有足够宽度展开内容，宽屏自动 3 列、窄了退 2 列。 */
 .ws-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 16px;
 }
 .ws-card code {
   font-size: 12px;
   word-break: break-all;
 }
+/* 工作区页的块级间距。
+   视图内相邻元素原本没有任何统一间距规则，只有 .section-title 自带 margin，
+   于是顶部说明卡与下面的卡片网格紧贴（0 间距）。这里显式补上。
+   用 :where() 把自身 specificity 压成 0，整条只有 .view.workspace-view 那一级，
+   所以不会盖掉 .section-title 自己的 16px/10px。 */
+.view.workspace-view > :where(* + *) { margin-top: 14px; }
 .browse-link {
   color: var(--accent);
   cursor: pointer;
@@ -948,9 +961,11 @@ table.data tbody tr:hover { background: var(--panel-2); }
   .view { padding: 16px 18px calc(20px + env(safe-area-inset-bottom, 0px)); }
 }
 
-/* 窄屏：侧栏变覆盖式抽屉，不再占据布局宽度。
-   移动端不套用 .collapsed —— 那个 class 是桌面端的"图标窄条"，
-   两者叠加会把菜单文字藏掉、只剩一列图标，比抽屉本身更难用。 */
+/* 窄屏（手机竖屏为主）：侧栏**常驻**，是一条图标条。
+   关键点：不滑出屏外。之前做成 position:fixed + translateX(-100%) 的抽屉，
+   等于把侧栏删了 —— 用户要靠它在页面间切换，看不见就等于没有导航。
+   现在它始终在场，菜单项只剩图标但每个都可点击切换页面；
+   需要看文字时点侧栏上的箭头，展开成覆盖层，选完自动收回图标条。 */
 @media (max-width: 860px) {
   .sider {
     position: fixed;
@@ -958,30 +973,47 @@ table.data tbody tr:hover { background: var(--panel-2); }
     left: 0;
     bottom: 0;
     z-index: 40;
-    width: min(280px, 82vw);
-    transform: translateX(-100%);
-    transition: transform .22s ease;
-    box-shadow: 0 0 24px rgba(0, 0, 0, .35);
+    /* 图标条宽度：图标框 26 + 菜单内边距 2*5 + 侧栏内边距 2*4 = 46，
+       与桌面 .collapsed 的下限取齐，同一个数值两处好对照。 */
+    width: 46px;
+    transform: none;
+    transition: width .2s ease;
     overflow-y: auto;
     overscroll-behavior: contain;
   }
-  .sider.drawer-open { transform: translateX(0); }
-  /* 抽屉态下强制展开，忽略桌面端写进 localStorage 的 collapsed */
-  .sider.collapsed { width: min(280px, 82vw); }
+  /* 展开态：同一条侧栏拉宽成覆盖层，不另起一层 */
+  .sider.drawer-open {
+    width: min(260px, 78vw);
+    box-shadow: 0 0 24px rgba(0, 0, 0, .35);
+  }
+  /* 图标条态 = 桌面 collapsed 的同一套规则。这里强制生效，
+     忽略桌面存进 localStorage 的状态：桌面存"未折叠"带到手机上会占掉
+     184px 宽度，竖屏只剩 190px 给内容，卡片会挤成一列碎块。 */
+  .sider.collapsed { width: 46px; }
   .sider.collapsed .mi-label,
-  .sider.collapsed .brand-text { display: revert; }
-  .sider.collapsed .menu-item { justify-content: flex-start; gap: 10px; padding: 6px 10px; }
-  .sider.collapsed .brand-card { justify-content: flex-start; padding: 9px 10px; }
+  .sider.collapsed .brand-text { display: none; }
+  .sider.collapsed .menu-item { justify-content: center; gap: 0; padding: 5px; }
+  .sider.collapsed .brand-card { justify-content: center; padding: 10px 0; }
   .sider.collapsed .sider-top,
-  .sider.collapsed .sider-bottom { padding: 10px; }
+  .sider.collapsed .sider-bottom { padding: 12px 4px; }
+  /* 展开时把上面藏起来的文字放回来 */
+  .sider.drawer-open .mi-label,
+  .sider.drawer-open .brand-text { display: revert; }
+  .sider.drawer-open .menu-item { justify-content: flex-start; gap: 10px; padding: 6px 10px; }
+  .sider.drawer-open .brand-card { justify-content: flex-start; padding: 9px 10px; }
+  .sider.drawer-open .sider-top,
+  .sider.drawer-open .sider-bottom { padding: 10px; }
 
-  /* 抽屉里的箭头指向左侧（收起方向），不再是"折叠/展开" */
+  /* 展开态的箭头指向左侧（收起方向） */
   .sider-toggle { top: 12px; right: 10px; }
   .sider-toggle .toggle-chevron { transform: rotate(0deg); }
   .sider.drawer-open .sider-toggle .toggle-chevron { transform: rotate(180deg); }
 
-  /* 抽屉打开时锁住背景滚动，否则手指在遮罩上滑动会连带滚页面 */
+  /* 展开时锁住背景滚动，否则手指在侧栏外滑动会连带滚页面 */
   body.drawer-active { overflow: hidden; }
+
+  /* 侧栏脱离布局后，主区要自己让出这 46px */
+  .main { padding-left: 46px; }
 
   /* 触控目标不小于 40px（Apple HIG 建议 44，这里取折中） */
   .menu-item { padding: 10px; min-height: 40px; }
@@ -1002,17 +1034,23 @@ table.data tbody tr:hover { background: var(--panel-2); }
 }
 
 /* 手机竖屏：栅格 minmax 降到 2 列下限以下，让每张卡有足够宽度。
-   auto-fit 会据此自动排布，不需要按屏幕宽度写死列数。 */
+   auto-fit 会据此自动排布，不需要按屏幕宽度写死列数。
+   这里直接写 240px 而不用 min(100%,240px)：百分比在 grid-template-columns 里
+   的解析依赖 intrinsic sizing，不同浏览器结果不一致，不可依赖。 */
 @media (max-width: 560px) {
   .metric-grid,
   .skel-grid,
   .action-grid { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
   .overview-grid,
   .ws-grid,
-  .grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); }
+  .grid { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
   .metric-label, .metric .metric-label { font-size: 11px; }
   .metric .metric-value { font-size: 14px; }
   .section-title { font-size: 15px; }
+  /* 手机上卡片间距收紧：16px 在 375px 宽屏上会吃掉一屏能放的卡片数。
+     单列时上下间距 12px、块级间距 12px，与 .grid 的默认值对齐。 */
+  .ws-grid { gap: 12px; }
+  .view.workspace-view > :where(* + *) { margin-top: 12px; }
   /* 表格类内容横向滚动，而不是把整页撑宽 */
   table { display: block; overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; }
 }

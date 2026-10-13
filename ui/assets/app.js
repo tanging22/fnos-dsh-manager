@@ -44,12 +44,11 @@ const sider = document.getElementById('sider')
 const siderToggle = document.getElementById('sider-toggle')
 const siderScrim = document.getElementById('sider-scrim')
 
-/* 窄屏（≤860px）侧栏改成覆盖式抽屉：见 app.css 的媒体查询。
-   桌面端的「折叠」与移动端的「抽屉」是两件事，不能共用一个 class ——
-   桌面折叠是收窄成图标条（宽度动画），移动抽屉是整块盖在内容上。
-   这里用 matchMedia 判定当前处于哪种模式，各自独立控制，
-   并且移动端不读 localStorage 的折叠状态（那个值在桌面写下"1"，
-   带到手机上会让抽屉变成 46px 的窄条、菜单文字全被隐藏）。 */
+/* 窄屏（≤860px）侧栏是**常驻图标条**，不是滑出屏外的抽屉。
+   桌面端的「折叠」与窄屏的「图标条」是同一套几何（46px），但语义不同：
+   桌面折叠由用户在 localStorage 里存偏好，窄屏是强制的 —— 竖屏上
+   184px 宽的侧栏会把内容挤成一列碎块，所以不读那个偏好。
+   展开（drawer-open）只是把同一条侧栏拉宽露出文字，选完自动收回。 */
 const narrowQuery = window.matchMedia('(max-width: 860px)')
 const isNarrow = () => narrowQuery.matches
 
@@ -69,9 +68,21 @@ function closeDrawer() {
   if (isNarrow()) setDrawerOpen(false)
 }
 
+/* 按当前视口把侧栏摆到正确形态。窄屏：始终图标条。
+   桌面：读 localStorage 的偏好。 */
+function syncSiderMode() {
+  if (isNarrow()) {
+    applySiderCollapsed(true)
+  } else {
+    let saved = false
+    try { saved = localStorage.getItem('dsh-sider-collapsed') === '1' } catch {}
+    applySiderCollapsed(saved)
+    setDrawerOpen(false)
+  }
+}
+
 if (siderToggle) {
   siderToggle.addEventListener('click', () => {
-    // 移动端同一个按钮改成开关抽屉；桌面端才是折叠/展开。
     if (isNarrow()) {
       setDrawerOpen(!sider.classList.contains('drawer-open'))
       return
@@ -80,29 +91,26 @@ if (siderToggle) {
     applySiderCollapsed(collapsed)
     try { localStorage.setItem('dsh-sider-collapsed', collapsed ? '1' : '0') } catch {}
   })
-  // 恢复上次折叠状态。移动端不恢复：见上面的说明。
-  let saved = false
-  try { saved = localStorage.getItem('dsh-sider-collapsed') === '1' } catch {}
-  applySiderCollapsed(saved && !isNarrow())
+  syncSiderMode()
 }
 
-// 点遮罩关闭抽屉
+// 点遮罩 / 按 Esc 关闭展开态
 if (siderScrim) siderScrim.addEventListener('click', closeDrawer)
-
-// Esc 关闭抽屉
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') closeDrawer()
 })
 
-// 从窄屏切回宽屏时清掉抽屉态，否则 .drawer-open 会残留在宽屏上
-narrowQuery.addEventListener('change', (event) => {
-  if (!event.matches) {
-    setDrawerOpen(false)
+// 视口跨越 860px 时重新摆形态：窄->宽要收回图标条并恢复桌面偏好，
+// 宽->窄要强制图标条（否则侧栏会以桌面宽度占住竖屏）。
+narrowQuery.addEventListener('change', () => {
+  syncSiderMode()
+  if (!isNarrow()) {
     document.body.classList.remove('drawer-active')
+    if (siderScrim) siderScrim.hidden = true
   }
 })
 
-// 移动端选中菜单后自动收起抽屉，否则菜单被抽屉挡住、要点两次
+// 窄屏选中菜单后自动收回图标条，否则展开态会一直盖着内容
 sider?.addEventListener('click', (event) => {
   if (event.target.closest('.menu-item')) closeDrawer()
 })
@@ -181,6 +189,8 @@ async function runRenderTab() {
   const module = VIEWS[state.tab] ?? overview
   // 概览页用自适应无滚动条布局，其余页保留滚动。
   view.classList.toggle('overview-view', state.tab === 'overview')
+  // 工作区页需要块级间距规则（见 app.css 的 .view.workspace-view）
+  view.classList.toggle('workspace-view', state.tab === 'workspace')
   view.innerHTML = '<div class="empty"><span class="spin">◌</span> 加载中…</div>'
   try {
     await module.render(view, ctx)
