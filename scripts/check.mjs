@@ -14,7 +14,7 @@
 import { execFileSync } from 'node:child_process'
 import { readdirSync, readFileSync, existsSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -299,13 +299,37 @@ for (const source of shellSources) {
 
 /* Prefer an explicitly provided interpreter, then PATH, then the common
  * absolute locations. A Python-based WorkBuddy runtime is not on PATH, and
- * silently skipping the check is exactly how the proxy bug survived. */
+ * silently skipping the check is exactly how the proxy bug survived.
+ *
+ * That runtime lives at a version-pinned path under the current user's home
+ * directory, so it is discovered rather than written out literally: a literal
+ * path would leak a user name into the repository and rot on every upgrade. */
+function workbuddyPythons() {
+  const versionsDir = join(
+    homedir(),
+    '.workbuddy',
+    'binaries',
+    'python',
+    'versions',
+  )
+  const leaf = process.platform === 'win32' ? 'python.exe' : 'bin/python3'
+  try {
+    return readdirSync(versionsDir)
+      .sort()
+      .reverse()
+      .map((version) => join(versionsDir, version, leaf))
+      .filter((bin) => existsSync(bin))
+  } catch {
+    return []
+  }
+}
+
 const pythonCandidates = [
   process.env.PYTHON,
   'python3',
   'python',
   '/usr/bin/python3',
-  'C:/Users/zhushichuan/.workbuddy/binaries/python/versions/3.13.12/python.exe',
+  ...workbuddyPythons(),
 ].filter(Boolean)
 const pythonBin = pythonCandidates.find((bin) => {
   try {
