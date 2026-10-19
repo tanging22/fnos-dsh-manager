@@ -810,10 +810,47 @@ async function tailFile(path, maxBytes) {
  * here would silently break LAN binding. See webserverHost().
  */
 
-/** Injected into every HTML `<head>`: hide the desktop "open config" button and
- *  declare the native-host privilege branch (REVERSE_PROXY_ADAPTATION #4/#5). */
+/** 插件接口的绝对路径前缀修正，注入到 dsh 页面的 `<head>` 里（早于任何页面脚本）。
+ *
+ *  dsh 插件的前端普遍把接口地址写死成**绝对路径**（dsh-im-connect 就是
+ *  `const API_BASE = '/api/dsh-im-connect'`）。面板把 dsh 挂在 console 代理的
+ *  `/p` 前缀下（fnOS 的应用网关外面还套着一层 `/app/<app>`），绝对路径不带
+ *  前缀，请求便绕过 `/p/` 直接落进面板自己的 `/api/` 分支；面板路由表里当然
+ *  没有插件的接口 → 404。症状是「本机直连 3080 一切正常，经面板域名访问插件
+ *  全挂」，而且插件是第三方包，改它一次升级就被覆盖。
+ *
+ *  为什么不在面板的 `/api/` 分支里兜底：未注册的 `/api/*` 必须保持 404，
+ *  否则那些已被删掉的管理接口会顺着兜底"复活"（smoke 里 "… is gone" 那一组
+ *  断言锁的就是这件事，第一版兜底实现正是被它拦下来的）。所以在浏览器侧修，
+ *  只给「以 `/` 开头、且没带当前前缀」的 URL 补前缀，其余一律原样放行：dsh
+ *  自身的调用（它本来就走带前缀的路径）、任何相对路径、跨站绝对 URL 都不碰。
+ *
+ *  前缀从 `location.pathname` 现推（正则取到第一个 `/p` 段为止）：`/app/<app>`
+ *  这一段是 fnOS 网关在面板之外加上去的，只有浏览器知道，服务端注入时看不到。
+ *  挂在 `window.__DSH_PROXY_PREFIX__` 上纯为诊断方便（面板日志/控制台能直接看到
+ *  当前推出来的前缀）。
+ */
+const DSH_PREFIX_SHIM = '<script>(function(){try{' +
+  'var m=location.pathname.match(/^(.*?\\/p)(?=\\/|$)/);if(!m)return;' +
+  'var p=m[1];window.__DSH_PROXY_PREFIX__=p;' +
+  'var fix=function(u){if(typeof u!=="string"||u.charAt(0)!=="/"||u.charAt(1)==="/")return u;' +
+  'return u===p||u.indexOf(p+"/")===0?u:p+u};' +
+  'var f=window.fetch;if(f)window.fetch=function(i,init){try{if(typeof i==="string")i=fix(i)}catch(_){}return f.call(this,i,init)};' +
+  'var o=window.XMLHttpRequest&&XMLHttpRequest.prototype.open;' +
+  'if(o)XMLHttpRequest.prototype.open=function(method,url){try{if(typeof url==="string")arguments[1]=fix(url)}catch(_){}return o.apply(this,arguments)};' +
+  'var W=window.WebSocket;if(W){var W2=function(url,protocols){var u=fix(typeof url==="string"?url:String(url));' +
+  'return protocols===undefined?new W(u):new W(u,protocols)};W2.prototype=W.prototype;window.WebSocket=W2}' +
+  'var E=window.EventSource;if(E){var E2=function(url,config){return config===undefined?new E(fix(url)):new E(fix(url),config)};' +
+  'E2.prototype=E.prototype;window.EventSource=E2}' +
+  'var b=navigator.sendBeacon;if(b)navigator.sendBeacon=function(url,data){try{url=fix(url)}catch(_){}return b.call(navigator,url,data)};' +
+  '}catch(_){}})();</script>'
+
+/** Injected into every HTML `<head>`: hide the desktop "open config" button,
+ *  declare the native-host privilege branch (REVERSE_PROXY_ADAPTATION #4/#5), and
+ *  put back the `/p` prefix that plugins hardcoding absolute API paths drop. */
 const DSH_HTML_SHIM = '<style>[data-slot="settings.action"] { display: none !important; }</style>' +
-  '<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__DSH_TRANSPORT__||{},{ownsHost:true});}catch(_){}</script>'
+  '<script>try{window.__DSH_TRANSPORT__=Object.assign(window.__DSH_TRANSPORT__||{},{ownsHost:true});}catch(_){}</script>' +
+  DSH_PREFIX_SHIM
 
 /** Insert `shim` right after `<head...>` (or prepend when there is no head). */
 function injectDshHtml(body, shim) {

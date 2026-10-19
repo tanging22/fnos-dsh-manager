@@ -20,6 +20,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { createServer } from 'node:http'
 import { createHash } from 'node:crypto'
 import { connect } from 'node:net'
+import { runInNewContext } from 'node:vm'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -559,6 +560,7 @@ try {
   check('proxy upstream actually served it', (await proxied.text()).includes('stub:/hello'), 'stub did not see the request')
   check('proxy reached the stub exactly once', stubHits === 1, `stubHits=${stubHits}`)
 
+
   /* --- the panel proxy STREAMS SSE (the gateway hop used to buffer it) ----
    *
    * The production symptom is dsh's client throwing
@@ -658,6 +660,50 @@ try {
     'manifest link was not given crossorigin')
   check('proxy injects the transport privilege shim',
     injectedHtml.includes('__DSH_TRANSPORT__') && injectedHtml.includes('ownsHost'), 'shim missing')
+
+  /* --- the shim restores the /p prefix that plugins drop ------------------
+   *
+   * Plugins hardcode absolute API paths (`const API_BASE = '/api/dsh-im-connect'`
+   * in dsh-im-connect, for one). Under the console proxy those requests carry no
+   * /p/ prefix, so they land on the panel's own /api/ branch and 404 there — the
+   * "fine on 3080, dead behind the panel domain" symptom.
+   *
+   * The fix cannot live in that branch: falling back to the upstream for any
+   * unregistered /api/* resurrects every retired management endpoint, which is
+   * exactly what the "… is gone" assertions above pin down (a first cut of this
+   * fix did that and this suite went 144/151). So the injected shim wraps the
+   * browser's network entry points instead, and the script is run for real below
+   * against a fake window — these assertions are behaviour, not a string match.
+   */
+  const shimSource = (injectedHtml.match(/<script>\(function\(\)\{try\{[\s\S]*?<\/script>/) ?? [''])[0]
+  check('the prefix shim ships in the injected HTML',
+    shimSource.includes('XMLHttpRequest.prototype.open'), 'prefix shim not found')
+
+  const fakeWindow = {}
+  const seen = []
+  const opened = []
+  fakeWindow.location = { pathname: '/app/fnos-dsh-manager/p/chat' }
+  fakeWindow.window = fakeWindow
+  fakeWindow.console = console
+  fakeWindow.navigator = {}
+  fakeWindow.XMLHttpRequest = function FakeXhr() {}
+  fakeWindow.XMLHttpRequest.prototype.open = function (method, url) { opened.push(url) }
+  fakeWindow.fetch = (url) => { seen.push(url); return Promise.resolve(url) }
+  runInNewContext(shimSource.replace(/^<script>/, '').replace(/<\/script>$/, ''), fakeWindow)
+  check('the shim derives the proxy prefix from location',
+    fakeWindow.__DSH_PROXY_PREFIX__ === '/app/fnos-dsh-manager/p',
+    `got ${fakeWindow.__DSH_PROXY_PREFIX__}`)
+  await fakeWindow.fetch('/api/dsh-im-connect/channels')
+  check('the shim prefixes a bare absolute API path',
+    seen[0] === '/app/fnos-dsh-manager/p/api/dsh-im-connect/channels', `got ${seen[0]}`)
+  await fakeWindow.fetch('/app/fnos-dsh-manager/p/api/status')
+  check('the shim leaves an already-prefixed path alone',
+    seen[1] === '/app/fnos-dsh-manager/p/api/status', `got ${seen[1]}`)
+  await fakeWindow.fetch('api/relative')
+  check('the shim leaves a relative path alone', seen[2] === 'api/relative', `got ${seen[2]}`)
+  new fakeWindow.XMLHttpRequest().open('GET', '/api/xhr-probe')
+  check('the shim wraps XMLHttpRequest too',
+    opened[0] === '/app/fnos-dsh-manager/p/api/xhr-probe', `got ${opened[0]}`)
   check('proxy preserves the upstream HTML intact',
     injectedHtml.includes('你好 dsh') && injectedHtml.includes('settings.action'),
     'upstream body was corrupted (UTF-8 or byte offsets)')
