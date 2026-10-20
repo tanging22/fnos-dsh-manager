@@ -320,10 +320,66 @@ export function setPluginEnabled(id, name, enabled) {
 // Bundle install / remove
 // ---------------------------------------------------------------------------
 
-function npmArgs(subcommand, args = []) {
-  // Same as versions: `http` level streams "fetching package X" lines for the
-  // live progress log instead of staying silent until the install completes.
-  return [subcommand, '--registry', registry(), '--no-audit', '--no-fund', '--loglevel', 'http', '--foreground-scripts', '--progress', 'false', ...args]
+/**
+ * 把 profile 依赖里的 `link:` 改写成 `file:`（原地写入磁盘）。
+ *
+ * 背景 —— 这正是「插件管理里安装 / 更新 / 卸载全报错」的根因：
+ *
+ * dsh 自己的 profile 是拿 **pnpm** 装的，本地 bundle 会被 pnpm 写成
+ * `"link:/abs/path"`。而本面板用的是 **npm**（版本安装那条链路早已验证 npm
+ * 在这台机器上可用），**npm 不认 `link:` 协议**：
+ *
+ *   npm error code EUNSUPPORTEDPROTOCOL
+ *   npm error Unsupported URL Type "link:": link:/vol1/@appdata/...
+ *
+ * 关键在于：只要 profile 里存在**任何一条** `link:` 依赖，之后所有的
+ * `npm install` / `npm remove` / `npm update` 都会在**依赖解析阶段**整体失
+ * 败——跟你要操作的那个包毫无关系。症状就是"装什么、更什么、卸什么都报
+ * 错"，而包其实是好的、日志里也看不到任何 npm ERR（因为 stderr 只在
+ * removeBundle 的 detail 里回传，前端往往只显示一句"失败"）。
+ *
+ * 为什么 `file:` 是等价且安全的替换：对**目录**依赖，npm 与 pnpm 都把
+ * `file:` 实现为 symlink（实测 `node_modules/x -> ../../../path`，与
+ * `link:` 产出一模一样），**不会**把本地包复制成一份快照。本地 bundle 那种
+ * "改源目录立刻生效"的语义因此完整保留。
+ *
+ * 幂等：已经是 `file:` 或普通 semver 的条目不动；没有变更则不写盘，避免
+ * 无谓地刷新 mtime 触发别的监听。
+ *
+ * 导出只为 smoke 门禁能直接断言（见下），不是公共 API。
+ */
+export function normalizeLocalDependencies(pkg) {
+  const deps = pkg?.dependencies
+  if (!deps || typeof deps !== 'object') return false
+  let changed = false
+  for (const [name, spec] of Object.entries(deps)) {
+    if (typeof spec === 'string' && spec.startsWith('link:')) {
+      deps[name] = `file:${spec.slice(5)}`
+      changed = true
+    }
+  }
+  if (changed) writeProfilePackage(pkg)
+  return changed
+}
+
+/**
+ * npm 命令行基参数。
+ *
+ * `--legacy-peer-deps` 不是图省事：dsh 的第三方 bundle 里，peer 声明普遍滞
+ * 后于 dsh 本体的发版节奏（dsh-meme@0.1.53 仍要求
+ * `@deepseek-ai/dsh-llm@^0.0.1-rc.1`，而机器上已是 0.2.1-rc.2）。npm 默
+ * 认的 ERESOLVE 校验会因此**直接拒绝整条命令**，连包都放不下去。而 dsh 启
+ * 动时自己会做版本门控，并给出人能读的报错
+ * （"Plugin X is incompatible with dsh Y: requirements {...}"）——所以这里
+ * 把版本校验交给 dsh，npm 只负责把包放到位。
+ *
+ * `--loglevel http` 让 "fetching package X" 逐行流出来，长安装才有实时进度。
+ *
+ * 同样导出给 smoke 断言用：flag 放在子命令之后、包参数之前（npm 两者都接，
+ * 但放末尾会被误读成要操作的包名）。
+ */
+export function npmArgs(subcommand, args = []) {
+  return [subcommand, '--registry', registry(), '--no-audit', '--no-fund', '--loglevel', 'http', '--foreground-scripts', '--progress', 'false', '--legacy-peer-deps', ...args]
 }
 
 /** Install a bundle into the profile and select it. */
@@ -343,6 +399,9 @@ export async function installBundle(spec, { onProgress } = {}) {
   mkdirSync(dir, { recursive: true })
 
   const pkg = readProfilePackage()
+  // npm 不认 pnpm 写的 `link:`；存在任何一条都会让本次 install 在依赖解析
+  // 阶段整体失败（EUNSUPPORTEDPROTOCOL），与要装的包无关。先归一化再装。
+  normalizeLocalDependencies(pkg)
   if (bundleInstalled(inspect.name)) {
     // Reinstall = upgrade to the requested version.
     onProgress?.({ phase: 'upgrading', name: inspect.name })
@@ -393,6 +452,8 @@ export async function removeBundle(name) {
 
   return withPluginWriteLock(async () => {
     const pkg = readProfilePackage()
+    // 同 installBundle：先消掉 `link:`，否则 npm 在解析阶段就整体退出。
+    normalizeLocalDependencies(pkg)
     const bundles = readBundles(pkg).filter((entry) => entry !== pkgName)
     writeBundles(pkg, bundles)
 

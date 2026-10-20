@@ -1,5 +1,63 @@
 # Changelog
 
+## v1.0.51 - 2026-10-20
+
+### 修复
+
+**插件管理：安装 / 更新 / 卸载全部报错**
+
+现象是「装什么、更什么、卸什么都失败」，而面板日志里**干干净净，一条 npm 报错都没有**。这次是**两个互相独立的坑**叠在一起，各自都能单独把整条命令打死。
+
+#### 坑一：profile 里有 `link:` 依赖，npm 根本不认
+
+dsh 的 profile 是拿 **pnpm** 装的，本地 bundle 会被 pnpm 写成：
+
+```json
+"dsh-whale-wife-persona": "link:/vol1/@appdata/fnos-dsh-manager/dsh_home/local-bundles/dsh-whale-wife-persona"
+```
+
+面板用的却是 **npm**（版本安装那条链路早已验证 npm 在这台机器上可用），而 **npm 没有 `link:` 协议**：
+
+```
+npm error code EUNSUPPORTEDPROTOCOL
+npm error Unsupported URL Type "link:": link:/vol1/@appdata/...
+```
+
+关键在「**任何一条**」三个字：只要 profile 里存在一条 `link:`，之后所有的 `npm install` / `npm remove` / `npm update` 都在**依赖解析阶段**整体退出——**跟你要操作的那个包毫无关系**。所以 dsh-meme 明明是好的，卸载它照样失败；装新插件也一样失败。
+
+为什么日志里查不到：npm 的 stderr 只在 `removeBundle()` 的 `detail` 字段里回传，前端往往只显示一句「失败」，服务端不落盘。
+
+修法：进入写锁、读完 `package.json` 之后先归一化，把 `link:` 改写成 `file:`。这不是随意替换——对**目录**依赖，npm 下 `file:` 产出的就是 symlink（`node_modules/x -> ../../../path`），与 `link:` 一模一样，**不会**把本地包复制成快照，所以「改本地源目录立刻生效」的语义完整保留。
+
+#### 坑二：peer 声明滞后，npm 直接 ERESOLVE
+
+绕开坑一之后，卸载 dsh-meme 仍然失败：
+
+```
+Fix the upstream dependency conflict, or retry
+this command with --force or --legacy-peer-deps
+```
+
+eresolve 报告：`Found: @deepseek-ai/dsh-llm@0.2.1-rc.2`，`Conflicting peer dependency: @deepseek-ai/dsh-llm@0.0.1-rc.5`（经 `@deepseek-ai/dsh-tools@0.0.1-rc.1` ← `dsh-meme@0.1.53` 引入）。第三方 bundle 的 peer 声明普遍滞后于 dsh 本体的发版节奏。
+
+修法：npm 参数加 `--legacy-peer-deps`（排在被操作包名之前，否则 npm 会把它当成第二个要操作的包）。版本门控交给 **dsh 自己**——它启动时给的报错是人类可读的 `Plugin X is incompatible with dsh Y: requirements {...}`，比 npm 的 ERESOLVE 树有用得多。npm 只负责把包放到位。
+
+#### 验证
+
+隔离环境（独立 npm cache + 独立 home）7 组对照：
+
+| 用例 | 条件 | 操作 | 结果 |
+| --- | --- | --- | --- |
+| A | 无 `link:` | remove | EXIT=0 |
+| B | 有 `link:` | remove | EXIT=1 `EUNSUPPORTEDPROTOCOL` |
+| C | `link:` → `file:` | remove | EXIT=0 |
+| D | `file:` | 连续 remove 两个 | 两次 EXIT=0，本地包保留 |
+| E | 有 `link:` | install | EXIT=1（连 install 也拦） |
+| I | 有 `link:` + `--legacy-peer-deps` | remove | EXIT=1（legacy 救不了坑一，两坑独立） |
+| J | `file:` + `--legacy-peer-deps` | remove | EXIT=0，本地包保留 |
+
+门禁：check 29/15/0；smoke **161 → 167**，新增 6 条断言直接 import 真实模块调 `normalizeLocalDependencies()` 与 `npmArgs()`（含幂等性、干净包不写盘、flag 位置在 spec 之前）。反向验证：拆掉两处修复恰好红 3 条，还原回 167/167。
+
 ## v1.0.50 - 2026-10-20
 
 ### 修复

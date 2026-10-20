@@ -1463,6 +1463,51 @@ async function pythonBin() {
         return plugins.removeBundle('../../../../../../etc').then((r) => {
           out.removeRejected = r.ok === false && r.error === 'invalid-package-name'
 
+          /* ---- 插件安装/卸载的两个前置坑（v1.0.51）----
+           *
+           * (1) profile 里存在 pnpm 写的 link: 依赖时，npm 在依赖解析阶段就整体
+           *     退出（EUNSUPPORTEDPROTOCOL），与要操作的包无关 —— 表现为"装啥、
+           *     更啥、卸啥都报错"。修法是 install/remove 前先归一化成 file:（对
+           *     目录依赖，npm 下 file: 产出的就是 symlink，与 link: 等价，不会变
+           *     成快照，本地 bundle 改源目录仍立刻生效）。
+           * (2) 第三方 bundle 的 peer 声明滞后于 dsh 本体（dsh-meme@0.1.53 仍要
+           *     dsh-llm@^0.0.1-rc.1，机器上已是 0.2.1-rc.2），npm 默认严格校验
+           *     直接 ERESOLVE。版本门控交给 dsh 自己（它给人类可读的报错），npm
+           *     只负责把包放到位 —— 所以加 --legacy-peer-deps。
+           */
+          const WHALE = 'file:/vol1/@appdata/fnos-dsh-manager/dsh_home/local-bundles/dsh-whale-wife-persona'
+          const probePkg = {
+            name: 'dsh-profile-web',
+            private: true,
+            dependencies: {
+              'dsh-meme': '^0.1.53',
+              'dsh-whale-wife-persona': 'link:/vol1/@appdata/fnos-dsh-manager/dsh_home/local-bundles/dsh-whale-wife-persona',
+              'dsh-workbuddy-weblogin': 'link:/tmp/dsh-workbuddy-weblogin',
+            },
+            dsh: { profile: { bundles: [] } },
+          }
+          const firstPass = plugins.normalizeLocalDependencies(probePkg)
+          out.linkRewritten =
+            firstPass === true &&
+            probePkg.dependencies['dsh-whale-wife-persona'] === WHALE &&
+            probePkg.dependencies['dsh-workbuddy-weblogin'] === 'file:/tmp/dsh-workbuddy-weblogin' &&
+            probePkg.dependencies['dsh-meme'] === '^0.1.53'
+          // 幂等：再跑一次不该报告变更，结果也不该再变。
+          const secondPass = plugins.normalizeLocalDependencies(probePkg)
+          out.linkNormalizeIdempotent =
+            secondPass === false && probePkg.dependencies['dsh-whale-wife-persona'] === WHALE
+          // 干净的包不应触发无谓写盘。
+          out.cleanPackageUntouched =
+            plugins.normalizeLocalDependencies({ dependencies: { 'dsh-meme': '^0.1.53' } }) === false
+
+          const removeArgs = plugins.npmArgs('remove', ['--prefix', '/tmp/x', 'dsh-meme'])
+          out.legacyPeerDepsPresent = removeArgs.includes('--legacy-peer-deps')
+          // flag 必须排在包名之前，否则 npm 会把它当成第二个要操作的包。
+          out.legacyPeerDepsBeforeSpec =
+            removeArgs.indexOf('--legacy-peer-deps') < removeArgs.indexOf('dsh-meme')
+          out.npmArgsShapeIntact =
+            removeArgs[0] === 'remove' && removeArgs[removeArgs.length - 1] === 'dsh-meme'
+
           // 行缓冲上限：截断必须发生在"拆完行"之后。先喂一条含 token 的完整行，
           // 再喂一段 128KB 不含换行的垃圾 —— token 必须仍然被捕获到，否则反代
           // 会持续 401。
@@ -1558,6 +1603,18 @@ async function pythonBin() {
   check('a traversal package name is rejected', guard.traversalRejected === true, JSON.stringify(guard))
   check('removeBundle refuses traversal before any recursive delete',
     guard.removeRejected === true, JSON.stringify(guard))
+  check('npm is invoked with --legacy-peer-deps',
+    guard.legacyPeerDepsPresent === true, JSON.stringify(guard))
+  check('--legacy-peer-deps lands before the package spec',
+    guard.legacyPeerDepsBeforeSpec === true, JSON.stringify(guard))
+  check('the npm argv still starts with the subcommand and ends with the spec',
+    guard.npmArgsShapeIntact === true, JSON.stringify(guard))
+  check('a link: dependency is rewritten to file:',
+    guard.linkRewritten === true, JSON.stringify(guard))
+  check('the link: rewrite is idempotent',
+    guard.linkNormalizeIdempotent === true, JSON.stringify(guard))
+  check('a package with no link: deps is left untouched',
+    guard.cleanPackageUntouched === true, JSON.stringify(guard))
   check('the launch-token line survives a huge newline-free burst',
     guard.tokenAfterHugeNoise === true, `token=${guard.tokenAfterHugeNoise}`)
   check('bundle enable/disable records the trimmed package name',
