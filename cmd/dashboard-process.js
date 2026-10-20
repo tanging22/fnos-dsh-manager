@@ -52,9 +52,18 @@ import {
 import { setTargetPidResolver } from './dashboard-usage.js'
 import { CaptureLaunchToken, SetCurrentLaunchToken, sessionHoldState } from './dashboard-session.js'
 import { applyPatches } from './dashboard-patches.js'
+import { createChildLogGuard, rotateChildLog } from './dashboard-logs.js'
 
 export const PID_FILE = join(DATA_DIR, 'dsh.pid')
 export const DSH_LOG = join(DATA_DIR, 'dsh.log')
+
+/**
+ * dsh 的 stdout/stderr 是逐 chunk 落盘的，chunk 数远多于「日志切片」的次数。
+ * 这个守卫在内存里累计写入量，只在越过 1MB 时才真正 stat + 切片 —— 平时
+ * 每个 chunk 的额外成本是一次整数加法，而不是一次系统调用。
+ * 每次 startDsh 都要 reset，否则新进程会继承上一轮累计的字节数。
+ */
+const childLogGuard = createChildLogGuard(DSH_LOG)
 
 // ---------------------------------------------------------------------------
 // Managed process state (Go: `managedProcess`)
@@ -432,6 +441,12 @@ export function listenPort() {
 function appendLog(text) {
   try {
     mkdirSync(dirname(DSH_LOG), { recursive: true })
+    // dsh.log 的 fd 是 openSync 拿的、并作为 stdio 交给了子进程 —— 子进程攥的
+    // 是那个 inode。所以这里**不能 rename**（一改名，子进程就继续往旧文件里
+    // 写，新的 dsh.log 永远是空的，日志页直接空白且必须重启才恢复），只能
+    // copytruncate：内容复制成 dsh.1.log 后把当前文件就地清空，inode 不变，
+    // 子进程的 fd 依旧有效，无需重启。
+    rotateChildLog(DSH_LOG)
     writeFileSync(DSH_LOG, text, { flag: 'a' })
   } catch {}
 }
@@ -793,6 +808,9 @@ export async function startDsh() {
   let fd = null
   try {
     fd = openSync(DSH_LOG, 'a')
+    // 新进程从头开始计。不 reset 的话会继承上一轮累计的字节数，导致这一轮
+    // 明明只写了 200KB 就提前切片（切片本身无害，但会让日志碎成一地）。
+    childLogGuard.reset()
     // dsh runs AS the panel (no setuid) — the panel lacks CAP_SETUID, so any
     // `uid`/`gid` here fails with `spawn EPERM`. This matches the Go reference,
     // whose `SysProcAttr` only sets `Setpgid` and never drops privileges.
@@ -807,11 +825,11 @@ export async function startDsh() {
     const spawnOpts = { env, cwd: home, detached: true, stdio: ['ignore', 'pipe', 'pipe'] }
     const child = spawn(launch.bin, [...launch.args, ...buildArgs(port)], spawnOpts)
     child.stdout.on('data', (chunk) => {
-      try { writeSync(fd, chunk) } catch { /* log fd closed is fine */ }
+      try { writeSync(fd, chunk); childLogGuard.note(chunk.length) } catch { /* log fd closed is fine */ }
       CaptureLaunchToken(chunk)
     })
     child.stderr.on('data', (chunk) => {
-      try { writeSync(fd, chunk) } catch { /* log fd closed is fine */ }
+      try { writeSync(fd, chunk); childLogGuard.note(chunk.length) } catch { /* log fd closed is fine */ }
       rememberStartupStderr(chunk)
       // Launch Token 也可能打在 stderr 上：不少 CLI 把服务横幅/诊断信息走 stderr，
       // 只盯 stdout 就会永远抓不到 token → 换不到 Cookie → 反代 401、WS 60 秒超时。

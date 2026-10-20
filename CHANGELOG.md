@@ -1,5 +1,54 @@
 # Changelog
 
+## v1.0.52 - 2026-10-20
+
+### 新增
+
+**日志切片（rotation）**
+
+面板长跑几周后 `console.log` 与 `dsh.log` 会滚到几十 MB：前者塞着 30 秒一次的 watchdog 心跳，后者是 dsh 子进程 stdout/stderr 的全量 tee。日志页是「tail 最后 2MB + 按行截断」读的，文件越大打开越慢，真正有用的那几行反而被心跳淹没。
+
+现在两个文件统一按「单文件超过 1MB 就切一片，最多留 3 片」处理，超出的最旧一片直接删掉。上限因此是每文件约 3MB、两个合计约 6MB。切片命名 `console.log` → `console.1.log`（序号插在扩展名前）。
+
+**为什么是两套策略，不是偷懒写了两份**：两个文件的写入方不一样。
+
+- `rename` —— 给**面板自己**写的 `console.log`。`cmd/dashboard.js` 的 `log()` 每次 append 都重新 open，不持有常驻 fd，所以 rename 安全且原子：改名后下一次 append 自然落到新文件，中间不会丢行。
+- `copytruncate` —— 给 **dsh 子进程正在写** 的 `dsh.log`。它的 fd 由 `startDsh` 里 `openSync(DSH_LOG,'a')` 拿到、作为 stdio 直接交给子进程，**子进程攥的是那个 inode**。此时把 `dsh.log` rename 成 `dsh.1.log`，子进程照样往旧 inode 写，新建的 `dsh.log` 永远是空的——日志页会变成一片空白，且只有重启 dsh 才能恢复，比日志太大还糟。所以只能「复制走再就地清空」：inode 不变，子进程的 fd 继续有效，无需重启。
+
+（copytruncate 的固有代价：复制与清空之间极小的时间窗里新写入的字节可能跟切片重复或丢失。对 stdout/stderr 这种诊断流完全可接受；而 rename 那种「日志直接空掉」的后果不可接受。）
+
+**还带了一个计数器**：stdout/stderr 是逐 chunk 写的，繁忙的 dsh 每秒能吐成百上千个 chunk，每个 chunk 都 `statSync` 一次是纯浪费。`createChildLogGuard()` 在内存里累加写入量，只有累计值越过上限才真正去 stat + 切片，平时只是一次整数加法。切片后把计数重置为**当前实际大小而非 0**，这样即使有别的东西也在往这个文件写，计数也不会越走越偏；每次 `startDsh` 都 `reset()`，否则新进程会继承上一轮的累计字节数。
+
+**范围**：只管 `console.log` 和 `dsh.log`。`install` / `uninstall` / `upgrade` / `proxy` / `access` 是一次性日志，装上或跑完就不动了，暂不纳入。
+
+### 实现
+
+新文件 `cmd/dashboard-logs.js`：
+
+| 导出 | 作用 |
+| --- | --- |
+| `LOG_ROTATE_MAX_BYTES` | `1024 * 1024`，单文件上限 |
+| `LOG_ROTATE_KEEP` | `3`，保留切片数（不含当前文件） |
+| `logSizeBytes(path)` | 当前大小；文件不存在/不可读返回 `0`（「不切」是最安全的默认） |
+| `rotateLog(path, options)` | 主入口，返回 `{rotated, reason?, slice?}`；`strategy` 可选 `rename`（默认）/ `copytruncate` |
+| `rotatePanelLog(path)` | 面板日志，`strategy: 'rename'` |
+| `rotateChildLog(path)` | 子进程日志，`strategy: 'copytruncate'` |
+| `createChildLogGuard(path, options)` | 返回 `{note(bytes), reset()}`，带累计计数 |
+
+`shiftSlices()` 内部**必须从最旧往最新方向挪**（`for (let index = keep; index >= 1; index -= 1)`）：顺序反了 `.1` 会先把 `.2` 覆盖掉，一串下去只剩一份。`copytruncate` 的三步顺序也必须是 shiftSlices → copyFileSync → truncateSync，反了会先把数据冲掉。任何异常一律吞掉——轮转只是后勤，绝不能因为它把写日志的调用方（进而把面板主流程）拖垮。
+
+接线两处：
+
+- `cmd/dashboard.js` 的 `log()`：在 `mkdirSync` 之后、`appendFileSync` 之前调 `rotatePanelLog(PANEL_LOG)`，放在 `try` 内。
+- `cmd/dashboard-process.js`：模块级 `const childLogGuard = createChildLogGuard(DSH_LOG)`；`appendLog()` 里在写之前调 `rotateChildLog(DSH_LOG)`；stdout/stderr 的 `writeSync(fd, chunk)` 后跟一句 `childLogGuard.note(chunk.length)`；`openSync(DSH_LOG,'a')` 之后 `childLogGuard.reset()`。
+
+### 门禁
+
+- check **30 parsed / 16 imported / 0 failure**（新文件被纳入）
+- smoke **167 → 173**，新增 6 条断言：没超限不碰文件、rename 切出 `.1` 且当前文件让位、**copytruncate 前后 inode 相同**、只留 3 片且 `.1` 最新 `.3` 最旧、空路径与缺失文件都不操作、chunk 计数器攒够才真 stat
+- 反向验证：把阈值判定改成 `< 0`（永不触发）+ 把 `index >= keep` 改成 `index >= 999`（不删旧片）→ 恰好红 **2 条**（171/173），还原回 173/173
+- 踩坑记录：`guardScript` 是模板字符串，注释里写反斜杠 n 会被真的换行吃掉，导致整个子进程 `SyntaxError: Invalid or unexpected token` 而 stdout 为空 → 父进程 `guard = {}`，表现为**一大片断言集体 FAIL 且 extra 全是 `{}`**，极易误判成「新功能写错了」。另外 smoke 的调试副本必须放在仓库 `scripts/` 内——`ROOT` 由脚本自身路径推导，拷到 `/tmp` 会失真
+
 ## v1.0.51 - 2026-10-20
 
 ### 修复

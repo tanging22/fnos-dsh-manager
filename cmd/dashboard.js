@@ -15,6 +15,7 @@ import { listenPort, StartWatchdog, startDsh } from './dashboard-process.js'
 import { StartUsageSampler } from './dashboard-usage.js'
 import { GetLastRunState, StatusRunning, StatusStarting } from './dashboard-state.js'
 import { applyPatches } from './dashboard-patches.js'
+import { rotatePanelLog } from './dashboard-logs.js'
 
 const PANEL_LOG = CONSOLE_LOG
 
@@ -23,6 +24,11 @@ function log(line) {
   console.log(text)
   try {
     mkdirSync(DATA_DIR, { recursive: true })
+    // 写之前先看一眼大小：超过 1MB 就把当前这份改名挪走（console.log →
+    // console.1.log，最多留 3 片，多出来的最旧一片删掉）。面板每次 append
+    // 都重新 open、不持有常驻 fd，所以 rename 安全、原子、不丢行。
+    // 放在 try 内：轮转失败也不能连累「把这一行写下来」这件正事。
+    rotatePanelLog(PANEL_LOG)
     appendFileSync(PANEL_LOG, `${text}\n`)
   } catch { /* a read-only data dir must not stop the panel */ }
 }

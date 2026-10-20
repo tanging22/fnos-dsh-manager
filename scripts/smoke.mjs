@@ -1451,8 +1451,9 @@ async function pythonBin() {
       load('dashboard-resources.js'),
       load('dashboard-session.js'),
       load('dashboard-server.js'),
+      load('dashboard-logs.js'),
     ])
-      .then(([plugins, config, resources, session, server]) => {
+      .then(([plugins, config, resources, session, server, logs]) => {
         const out = {
           validName: plugins.isValidPackageName('dshmarket'),
           scopedName: plugins.isValidPackageName('@deepseek-ai/dsh'),
@@ -1515,6 +1516,70 @@ async function pythonBin() {
           out.tokenAfterHugeNoise = session.GetCurrentLaunchToken() === 'abc123'
           session.CaptureLaunchToken('x'.repeat(128 * 1024))
           out.bufferBounded = true // 能走到这里就说明没有 OOM/抛错
+
+          // ---- 日志切片（v1.0.52）----
+          // console.log 由面板自己 append（每次重新 open、无常驻 fd）→ 可以
+          // rename；dsh.log 的 fd 交给子进程当 stdout 了，子进程攥的是 inode
+          // → 只能 copytruncate。用错策略的后果不是"日志大一点"，而是日志页
+          // 从此空白、且必须重启 dsh 才恢复，所以这两条必须各测各的。
+          const fx = require('fs')
+          const px = require('path')
+          const rlog = px.join(process.env.DATA_DIR, 'rotate.log')
+          const rs = (i) => px.join(process.env.DATA_DIR, 'rotate.' + i + '.log')
+          // 注意：这里整段都在模板字符串里，反斜杠 n 会被换行吃掉，
+          // 所以标签不带换行，注释里也别写转义序列。
+          const big = (tag) => Buffer.concat([Buffer.alloc(logs.LOG_ROTATE_MAX_BYTES + 1, 0x20), Buffer.from(tag)])
+
+          // 没超限就不该动，连文件都不该碰。
+          fx.writeFileSync(rlog, 'small')
+          out.rotateUnderLimit = logs.rotateLog(rlog).rotated === false
+            && fx.readFileSync(rlog, 'utf8') === 'small'
+
+          // rename：切出 .1，当前文件让位（下一次 append 落到新的 .log 上）。
+          fx.writeFileSync(rlog, big('gen-r'))
+          const rr = logs.rotateLog(rlog, { strategy: 'rename' })
+          out.rotateRenamed = rr.rotated === true
+            && fx.existsSync(rs(1))
+            && fx.readFileSync(rs(1), 'utf8').includes('gen-r')
+            && !fx.existsSync(rlog)
+
+          // copytruncate：inode 必须是同一个，切片有内容，当前文件清零。
+          fx.writeFileSync(rlog, big('gen-c'))
+          const inoBefore = fx.statSync(rlog).ino
+          const rc = logs.rotateChildLog(rlog)
+          out.rotateInodeKept = rc.rotated === true
+            && inoBefore === fx.statSync(rlog).ino
+            && fx.statSync(rlog).size === 0
+            && fx.readFileSync(rs(1), 'utf8').includes('gen-c')
+
+          // 连切 5 次只留 3 片：顺序必须是 .1 最新、.3 最旧，.4 被删掉。
+          // （切片整体后移必须从最旧的开始挪，否则 .1 会先覆盖掉 .2。）
+          for (let i = 1; i <= 5; i += 1) {
+            fx.writeFileSync(rlog, big('gen' + i))
+            logs.rotateChildLog(rlog)
+          }
+          out.rotateKeepsThree = fx.existsSync(rs(1)) && fx.existsSync(rs(2))
+            && fx.existsSync(rs(3)) && !fx.existsSync(rs(4))
+            && fx.readFileSync(rs(1), 'utf8').includes('gen5')
+            && fx.readFileSync(rs(2), 'utf8').includes('gen4')
+            && fx.readFileSync(rs(3), 'utf8').includes('gen3')
+
+          // 空路径 / 不存在的文件：都只能是不操作，绝不能抛。
+          out.rotateNoPath = logs.rotatePanelLog('').rotated === false
+            && logs.rotateChildLog('').rotated === false
+          out.rotateMissing = logs.rotateLog(px.join(process.env.DATA_DIR, 'nope.log')).rotated === false
+
+          // chunk 计数器：小 chunk 攒着不算，累计越过上限才真去 stat 一次。
+          fx.truncateSync(rlog, 0)
+          const guard = logs.createChildLogGuard(rlog)
+          guard.reset()
+          out.guardSkipsSmallChunks = guard.note(1000) === false
+          fx.writeFileSync(rlog, big('gen-g'))
+          guard.reset()
+          out.guardRotatesWhenFull = guard.note(1) === true
+
+          for (let i = 1; i <= 4; i += 1) { try { fx.unlinkSync(rs(i)) } catch {} }
+          try { fx.unlinkSync(rlog) } catch {}
 
           // ---- 会话代持持久化（v1.0.41）----
           // 面板重启（fnOS 每次升级都会）若把 token/cookie 冲掉，而 dsh 还活着，
@@ -1605,6 +1670,18 @@ async function pythonBin() {
     guard.removeRejected === true, JSON.stringify(guard))
   check('npm is invoked with --legacy-peer-deps',
     guard.legacyPeerDepsPresent === true, JSON.stringify(guard))
+  check('a log under the size limit is left alone',
+    guard.rotateUnderLimit === true, JSON.stringify(guard))
+  check('the panel log is sliced by rename',
+    guard.rotateRenamed === true, JSON.stringify(guard))
+  check('the dsh log keeps its inode across a slice',
+    guard.rotateInodeKept === true, JSON.stringify(guard))
+  check('only three slices are kept and the oldest is deleted',
+    guard.rotateKeepsThree === true, JSON.stringify(guard))
+  check('rotation is a no-op for an empty path or a missing file',
+    guard.rotateNoPath === true && guard.rotateMissing === true, JSON.stringify(guard))
+  check('the chunk guard defers stat until the threshold is crossed',
+    guard.guardSkipsSmallChunks === true && guard.guardRotatesWhenFull === true, JSON.stringify(guard))
   check('--legacy-peer-deps lands before the package spec',
     guard.legacyPeerDepsBeforeSpec === true, JSON.stringify(guard))
   check('the npm argv still starts with the subcommand and ends with the spec',
