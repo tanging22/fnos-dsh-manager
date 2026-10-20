@@ -45,6 +45,23 @@ function check(name, condition, detail) {
   console.log(`${condition ? 'ok  ' : 'FAIL'}  ${name}${condition || !detail ? '' : ` — ${detail}`}`)
 }
 
+/**
+ * True when `path` parses as JavaScript.
+ *
+ * A patch that rewrites source can look right in a string match and still be a
+ * syntax error — the one that motivated this helper left a stray `;` between
+ * the injected `catch` block and the `try` that followed. `node --check` is the
+ * cheapest way to catch that class of bug, and it is the same check the suite
+ * already relies on for the injected shim.
+ */
+async function syntaxOk(path) {
+  return await new Promise((resolve) => {
+    const probe = spawn(process.execPath, ["--check", path], { stdio: "ignore" })
+    probe.on("error", () => resolve(false))
+    probe.on("close", (code) => resolve(code === 0))
+  })
+}
+
 /** The dsh the panel proxies to; records that it was reached.
  *
  * `/html*` answers with REAL HTML, because the proxy's HTML path (CSP strip +
@@ -797,6 +814,57 @@ try {
   check('re-starting is a no-op, not a double patch',
     (repatched.match(/dsh-console: settings host-mode patch/g) ?? []).length === 1,
     `marker count=${(repatched.match(/dsh-console: settings host-mode patch/g) ?? []).length}`)
+
+  /* --- the unreadable-ancestor fsync patch --------------------------------
+   *
+   * dsh walks from the attachment store up to the filesystem root, fsyncing
+   * every ancestor to prove the new directory entry is durable:
+   *
+   *     await ensureDurableDirectory(home, parse(home).root)   // stop = "/"
+   *
+   * On fnOS the intermediate mount point is `d---------  root:root /vol1`, so
+   * the walk hits a directory the process cannot open and every upload dies
+   * with `EACCES: permission denied, open '/vol1'` — even though the store
+   * itself sits in DSH_HOME and is writable. Real upload failure observed via
+   * the panel proxy:
+   *
+   *     {"ok":false,"error":{"code":"gateway/internal",
+   *      "message":"failed to store file upload: Error: EACCES:
+   *       permission denied, open '/vol1'"}}
+   *
+   * The patch makes `syncDirectory` stop at the first unreadable level. Verified
+   * three ways below: the catch exists, it only swallows permission errors (a
+   * real I/O failure must still throw), and re-starting does not stack copies.
+   */
+  const fakeAttach = join(dataDir, 'versions', fakeVersion, 'node_modules', '@deepseek-ai',
+    'dsh-attachment-local', 'lib', 'index.js')
+  mkdirSync(dirname(fakeAttach), { recursive: true })
+  writeFileSync(fakeAttach, [
+    'async function syncDirectory(path) {',
+    '\tif (process.platform === "win32") return;',
+    '\tconst handle = await open(path, constants.O_RDONLY);',
+    '\ttry {',
+    '\t\tawait handle.sync();',
+    '\t} finally {',
+    '\t\tawait handle.close();',
+    '\t}',
+    '}',
+    '',
+  ].join('\n'), 'utf8')
+
+  await call('/api/service/start', { method: 'POST' })
+  const attachText = readFileSync(fakeAttach, 'utf8')
+  check('the fsync patch guards the directory open',
+    /catch \(error\)[\s\S]{0,240}EACCES/.test(attachText), attachText.slice(0, 160))
+  check('the guard swallows only permission errors',
+    /"code" in error && \(error\.code === "EACCES" \|\| error\.code === "EPERM"\)\)/.test(attachText),
+    attachText.slice(0, 300))
+  check('a non-permission failure still throws', /throw error;/.test(attachText), attachText.slice(0, 300))
+  check('the fsync patch keeps the original sync call', /await handle\.sync\(\)/.test(attachText), attachText.slice(0, 300))
+  check('the patched bundle is still valid JavaScript', await syntaxOk(fakeAttach), 'node --check failed')
+  check('the fsync patch is idempotent',
+    (attachText.match(/dsh-console: unreadable-ancestor fsync patch/g) ?? []).length === 1,
+    `marker count=${(attachText.match(/dsh-console: unreadable-ancestor fsync patch/g) ?? []).length}`)
 
   /* --- the WS proxy: one handshake header per name ------------------------
    *

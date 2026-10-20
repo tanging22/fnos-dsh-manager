@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.0.50 - 2026-10-20
+
+### 修复
+
+**附件上传必现 `EACCES: permission denied, open '/vol1'`**
+
+现象很迷惑：**浏览器看到 200 就以为上传成功了，dsh 却报失败**。原因是 dsh 的上传接口把「业务失败」也包成 HTTP 200 + JSON（只有 405/415/400 用真状态码），返回体是：
+
+```json
+{"ok":false,"error":{"code":"gateway/internal",
+ "message":"failed to store file upload: Error: EACCES: permission denied, open '/vol1'"}}
+```
+
+根因不在上传目录，而在**之后的 fsync**：dsh 每次写完附件，会从存储目录一路向上 fsync 到文件系统根，用来证明"新建的目录项已经落盘"：
+
+```js
+await ensureDurableDirectory(home, parse(home).root)   // stop = "/"
+```
+
+fnOS 上中间那层挂载点是 `d---------  root:root  /vol1`，进程连打开都不行 → 整次上传被打回。所以「附件根目录在 dsh 目录里、临时文件也在 dsh 目录里」都是对的，碰 `/vol1` 纯粹是**这趟向上遍历**碰到的，跟上传路径配置无关。
+
+修法：让 `syncDirectory` 在遇到第一个打不开的层级就停 —— 只吞 `EACCES` / `EPERM`，其他错误照抛。挂载点之上那层的持久性是运维的契约，不是应用的；进程自己 home 以下的每一层（数据本体、目录项）仍然照原样 fsync。
+
+**落点**：这个修复以前是一次性的手工脚本，现在做成了面板的**内置补丁**，和已有的 settings host-mode 补丁并列，由 `cmd/dashboard-patches.js` 统一持有。它跑在 `startDsh` 里、位于所有早退分支之前，并且对 `versions/` 下**每一个**已安装版本都应用一遍 —— 否则切版本就会把补丁弄丢。
+
+### 门禁
+
+check 29 parsed / 15 imported / 0 failure，smoke **161/161**（新增 6 条）。
+
+新增断言盯住三件事：catch 分支存在、它**只**吞权限错误（真 I/O 故障必须继续 throw）、重启不叠加副本（`marker` 计数恒为 1）。最后一条用 `node --check` 验补丁后的 bundle 仍是合法 JS —— 第一版替换曾在 `catch` 块和后面那个 `try` 之间留下一个裸 `;`，字符串匹配全绿、只有 `node --check` 能看见。
+
+### 提醒
+
+跑 smoke 需要 **Node ≥ 22**（仓库 `engines` 已声明）。本机默认 `node` 是 v20，没有全局 `WebSocket`，会有一条 `/ws handshake completes` 假红。
+
 ## v1.0.49 - 2026-10-19
 
 ### 修复
