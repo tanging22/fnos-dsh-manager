@@ -1,4 +1,5 @@
 # DSH 管理器（fnos-dsh-manager）
+管理器属于原汤化原食了，管理器全部代码都是用DeepSeek harness写的，有些部分也是参考同类型GitHub项目实现。修修补补到现在达到勉强可以用的版本。我不懂代码的，勉强做到这样了。
 
 给 **fnOS（飞牛 NAS）** 用的 DeepSeek Harness（DSH）管理面板套件。
 
