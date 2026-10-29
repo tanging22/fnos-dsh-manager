@@ -267,10 +267,16 @@ export function removeVersion(version) {
 
 /** Remove old versions, keeping the configured count plus whatever is current. */
 export async function pruneVersions() {
-  const keep = Math.max(1, Number(loadConfig().versions?.keep ?? 3))
+  // keep 来自 console-config.json，而 saveConfig 不校验类型：一个 "3" 之外的
+  // 脏值（null / NaN / 对象）会让 slice(0, NaN) 变空数组，keepSet 只剩 pinned，
+  // 于是所有没 pin 的已装版本目录被整批删掉。宁可退回默认 3，也不能删多。
+  const raw = Number(loadConfig().versions?.keep ?? 3)
+  const keep = Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3
   const pinned = readPinnedVersion()
   const installed = listInstalledVersions()
   const keepSet = new Set(installed.slice(0, keep).map((entry) => entry.version))
+  // 正在用的那个无论如何都留着：哪怕 keep 被配成 1、而它排在后面。
+  if (installed.length > 0) keepSet.add(installed[0].version)
   if (pinned) keepSet.add(pinned)
   const removed = []
   for (const entry of installed) {

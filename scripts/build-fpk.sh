@@ -15,7 +15,24 @@
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORK="$(mktemp -d)"
+# mktemp 会跟随外部 TMPDIR，而 TMPDIR 不一定真的能写：fnOS 应用沙箱里它常常指向
+# 一个只读的挂载点，此时 `[ -w ]` 仍然返回真（access(2) 只看权限位，不看挂载点是否
+# 只读），于是 mktemp 当场失败、整个打包起不来。
+# 所以这里不预判，直接挨个试 mktemp，第一个真能建出目录的基准就算数。
+make_work_dir() {
+    for base in "${TMPBASE:-}" "${TMPDIR:-}" /tmp "${ROOT}/.build-tmp"; do
+        [ -n "${base}" ] || continue
+        if mkdir -p "${base}" 2>/dev/null && work="$(mktemp -d "${base}/fnos-dsh-manager.build.XXXXXXXX" 2>/dev/null)"; then
+            printf '%s\n' "${work}"
+            return 0
+        fi
+    done
+    return 1
+}
+WORK="$(make_work_dir)" || {
+    echo "error: no writable directory for a build workdir (tried TMPBASE/TMPDIR, /tmp, ${ROOT}/.build-tmp)" >&2
+    exit 1
+}
 STAGE="${WORK}/fnos-dsh-manager"
 TMPDIR="${WORK}/tmp"
 
@@ -23,6 +40,8 @@ trap 'rm -rf "${WORK}"' EXIT
 mkdir -p "${TMPDIR}"
 
 # fnpack writes its own temp files; give it a directory we control.
+# TMPDIR 也一起 export —— 只设 TMP/TEMP 时，跟随 TMPDIR 的子进程仍会跑回外部那个目录。
+export TMPDIR="${TMPDIR}"
 export TMP="${TMPDIR}"
 export TEMP="${TMPDIR}"
 
@@ -42,8 +61,13 @@ mkdir -p "${STAGE}"
 # /var/apps/<name>/target/. The panel serves its static files from there, so
 # app/ui must be a FULL mirror of the repo-root ui/ (index.html + assets +
 # images), not just config+icons — otherwise the panel 404s after install.
+# 缺文件必须当场失败：静默 continue 会打出一个少文件的包，装完是 404 / 起不来，
+# 而且这种包看起来"构建成功"，最难查。
 for entry in manifest VERSION CHANGELOG.md LICENSE README.md ui cmd config wizard app ICON.PNG ICON_256.PNG; do
-    [ -e "${ROOT}/${entry}" ] || continue
+    if [ ! -e "${ROOT}/${entry}" ]; then
+        echo "error: required entry missing: ${entry}" >&2
+        exit 1
+    fi
     cp -a "${ROOT}/${entry}" "${STAGE}/"
 done
 

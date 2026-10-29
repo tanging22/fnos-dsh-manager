@@ -1,5 +1,51 @@
 # Changelog
 
+## v1.0.53 - 2026-10-29
+
+### 修复
+
+**网关随机 502 `upstream unreachable: [Errno 24] Too many open files`**
+
+症状：面板用着用着突然一片红，每个请求都回 502，正文只有一行 `upstream unreachable: [Errno 24] Too many open files`。重启就好一阵，过几天又犯。
+
+报错点在 `cmd/proxy.py` 的 `_http_proxy()`——它在 `except Exception as exc` 里把异常原文拼进 502。`[Errno 24]` 是 Python `OSError` 的写法，所以不是面板（Node）侧的问题，是这座 Python 网关自己连上游时 `socket()`/`connect()` 失败了。而系统 fd 远远没用完：`/proc/sys/fs/file-nr` 常年九千多。
+
+卡住它的是**进程自己的 soft 上限**：
+
+```
+$ grep "open files" /proc/<proxy.pid>/limits
+Max open files    1024    524288
+```
+
+同一个启动器拉起来的 dashboard 与 dsh 都是 `524288 524288`，只有网关落在 1024。这条不是 `cmd/main` 里某句 `ulimit` 写出来的，是从 fnOS 启动环境继承来的——而 `cmd/main` 从来没管过它，等于完全交给外面。
+
+1024 为什么不够：这座网关**每条连接固定吃 2~3 个 fd**——客户端 socket、上游 `HTTPConnection` 的 socket，再加 `http.client` 给响应挂的 `makefile()`（`socket._io_refs > 0` 时只关 `conn` 并不真释放 fd，要等 `resp` 被 GC）。而两种长连接会**主动把超时摘掉**：SSE 走 `_stream_phase()` 后两侧 `settimeout(None)`，WebSocket 走 `_relay()` 双 pump 线程。标签页挂着不动也照样占着。十几个标签页 × 面板自身轮询一起打上来，一瞬间就够顶穿 1024。**它不是慢慢泄漏到满，是峰值撞死**——所以重启总"有用"，也总复发。
+
+四处改动，前两条各自独立就能止血，后两条防止再被别的东西顶穿：
+
+1. **进程自己抬上限**（`_raise_fd_limit()`）。启动时读 `RLIMIT_NOFILE`，把 soft 抬到 `min(FD_LIMIT_TARGET, hard)`，默认 target 65536。生产 hard 是 524288，抬完就是 65536；hard 不够大时按 hard 走，不硬闯。只升不降，失败也不拦启动——宁可少几个 fd，也不能因为调不动限制就整座网关起不来。
+2. **`cmd/main` 里加一行 `ulimit -n`** 兜底：先试 65536，不行退到 hard，再不行就算了（`|| true`）。将来 Python 侧那段被谁删了，启动脚本还能托住。
+3. **并发闸**（`_ConnectionGuard`）。`ThreadingHTTPServer` 每来一条连接起一个线程，**没有任何上限**——这才是 fd 能被无限制吃掉的根。现在套一个 `BoundedSemaphore`：抢不到槽的连接立刻收到 `503 Service Unavailable`（正文 `gateway busy: too many concurrent connections`）并关闭。默认 400 条，`MAX_CONNECTIONS` 可调。**为什么不是排队**：排队只会把上游的慢传导成前端集体超时，快速失败至少让还在用的那几个标签页活着。闸被抽成 mixin，生产（unix socket）与开发（`TCP_LISTEN`）两个模式共用——否则它连验证都没法验。
+4. **`resp` 显式 close**。`_http_proxy` 的 `finally` 原来只有 `conn.close()`，现在先 `resp.close()` 再关连接。上面那条 `_io_refs` 机制是真实存在的，靠 GC 收尾意味着「峰值过后 fd 要等一轮 GC 才回来」，正好卡在最不该卡的时候。
+
+顺手把诊断做进去：`errno` 是 23（ENFILE）或 24（EMFILE）时，502 正文后面会附 `[fds=… soft_limit=… threads=…]`。下次再有人贴这张报错，一眼能看出是 fd 用光、线程堆高，还是 soft 上限又被打回去了。
+
+### 顺带修掉
+
+**`TCP_LISTEN` 写 `host:port` 会直接起不来**
+
+开发模式原来只接受纯端口号：`int(tcp_listen)` 碰到 `127.0.0.1:28123` 就是 `ValueError: invalid literal for int() with base 10: '127.0.0.1:28123'`，抛在 `main()` 里没人接，整座网关还没开始监听就退出。现在按最后一个冒号拆 host/port，`TCP_LISTEN=28123` 与 `TCP_LISTEN=127.0.0.1:28123` 两种都吃。这是想用它起测试实例验并发闸时踩到的。
+
+### 验证
+
+- `python3 -m py_compile cmd/proxy.py` 通过；`bash -n cmd/main` 通过。
+- 并发闸：`MAX_CONNECTIONS=3` 起实例，5 条只连不发数据的长连接 → 前 3 条拿到槽，后 2 条立刻收到 `HTTP/1.1 503 Service Unavailable`。
+- fd 抬升：进程内把 soft 降到 64（hard 保持 524288），调 `_raise_fd_limit(128)` → 返回 `(128, 524288)`，再调一次不变（幂等）。
+
+### 关于依赖
+
+这一版没动任何依赖，因为**这个项目本来就没有第三方依赖**：`package.json` 的 `dependencies` 与 `devDependencies` 都是空的，`cmd/` 下 13 个 JS（7121 行）只 import `node:` 内置模块。所以「升级依赖」在这里不成立，也没有「依赖过期」导致的 bug。唯一的运行时要求是 `engines.node >= 22`，fnOS 自带的 Node 本来就满足。
+
 ## v1.0.52 - 2026-10-20
 
 ### 新增

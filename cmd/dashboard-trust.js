@@ -15,10 +15,15 @@
  */
 
 import { existsSync } from 'node:fs'
-import { APP_DIR, CONSOLE_APP_DIR, LAN_PROXY_PORT, lanAddresses, localHost } from './dashboard-utils.js'
+import { APP_DIR, CONSOLE_APP_DIR, CONSOLE_PORT, LAN_PROXY_PORT, lanAddresses, localHost } from './dashboard-utils.js'
 
-/** 本面板自己的监听端口：console 28001 + LAN 直连口。Origin 端口检查用。 */
-const CONSOLE_PORT = 28001
+/**
+ * 本面板自己的监听端口：console + LAN 直连口。Origin 端口检查用。
+ *
+ * CONSOLE_PORT 必须从 utils 引，不能在这儿写死 28001——utils 侧读的是
+ * process.env.CONSOLE_PORT，写死之后一旦用环境变量换了端口，面板自己页面
+ * 发来的 POST 会全部被判 origin-port-mismatch，也就是面板把自己锁在外面。
+ */
 const OWN_LISTEN_PORTS = new Set([CONSOLE_PORT, LAN_PROXY_PORT])
 
 /** 提取 Origin 头的端口（无端口返回 ''；https 默认 443 也返回 ''——不惩罚）。 */

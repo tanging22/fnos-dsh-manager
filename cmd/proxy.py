@@ -30,8 +30,15 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:
+    import resource
+except ImportError:  # 开发机 (Windows) 没有 resource; TCP_LISTEN 调试模式要能起。
+    resource = None
+
 CONSOLE_PORT = int(os.environ.get("CONSOLE_PORT", "28001"))
-SOCK_PATH = os.environ.get("SOCK_PATH", "/var/apps/dsh-console/target/app.sock")
+# 默认值与 manifest 的 appname 对齐。生产环境 cmd/main 会显式传这两个值，
+# 这里只是让裸跑（调试）时落到正确的路径，而不是套件改名前的 dsh-console。
+SOCK_PATH = os.environ.get("SOCK_PATH", "/var/apps/fnos-dsh-manager/target/app.sock")
 BACKEND = ("127.0.0.1", CONSOLE_PORT)
 GATEWAY_PREFIX = os.environ.get("GATEWAY_PREFIX", "/app/dsh-console")
 
@@ -50,6 +57,47 @@ HOP_BY_HOP = {
     "connection", "proxy-connection", "keep-alive", "transfer-encoding",
     "te", "trailers", "proxy-authorization", "proxy-authenticate", "upgrade",
 }
+
+# 同时在飞的连接数上限。每条连接最多握 2~3 个 fd (客户端 + 上游 + 上游的
+# SocketIO), 所以护栏必须与 fd 上限配套: 只抬 fd 上限、不设并发闸, 峰值一来
+# 照样把进程撞死在 EMFILE 上, 症状就是下面 _http_proxy 里那句
+# `upstream unreachable: [Errno 24] Too many open files`。
+MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "400"))
+# 进程启动时把 soft fd 上限抬到多少 (向上限靠, 不超过 hard)。
+FD_LIMIT_TARGET = int(os.environ.get("FD_LIMIT_TARGET", "65536"))
+# 抬完之后的 soft 上限, 只用于 502 body 里的诊断信息。
+_FD_SOFT_LIMIT = 0
+
+
+def _raise_fd_limit(target=FD_LIMIT_TARGET):
+    """把本进程的 RLIMIT_NOFILE soft 上限抬到 target (不超过 hard)。
+
+    fnOS 启动器给 proxy.py 的 soft 上限是 1024 (dashboard 与 dsh 都是 524288),
+    而本代理每条连接要占 2~3 个 fd 且没有并发闸 —— 页面多开几个标签、再来几条
+    SSE, 1024 就撞满了, socket() 立刻 EMFILE, 于是每一次代理都回
+    `502 upstream unreachable: [Errno 24] Too many open files`。
+    这个值只能由进程自己抬: 启动器不受我们控制, 而 hard 上限本来就够。
+    """
+    global _FD_SOFT_LIMIT
+    if resource is None:
+        return None
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY:
+            target = min(target, hard)
+        if soft == resource.RLIM_INFINITY or soft >= target:
+            _FD_SOFT_LIMIT = soft
+            return (soft, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        _FD_SOFT_LIMIT = target
+        return (target, hard)
+    except (ValueError, OSError):
+        # 抬不动也不能拦启动: 护栏还在, 最坏退化成"少接一些连接"。
+        try:
+            _FD_SOFT_LIMIT = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        except Exception:
+            pass
+        return None
 
 
 def _recv_exact(sock, n):
@@ -359,8 +407,18 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.wfile.write(data)
 
+    @staticmethod
+    def _fd_usage():
+        """本进程当前占用的 fd 数 (拿不到就 -1)。只用于出错时的诊断信息。"""
+        try:
+            with os.scandir("/proc/self/fd") as entries:
+                return sum(1 for _ in entries)
+        except OSError:
+            return -1
+
     def _http_proxy(self, path):
         conn = None
+        resp = None
         try:
             body = self.body_bytes()
             headers = {
@@ -452,8 +510,23 @@ class Handler(BaseHTTPRequestHandler):
             if chunked:
                 self.wfile.write(b"0\r\n\r\n")
         except Exception as exc:
-            self.fail(502, "upstream unreachable: %s" % exc)
+            # EM FILE / ENFILE (23/24) 只说 "Too many open files" 是没法用的:
+            # 分不清是撞了 fd 上限, 还是真的在漏。顺手把当时的水位写进 body,
+            # 下一次再出现就能一眼判断 (之前这里连 fd 数都看不到, 只能靠猜)。
+            detail = "upstream unreachable: %s" % exc
+            if getattr(exc, "errno", None) in (23, 24):
+                detail += " [fds=%s soft_limit=%s threads=%s]" % (
+                    self._fd_usage(), _FD_SOFT_LIMIT, threading.active_count())
+            self.fail(502, detail)
         finally:
+            # resp 必须显式关: 只关 conn 时 SocketIO 还被 resp 持着
+            # (socket._io_refs > 0), 那个 fd 要等 GC 才真的释放。高并发下这段
+            # 延迟释放正好把 1024 的 soft 上限撑爆, 表现为随机的 Errno 24。
+            try:
+                if resp is not None:
+                    resp.close()
+            except Exception:
+                pass
             try:
                 if conn:
                     conn.close()
@@ -520,7 +593,45 @@ class Handler(BaseHTTPRequestHandler):
     do_OPTIONS = _proxy
 
 
-class UnixServer(ThreadingHTTPServer):
+class _ConnectionGuard:
+    # ThreadingMixIn 对并发没有任何约束: 每个连接一个线程、每个线程 2~3 个 fd,
+    # 一旦 fd 耗尽, 所有请求一起变成 `502 upstream unreachable: [Errno 24]`.
+    # 有了这道闸, 超出的连接会被立刻打回 503 并关闭 —— 慢一点, 但进程不会塌。
+    # 生产(unix socket)与开发(TCP_LISTEN)两个模式共用它: 闸只在生产生效而开发
+    # 模式裸奔的话, 这类问题永远没法在开发机上复现。
+    max_connections = MAX_CONNECTIONS
+
+    def _init_guard(self):
+        self._slots = threading.BoundedSemaphore(self.max_connections)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            body = b"gateway busy: too many concurrent connections\n"
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: text/plain; charset=utf-8\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            # 起线程失败时槽位必须还回去, 否则闸会被慢慢吃掉。
+            self._slots.release()
+            self.shutdown_request(request)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+class UnixServer(_ConnectionGuard, ThreadingHTTPServer):
     # AF_UNIX 在模块加载时求值会炸掉 Windows 开发机（那边没有这个属性），
     # 连带 TCP_LISTEN 模式也起不来。故改为在 __init__ 里惰性读取。
     address_family = None
@@ -529,19 +640,38 @@ class UnixServer(ThreadingHTTPServer):
 
     def __init__(self, path, handler):
         self.address_family = socket.AF_UNIX
+        self._init_guard()
         super().__init__(path, handler)
 
 
+class TCPGatewayServer(_ConnectionGuard, ThreadingHTTPServer):
+    # 开发模式的 TCP 监听。必须与 UnixServer 用同一道闸 —— 否则「并发把 fd 打满」
+    # 这件事在开发机上永远复现不出来, 而我正是在这个模式上验证护栏的。
+    daemon_threads = True
+
+    def __init__(self, addr, handler):
+        self._init_guard()
+        super().__init__(addr, handler)
+
+
 def main():
+    # 先抬 fd 上限再做任何事: 启动器给的是 1024, 而本代理每条连接要 2~3 个 fd。
+    limit = _raise_fd_limit()
+
     # 生产永远走 unix socket（fnOS 网关按 ui/config 的 gatewaySocket 拨号）。
     # TCP_LISTEN 只给开发机用：Windows 的 python 没有 socket.AF_UNIX，网关这一跳
     # 在开发机上根本起不来，上传穿透这类问题就无法端到端复现。它不被设置时行为
     # 与之前完全一致。
     tcp_listen = os.environ.get("TCP_LISTEN")
     if tcp_listen:
-        server = ThreadingHTTPServer(("127.0.0.1", int(tcp_listen)), Handler)
-        print("dsh-console gateway (dev TCP): 127.0.0.1:%d -> 127.0.0.1:%d (prefix %s)"
-              % (int(tcp_listen), CONSOLE_PORT, GATEWAY_PREFIX), flush=True)
+        # 兼容 "28123" 与 "127.0.0.1:28123" 两种写法（前者是老写法，别写错就把整条
+        # 网关打挂：int("127.0.0.1:28123") 会直接抛 ValueError 在启动阶段退出）。
+        host, _, port_text = tcp_listen.rpartition(":")
+        bind_host = host or "127.0.0.1"
+        bind_port = int(port_text or tcp_listen)
+        server = TCPGatewayServer((bind_host, bind_port), Handler)
+        print("dsh-console gateway (dev TCP): %s:%d -> 127.0.0.1:%d (prefix %s)"
+              % (bind_host, bind_port, CONSOLE_PORT, GATEWAY_PREFIX), flush=True)
         server.serve_forever()
         return
 

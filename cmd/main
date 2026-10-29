@@ -193,7 +193,14 @@ start_panel() {
 }
 
 start_proxy() {
-    [ -f "${PROXY_PY}" ] || { echo "WARN: ${PROXY_PY} missing; gateway entry unavailable" >&2; return 0; }
+    # 不能 return 0：面板起来了而网关没起来，用户点图标只会看到 Bad Gateway，
+    # 而且 status 仍报"运行中"。安装残缺就该在启动阶段就喊出来。
+    [ -f "${PROXY_PY}" ] || { echo "ERROR: ${PROXY_PY} missing; gateway entry unavailable" >&2; return 1; }
+    # fnOS 启动器给这个进程的 soft fd 上限只有 1024, 而本代理每条连接就要 2~3 个 fd
+    # (客户端 socket + 上游 socket + makefile 引用). 一撞上限, 所有请求一起变成
+    # `502 upstream unreachable: [Errno 24] Too many open files`.
+    # 这里先抬(只升不降, 抬不动就算了), proxy.py 启动时也会自己再抬一次 —— 双保险.
+    ulimit -n 65536 2>/dev/null || ulimit -n "$(ulimit -Hn 2>/dev/null || echo 4096)" 2>/dev/null || true
     CONSOLE_PORT="${CONSOLE_PORT}" \
     SOCK_PATH="${SOCK_PATH}" \
     GATEWAY_PREFIX="${GATEWAY_PREFIX}" \
@@ -206,8 +213,10 @@ start_proxy() {
     while [ "${waited}" -lt 10 ]; do
         sleep 1
         waited=$((waited + 1))
-        [ -S "${SOCK_PATH}" ] && { echo "gateway socket ready after ${waited}s"; return 0; }
-        running "${PROXY_PID}" "proxy.py" || break
+        # 只看文件存在会把上一实例残留的 socket 当成"已就绪"——文件在，没人 listen。
+        # sock_alive 会真去 connect 一次。
+        sock_alive && { echo "gateway socket ready after ${waited}s"; return 0; }
+        running "${PROXY_PID}" "${PROXY_PY}" || break
     done
     echo "ERROR: gateway socket ${SOCK_PATH} not created; see ${PROXY_LOG}" >&2
     return 1
@@ -222,7 +231,7 @@ stop_panel() {
 }
 
 stop_proxy() {
-    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py"; then
+    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "${PROXY_PY}"; then
         kill "$(cat "${PROXY_PID}")" 2>/dev/null || true
     fi
     rm -f "${PROXY_PID}" 2>/dev/null || true
@@ -233,7 +242,7 @@ stop_proxy() {
 start() {
     # 陈旧 pid 文件清理: 指向的进程不是我们的 → 删除重来
     [ -f "${PANEL_PID}" ] && running "${PANEL_PID}" "dashboard.js" || rm -f "${PANEL_PID}" 2>/dev/null || true
-    [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py" || rm -f "${PROXY_PID}" 2>/dev/null || true
+    [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "${PROXY_PY}" || rm -f "${PROXY_PID}" 2>/dev/null || true
 
     if [ -f "${PANEL_PID}" ]; then
         if running "${PANEL_PID}" "dashboard.js" && port_alive; then
@@ -248,10 +257,10 @@ start() {
         start_panel || return 1
     fi
 
-    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py" && [ -S "${SOCK_PATH}" ]; then
+    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "${PROXY_PY}" && sock_alive; then
         echo "proxy already running (pid $(cat "${PROXY_PID}"))"
     else
-        [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py" && stop_proxy
+        [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "${PROXY_PY}" && stop_proxy
         start_proxy || return 1
     fi
     return 0
@@ -280,7 +289,7 @@ status() {
         echo "panel stopped"
         panel_ok=1
     fi
-    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "proxy.py"; then
+    if [ -f "${PROXY_PID}" ] && running "${PROXY_PID}" "${PROXY_PY}"; then
         if sock_alive; then
             echo "proxy running (pid $(cat "${PROXY_PID}")) ${SOCK_PATH}"
         else

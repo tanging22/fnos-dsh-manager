@@ -634,7 +634,12 @@ const routes = {
     if (body.install !== undefined) next.install = { ...next.install, ...body.install }
     if (body.versions !== undefined) next.versions = { ...next.versions, ...body.versions }
 
-    saveConfig(next)
+    // saveConfig() 现在会在写盘失败时返回 { ok: false, error }（原子写 + 不吞错）,
+    // 这里必须看返回值: 以前写失败也照样回 200 ok:true, 用户以为改了其实磁盘没动。
+    const saved = saveConfig(next)
+    if (saved?.ok === false) {
+      return json(response, 500, { ok: false, error: saved.error })
+    }
     // Persist first, then apply: applyLanBinding() reads loadConfig(), so doing
     // it before saveConfig() would write the *previous* setting's patch.
     if (body.lanBind !== undefined) {

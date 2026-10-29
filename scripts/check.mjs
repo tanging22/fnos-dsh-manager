@@ -12,7 +12,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { readdirSync, readFileSync, existsSync } from 'node:fs'
+import { readdirSync, readFileSync, existsSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -276,6 +276,30 @@ if (!existsSync(manifestPath)) {
  * and skip (loudly) when the interpreter is absent rather than failing the gate.
  */
 const pythonSources = ['cmd/proxy.py']
+
+/**
+ * `os.tmpdir()` 只读 TMPDIR，不判断它能不能写（Python 的 tempfile 会自己回退，Node 不会）。
+ * 多沙箱环境里 TMPDIR 常指向一个只读挂载点，于是 py_compile 写不出那个 .pyc —— 报出来的
+ * 却是一行像语法错误的栈，让人误以为 proxy.py 有问题。
+ *
+ * ★ 探测必须是「真写一次」，不能用 accessSync(W_OK)：access(2) 只看权限位，不看挂载点
+ * 是不是只读。只读 bind mount 上权限位照样是 0755，access 会通过，随后 write 才 EACCES ——
+ * 我第一次就是这么修的，症状原封不动。
+ */
+function writableTempDir() {
+  for (const candidate of [tmpdir(), '/tmp', join(ROOT, '.build-tmp')]) {
+    if (!candidate) continue
+    const probe = join(candidate, `.fnos-dsh-manager-writable-${process.pid}`)
+    try {
+      writeFileSync(probe, '')
+      rmSync(probe, { force: true })
+      return candidate
+    } catch {
+      // 下一个
+    }
+  }
+  return ROOT
+}
 const shellSources = ['cmd/main', 'cmd/install_callback', 'cmd/upgrade_init', 'cmd/upgrade_callback',
   'cmd/config_init', 'cmd/config_callback', 'cmd/uninstall_init', 'cmd/uninstall_callback']
 
@@ -356,11 +380,16 @@ if (pythonBin) {
     try {
       // Compile to bytecode without writing a __pycache__ next to the source.
       execFileSync(pythonBin, ['-c', `import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)`,
-        absolute, join(tmpdir(), 'fnos-dsh-manager-proxy.pyc')], { stdio: 'pipe' })
+        absolute, join(writableTempDir(), 'fnos-dsh-manager-proxy.pyc')], { stdio: 'pipe' })
     } catch (error) {
       failures += 1
       console.error(`PYTHON  ${source}`)
-      console.error(`        ${String(error.stderr ?? error.message).trim().split('\n').slice(0, 3).join('\n        ')}`)
+      // 只印前三行会把真正的异常类型切掉（py_compile 的栈前面全是 importlib 帧）——
+      // 尾部那一行才是 "PermissionError: ..." 这种能直接定位的行。
+      const trace = String(error.stderr ?? error.message).trim().split('\n').filter(Boolean)
+      const head = trace.slice(0, 3)
+      const tail = trace.length > 4 ? trace.slice(-1) : []
+      console.error(`        ${[...head, ...tail].join('\n        ')}`)
     }
   }
 } else {

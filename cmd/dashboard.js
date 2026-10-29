@@ -46,11 +46,16 @@ async function main() {
     process.exit(1)
   })
 
+  // 只绑回环：面板前方永远有一个 fnOS 网关（Unix socket，见 cmd/proxy.py），
+  // 而 dashboard-server.js 的鉴权正是按「只有网关可达」这个前提整段删掉的。
+  // 绑 0.0.0.0 会让局域网里任何人直连 :CONSOLE_PORT 调全部管理 API，
+  // 等于把那个前提拆了。局域网用 :LAN_PROXY_PORT（28002）直连 dsh，不经这里。
+  const PANEL_HOST = '127.0.0.1'
   await new Promise((resolvePromise) => {
-    server.listen(CONSOLE_PORT, '0.0.0.0', resolvePromise)
+    server.listen(CONSOLE_PORT, PANEL_HOST, resolvePromise)
   })
 
-  log(`panel listening on http://0.0.0.0:${CONSOLE_PORT}/ (dsh target port ${listenPort()}) at ${nowIso()}`)
+  log(`panel listening on http://${PANEL_HOST}:${CONSOLE_PORT}/ (dsh target port ${listenPort()}) at ${nowIso()}`)
 
   // Supervise dsh: a 1s watchdog adopts orphaned children and clears stale
   // "running" state when the process dies, so the panel never reports a
@@ -114,6 +119,9 @@ async function main() {
       lanProxy.on('error', (error) => {
         log(`lan-proxy on :${LAN_PROXY_PORT} error: ${error.code === 'EADDRINUSE' ? 'port in use' : error.message}`)
       })
+      // 「listening」这句必须从绑定成功回调里打，不能落在 catch 之后——
+      // 那样端口被占时日志仍然宣称在监听，和真实状态相反。
+      log(`lan-proxy listening on http://0.0.0.0:${LAN_PROXY_PORT}/ -> dsh (direct, no /p/ prefix)`)
       resolvePromise()
     })
   }).catch((error) => {
@@ -121,7 +129,6 @@ async function main() {
     lanProxy.on('error', () => { /* runtime accept errors are non-fatal */ })
     log(`lan-proxy failed to bind :${LAN_PROXY_PORT}: ${error?.message ?? error}`)
   })
-  log(`lan-proxy listening on http://0.0.0.0:${LAN_PROXY_PORT}/ -> dsh (direct, no /p/ prefix)`)
 
   const shutdown = (signal) => {
     log(`received ${signal}; closing`)

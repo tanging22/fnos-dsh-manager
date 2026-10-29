@@ -10,7 +10,7 @@
  *    standalone, rooted wherever `DATA_DIR` points.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import {
   APP_DIR,
@@ -190,16 +190,31 @@ export function loadConfig() {
 }
 
 export function saveConfig(next) {
-  // Strip the in-memory bookkeeping key before it can reach disk, otherwise
-  // every save would bake a `__parseError` field into the user's config.
-  const { __parseError, ...clean } = next ?? {}
+  // Strip the in-memory bookkeeping keys before they can reach disk, otherwise
+  // every save would bake `__parseError` / `__saveError` into the user's config.
+  const { __parseError, __saveError, ...clean } = next ?? {}
   const merged = deepMerge(DEFAULTS, clean)
   try {
     mkdirSync(dirname(CONFIG_PATH), { recursive: true })
-    // Write `merged`, never `configCache`: the latter carries the bookkeeping key.
-    writeFileSync(CONFIG_PATH, `${JSON.stringify(merged, null, 2)}\n`, 'utf8')
-  } catch {}
-  // Keep the in-memory view in sync with disk, minus the field we just dropped.
+    // Write `merged`, never `configCache`: the latter carries the bookkeeping keys.
+    // Atomic write: a plain writeFileSync straight onto the live file leaves a
+    // truncated file behind whenever the write is cut short (ENOSPC, kill -9,
+    // power loss). The next loadConfig() then cannot parse it and silently
+    // falls back to DEFAULTS — every setting the user ever made, gone, with
+    // nothing but a console.warn to show for it.
+    const tmp = `${CONFIG_PATH}.tmp`
+    writeFileSync(tmp, `${JSON.stringify(merged, null, 2)}\n`, 'utf8')
+    renameSync(tmp, CONFIG_PATH)
+  } catch (error) {
+    // Swallowing this used to mean the panel kept showing the new values (we
+    // updated configCache regardless) while disk still held the old ones, so
+    // the change silently reverted on the next restart. Report it instead.
+    const failure = error?.message ?? String(error)
+    try { rmSync(`${CONFIG_PATH}.tmp`, { force: true }) } catch { /* nothing to clean */ }
+    console.error(`[fnos-dsh-manager] could not write ${CONFIG_PATH}: ${failure}`)
+    return { ok: false, error: failure }
+  }
+  // Keep the in-memory view in sync with disk, minus the fields we just dropped.
   configCache = merged
   configCache.__parseError = ''
   return configCache
