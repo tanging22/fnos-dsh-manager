@@ -63,6 +63,12 @@ HOP_BY_HOP = {
 # 照样把进程撞死在 EMFILE 上, 症状就是下面 _http_proxy 里那句
 # `upstream unreachable: [Errno 24] Too many open files`。
 MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "400"))
+# 长连接 (SSE / WebSocket) 自己一池: 这两种连接把超时摘掉之后就挂在那里不走,
+# 十几个标签页就能把短请求的槽吃光, 表现是点一下也回
+# `gateway busy: too many concurrent connections`。
+# 抢不到长连接池时**不报错**, 原地继续占短池 —— 最坏等于分池之前的行为。
+# 默认与短池等大 (总上限 2 * MAX_CONNECTIONS), 可用 MAX_LONG_CONNECTIONS 单独调。
+MAX_LONG_CONNECTIONS = int(os.environ.get("MAX_LONG_CONNECTIONS", str(MAX_CONNECTIONS)))
 # 进程启动时把 soft fd 上限抬到多少 (向上限靠, 不超过 hard)。
 FD_LIMIT_TARGET = int(os.environ.get("FD_LIMIT_TARGET", "65536"))
 # 抬完之后的 soft 上限, 只用于 502 body 里的诊断信息。
@@ -280,6 +286,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _ws_proxy(self, path):
+        # WebSocket 是长连接: 换到长连接池, 别继续占短请求的槽。
+        getattr(self.server, "_promote_long", lambda: None)()
         backend = None
         try:
             backend = socket.create_connection(BACKEND, timeout=30)
@@ -485,6 +493,8 @@ class Handler(BaseHTTPRequestHandler):
             # `Connection timed out after 60000ms` 就是这条路径的产物。
             chunked = not declared.isdigit()
             if content_type.lower().startswith("text/event-stream"):
+                # SSE 同样是长连接 (下面 _stream_phase 会把两侧超时摘掉)。
+                getattr(self.server, "_promote_long", lambda: None)()
                 kept.append(("Cache-Control", "no-cache, no-transform"))
                 kept.append(("X-Accel-Buffering", "no"))
             self.send_response(resp.status)
@@ -600,9 +610,42 @@ class _ConnectionGuard:
     # 生产(unix socket)与开发(TCP_LISTEN)两个模式共用它: 闸只在生产生效而开发
     # 模式裸奔的话, 这类问题永远没法在开发机上复现。
     max_connections = MAX_CONNECTIONS
+    max_long_connections = MAX_LONG_CONNECTIONS
 
     def _init_guard(self):
         self._slots = threading.BoundedSemaphore(self.max_connections)
+        # 长连接专用池 (SSE / WebSocket)。两池分开的理由见 MAX_LONG_CONNECTIONS 注释。
+        self._long_slots = threading.BoundedSemaphore(self.max_long_connections)
+        self._pool_of = {}
+        self._pool_lock = threading.Lock()
+
+    def _promote_long(self):
+        """当前线程进入长连接阶段 (WS 握手 / SSE) 时调用。
+
+        抢到长连接槽 → 标记本线程为 long 并把短池槽还回去;
+        抢不到 → 什么也不做 (继续占短池), 绝不因此拒绝请求。
+        """
+        ident = threading.get_ident()
+        with self._pool_lock:
+            if self._pool_of.get(ident) == "long":
+                return
+            if not self._long_slots.acquire(blocking=False):
+                return
+            self._pool_of[ident] = "long"
+        try:
+            self._slots.release()
+        except ValueError:
+            pass
+
+    def _release_pool(self, ident):
+        """按记账把槽还回对应的池子。"""
+        with self._pool_lock:
+            pool = self._pool_of.pop(ident, "short")
+        target = self._long_slots if pool == "long" else self._slots
+        try:
+            target.release()
+        except ValueError:
+            pass
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
@@ -625,10 +668,12 @@ class _ConnectionGuard:
             self.shutdown_request(request)
 
     def process_request_thread(self, request, client_address):
+        ident = threading.get_ident()
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
+            # 长连接与短请求记在不同池子上, 按记账归还 (见 _promote_long)。
+            self._release_pool(ident)
 
 
 class UnixServer(_ConnectionGuard, ThreadingHTTPServer):
