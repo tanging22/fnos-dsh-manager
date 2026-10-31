@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.0.54 - 2026-10-31
+
+### 修复
+
+网关（`cmd/proxy.py`）的并发闸只认「连接数」，不区分连接的寿命：
+
+1. 十几个标签页挂在后台时，SSE 与 WebSocket 长连接会主动摘掉超时（`_stream_phase` / `_relay` 里 `settimeout(None)`），
+   它们一直占着 `_ConnectionGuard` 的同一个池子 —— 短请求（点一下就是一个）一起抢这 400 个槽，
+   抢不到就直接回 `503 gateway busy: too many concurrent connections`。
+   症状是「面板时不时报 gateway busy，刷新一下又好了」；根因是长连接把短请求的额度吃掉了。
+2. 新增长连接专用池：`MAX_LONG_CONNECTIONS`（默认与 `MAX_CONNECTIONS` 等大，可用环境变量调），
+   在 `_ws_proxy()` 和 `_http_proxy()` 的 SSE 分支各调一次 `_promote_long()`：
+   抢到长池就把通用槽还回去、并给该线程记账；抢不到就**原地不动**（继续占通用槽），
+   也就是最坏情况等于这次改动之前，不会比原来更差。
+3. `process_request_thread` 的归还改成按线程记的池子归还（`_release_pool`）。
+
+### 验证
+
+- `python3 -m py_compile cmd/proxy.py` 通过。
+- 改动 46 行（+46 / -1），不改任何外部行为与调用方。
+- 想立刻压掉尖峰可只调环境变量：`MAX_CONNECTIONS=800`（fd 上限已抬到 65536，撑得住）。
+
 ## v1.0.53 - 2026-10-29
 
 ### 修复

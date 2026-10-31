@@ -11,3 +11,7 @@ dist/
 .credentials.yaml
 console-config.json
 trusted_hosts.conf
+
+# 构建与临时产物
+cmd/__pycache__/
+*.bak.poolsplit
